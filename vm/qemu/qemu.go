@@ -556,7 +556,52 @@ func (inst *instance) boot() error {
 		return vmimpl.MakeBootError(err, bootOutput)
 	}
 	bootOutputStop <- true
+
+	// After SSH is ready, start streaming BPF trace output from trace_pipe.
+	// Best effort: ignore errors if tracefs is not present or not mounted.
+	_, _ = inst.ssh("mount", "-t", "tracefs", "tracefs", "/sys/kernel/tracing")
+	if traceR, err := openRemoteCat(inst, "/sys/kernel/tracing/trace_pipe"); err == nil {
+		inst.merger.Add("trace", traceR)
+	} else if traceR2, err2 := openRemoteCat(inst, "/sys/kernel/debug/tracing/trace_pipe"); err2 == nil {
+		inst.merger.Add("trace", traceR2)
+	}
 	return nil
+}
+
+// openRemoteCat opens an SSH command that cats a remote file continuously, returning its stdout reader.
+func openRemoteCat(inst *instance, remotePath string) (io.ReadCloser, error) {
+	rpipe, wpipe, err := osutil.LongPipe()
+	if err != nil {
+		return nil, err
+	}
+	args := append(vmimpl.SSHArgs(inst.debug, inst.sshkey, inst.port), inst.sshuser+"@localhost", "cat "+remotePath)
+	cmd := osutil.Command("ssh", args...)
+	cmd.Stdout = wpipe
+	cmd.Stderr = wpipe
+	if _, err := cmd.StdinPipe(); err != nil {
+		rpipe.Close()
+		wpipe.Close()
+		return nil, err
+	}
+	if err := cmd.Start(); err != nil {
+		rpipe.Close()
+		wpipe.Close()
+		return nil, fmt.Errorf("failed to start ssh cat %s: %w", remotePath, err)
+	}
+	wpipe.Close()
+	return &remotePipe{cmd: cmd, r: rpipe}, nil
+}
+
+type remotePipe struct {
+	cmd *exec.Cmd
+	r   io.ReadCloser
+}
+
+func (p *remotePipe) Read(b []byte) (int, error) { return p.r.Read(b) }
+func (p *remotePipe) Close() error {
+	_ = p.cmd.Process.Kill()
+	_ = p.cmd.Wait()
+	return p.r.Close()
 }
 
 // "vfio-pci,host=BN:DN.{{FN%8}},addr=0x11".

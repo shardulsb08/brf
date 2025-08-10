@@ -56,7 +56,7 @@ typedef unsigned char uint8;
 // malloc will cause unspecified number of additional mmap's at unspecified locations.
 // For small objects prefer stack allocations, for larger -- either global objects (this may have
 // issues with concurrency), or controlled mmaps, or make the fuzzer allocate memory.
-#define malloc do_not_use_malloc
+// #define malloc do_not_use_malloc
 #define calloc do_not_use_calloc
 
 // Note: zircon max fd is 256.
