@@ -108,4 +108,7 @@ RUN chmod 0777 /usr/local/google-cloud-sdk
 RUN echo "export PS1='syz-env🈴 '" > /syzkaller/.bashrc
 ENV SYZ_ENV yes
 
+RUN apt-get update && \
+    apt-get install -y libbpf1 libbpf-devel elfutils-libelf elfutils-libelf-devel zlib zlib-devel
+
 ENTRYPOINT ["bash"]
