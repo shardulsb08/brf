@@ -75,32 +75,32 @@ multi_file_search() {
 # Step 1: Find all files that might contain XDP-related content
 find_xdp_related_files() {
     log_info "=== Step 1: Discovering XDP-related files ==="
-    
+
     cd "$KERNEL_SRC_DIR"
-    
-    # Find all files containing "xdp" (case-insensitive)
-    log_info "Searching for files containing 'xdp'..."
-    find . -type f \( -name "*.c" -o -name "*.h" -o -name "*.S" -o -name "*.asm" \) 2>/dev/null | \
-    xargs -I {} grep -l -i "xdp" {} 2>/dev/null | \
-    sort -u > "$TEMP_DIR/xdp_related_files.txt"
-    
+    log_info "Current directory: $(pwd)"
+
+    # Step 1: Just find files
+    log_info "Step 1.1: Running find command..."
+    find . -type f \( -name "*.c" -o -name "*.h" -o -name "*.S" -o -name "*.asm" \) 2>/dev/null > "$TEMP_DIR/all_files.txt"
+    log_info "Step 1.1 completed: $(wc -l < "$TEMP_DIR/all_files.txt") files found"
+
+    # Step 2: Find XDP files
+    log_info "Step 1.2: Finding XDP files..."
+    while IFS= read -r file; do
+        if grep -l -i "xdp" "$file" >/dev/null 2>/dev/null; then
+            echo "$file"
+        fi
+    done < "$TEMP_DIR/all_files.txt" > "$TEMP_DIR/xdp_related_files.txt"
+    log_info "Step 1.2 completed: $(wc -l < "$TEMP_DIR/xdp_related_files.txt") XDP files found"
+
+    # Step 3: Sort and deduplicate
+    log_info "Step 1.3: Sorting and deduplicating..."
+    sort -u "$TEMP_DIR/xdp_related_files.txt" > "$TEMP_DIR/xdp_related_files_sorted.txt"
+    mv "$TEMP_DIR/xdp_related_files_sorted.txt" "$TEMP_DIR/xdp_related_files.txt"
+    log_info "Step 1.3 completed"
+
     log_info "Found $(wc -l < "$TEMP_DIR/xdp_related_files.txt") files with XDP content"
-    
-    # Also find files containing "bpf" that might have XDP functions
-    log_info "Searching for files containing 'bpf'..."
-    find . -type f \( -name "*.c" -o -name "*.h" -o -name "*.S" -o -name "*.asm" \) 2>/dev/null | \
-    xargs -I {} grep -l -i "bpf" {} 2>/dev/null | \
-    sort -u > "$TEMP_DIR/bpf_related_files.txt"
-    
-    log_info "Found $(wc -l < "$TEMP_DIR/bpf_related_files.txt") files with BPF content"
-    
-    # Combine and deduplicate
-    cat "$TEMP_DIR/xdp_related_files.txt" "$TEMP_DIR/bpf_related_files.txt" | \
-    sort -u > "$TEMP_DIR/all_relevant_files.txt"
-    
-    log_info "Total unique relevant files: $(wc -l < "$TEMP_DIR/all_relevant_files.txt")"
-    
-    cd "$SCRIPT_DIR"
+    log_info "xdp find done"
 }
 
 # Step 2: Extract all XDP-related function patterns
