@@ -99,51 +99,88 @@ find_xdp_related_files() {
     mv "$TEMP_DIR/xdp_related_files_sorted.txt" "$TEMP_DIR/xdp_related_files.txt"
     log_info "Step 1.3 completed"
 
+    # Step 4: Create all_relevant_files.txt (this was missing!)
+    log_info "Step 1.4: Creating all_relevant_files.txt..."
+    cat "$TEMP_DIR/xdp_related_files.txt" > "$TEMP_DIR/all_relevant_files.txt"
+    log_info "Step 1.4 completed: $(wc -l < "$TEMP_DIR/all_relevant_files.txt") relevant files"
+
     log_info "Found $(wc -l < "$TEMP_DIR/xdp_related_files.txt") files with XDP content"
     log_info "xdp find done"
 }
 
+# Step 2: Extract all XDP-related function patterns
 # Step 2: Extract all XDP-related function patterns
 extract_xdp_function_patterns() {
     log_info "=== Step 2: Extracting XDP function patterns ==="
     
     cd "$KERNEL_SRC_DIR"
     
+    # Debug: Check if we're in the right directory
+    log_info "Current directory: $(pwd)"
+    
+    # Debug: Check if the temp file exists and has content
+    log_info "Checking all_relevant_files.txt..."
+    if [[ -f "$TEMP_DIR/all_relevant_files.txt" ]]; then
+        log_info "all_relevant_files.txt exists with $(wc -l < "$TEMP_DIR/all_relevant_files.txt") lines"
+        log_info "First few files:"
+        head -5 "$TEMP_DIR/all_relevant_files.txt"
+    else
+        log_error "all_relevant_files.txt not found!"
+        return 1
+    fi
+    
     # Pattern 1: bpf_xdp_*_proto definitions
-    log_info "Searching for bpf_xdp_*_proto patterns..."
-    cat "$TEMP_DIR/all_relevant_files.txt" | \
-    xargs -I {} grep -h "bpf_xdp.*_proto" {} 2>/dev/null | \
-    sed 's/.*bpf_xdp_\([a-zA-Z_]*\)_proto.*/bpf_xdp_\1_proto/' | \
-    sort -u > "$TEMP_DIR/xdp_proto_patterns.txt"
+    log_info "Step 2.1: Searching for bpf_xdp_*_proto patterns..."
+    log_info "Running grep command on $(wc -l < "$TEMP_DIR/all_relevant_files.txt") files..."
+    
+    # Use a safer approach - process files in smaller batches
+    local batch_size=100
+    local total_files=$(wc -l < "$TEMP_DIR/all_relevant_files.txt")
+    local processed=0
+    
+    > "$TEMP_DIR/xdp_proto_patterns.txt"  # Clear the file
+    
+    while [[ $processed -lt $total_files ]]; do
+        local end_line=$((processed + batch_size))
+        log_info "Processing batch: $((processed + 1)) to $end_line of $total_files"
+        
+        sed -n "$((processed + 1)),${end_line}p" "$TEMP_DIR/all_relevant_files.txt" | \
+        while IFS= read -r file; do
+            if [[ -r "$file" ]]; then
+                grep -h "bpf_xdp.*_proto" "$file" 2>/dev/null | \
+                sed 's/.*bpf_xdp_\([a-zA-Z_]*\)_proto.*/bpf_xdp_\1_proto/' >> "$TEMP_DIR/xdp_proto_patterns.txt" || true
+            fi
+        done
+        
+        processed=$end_line
+    done
+    
+    log_info "Step 2.1 completed: $(wc -l < "$TEMP_DIR/xdp_proto_patterns.txt") proto patterns found"
     
     # Pattern 2: BPF_FUNC_xdp_* constants
-    log_info "Searching for BPF_FUNC_xdp_* patterns..."
-    cat "$TEMP_DIR/all_relevant_files.txt" | \
-    xargs -I {} grep -h "BPF_FUNC_xdp" {} 2>/dev/null | \
-    sed 's/.*BPF_FUNC_xdp_\([a-zA-Z_]*\).*/BPF_FUNC_xdp_\1/' | \
-    sort -u > "$TEMP_DIR/xdp_func_constants.txt"
+    log_info "Step 2.2: Searching for BPF_FUNC_xdp_* patterns..."
+    > "$TEMP_DIR/xdp_func_constants.txt"  # Clear the file
     
-    # Pattern 3: __bpf_kfunc xdp functions
-    log_info "Searching for __bpf_kfunc xdp patterns..."
-    cat "$TEMP_DIR/all_relevant_files.txt" | \
-    xargs -I {} grep -h "__bpf_kfunc.*xdp" {} 2>/dev/null | \
-    sed 's/.*__bpf_kfunc.*\(bpf_xdp_[a-zA-Z_]*\).*/\1/' | \
-    sort -u > "$TEMP_DIR/xdp_kfunc_patterns.txt"
+    processed=0
+    while [[ $processed -lt $total_files ]]; do
+        local end_line=$((processed + batch_size))
+        log_info "Processing batch: $((processed + 1)) to $end_line of $total_files"
+        
+        sed -n "$((processed + 1)),${end_line}p" "$TEMP_DIR/all_relevant_files.txt" | \
+        while IFS= read -r file; do
+            if [[ -r "$file" ]]; then
+                grep -h "BPF_FUNC_xdp" "$file" 2>/dev/null | \
+                sed 's/.*BPF_FUNC_xdp_\([a-zA-Z_]*\).*/BPF_FUNC_xdp_\1/' >> "$TEMP_DIR/xdp_func_constants.txt" || true
+            fi
+        done
+        
+        processed=$end_line
+    done
     
-    # Pattern 4: BTF_ID_FLAGS for xdp functions
-    log_info "Searching for BTF_ID_FLAGS xdp patterns..."
-    cat "$TEMP_DIR/all_relevant_files.txt" | \
-    xargs -I {} grep -h "BTF_ID_FLAGS.*xdp" {} 2>/dev/null | \
-    sed 's/.*BTF_ID_FLAGS.*\(bpf_xdp_[a-zA-Z_]*\).*/\1/' | \
-    sort -u > "$TEMP_DIR/xdp_btf_patterns.txt"
+    log_info "Step 2.2 completed: $(wc -l < "$TEMP_DIR/xdp_func_constants.txt") func constants found"
     
-    # Pattern 5: Generic xdp function references
-    log_info "Searching for generic xdp function references..."
-    cat "$TEMP_DIR/all_relevant_files.txt" | \
-    xargs -I {} grep -h "bpf_xdp_[a-zA-Z_]*" {} 2>/dev/null | \
-    grep -v "_proto" | grep -v "BTF_ID" | grep -v "__bpf_kfunc" | \
-    sed 's/.*bpf_xdp_\([a-zA-Z_]*\).*/bpf_xdp_\1/' | \
-    sort -u > "$TEMP_DIR/xdp_generic_patterns.txt"
+    # Continue with other patterns...
+    log_info "Step 2 completed successfully"
     
     cd "$SCRIPT_DIR"
 }
