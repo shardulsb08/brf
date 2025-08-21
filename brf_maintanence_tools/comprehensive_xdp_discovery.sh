@@ -320,19 +320,72 @@ analyze_brf_coverage() {
 generate_report() {
     log_info "=== Step 7: Generating Comprehensive Report ==="
     
-    # Combine all discovered patterns
-    cat "$TEMP_DIR"/xdp_*_patterns.txt "$TEMP_DIR"/xdp_*functions.txt 2>/dev/null | \
-    grep -v '^$' | sort -u > "$TEMP_DIR/all_discovered_xdp_functions.txt"
+    # Debug: Check what files we have
+    log_info "Checking available temp files:"
+    ls -la "$TEMP_DIR"/
+    
+    # Debug: Check file contents
+    log_info "Contents of xdp_proto_patterns.txt:"
+    if [[ -f "$TEMP_DIR/xdp_proto_patterns.txt" ]]; then
+        wc -l "$TEMP_DIR/xdp_proto_patterns.txt"
+        head -5 "$TEMP_DIR/xdp_proto_patterns.txt"
+    else
+        log_warn "xdp_proto_patterns.txt not found"
+    fi
+    
+    log_info "Contents of xdp_func_constants.txt:"
+    if [[ -f "$TEMP_DIR/xdp_func_constants.txt" ]]; then
+        wc -l "$TEMP_DIR/xdp_func_constants.txt"
+        head -5 "$TEMP_DIR/xdp_func_constants.txt"
+    else
+        log_warn "xdp_func_constants.txt not found"
+    fi
+    
+    # Combine all discovered patterns - FIXED VERSION
+    log_info "Step 7.1: Combining all discovered patterns..."
+    
+    # Clear the output file first
+    > "$TEMP_DIR/all_discovered_xdp_functions.txt"
+    
+    # Add proto patterns
+    if [[ -f "$TEMP_DIR/xdp_proto_patterns.txt" ]]; then
+        log_info "Adding proto patterns..."
+        cat "$TEMP_DIR/xdp_proto_patterns.txt" >> "$TEMP_DIR/all_discovered_xdp_functions.txt"
+    fi
+    
+    # Add function constants
+    if [[ -f "$TEMP_DIR/xdp_func_constants.txt" ]]; then
+        log_info "Adding function constants..."
+        cat "$TEMP_DIR/xdp_func_constants.txt" >> "$TEMP_DIR/all_discovered_xdp_functions.txt"
+    fi
+    
+    # Add other pattern files if they exist
+    for pattern_file in "$TEMP_DIR"/xdp_*_patterns.txt "$TEMP_DIR"/xdp_*functions.txt; do
+        if [[ -f "$pattern_file" ]] && [[ "$pattern_file" != "$TEMP_DIR/xdp_proto_patterns.txt" ]] && [[ "$pattern_file" != "$TEMP_DIR/xdp_func_constants.txt" ]]; then
+            log_info "Adding $(basename "$pattern_file")..."
+            cat "$pattern_file" >> "$TEMP_DIR/all_discovered_xdp_functions.txt"
+        fi
+    done
+    
+    log_info "Step 7.1 completed: $(wc -l < "$TEMP_DIR/all_discovered_xdp_functions.txt") total functions"
     
     # Remove duplicates and clean up
+    log_info "Step 7.2: Cleaning up function list..."
     sed 's/^[[:space:]]*//;s/[[:space:]]*$//' "$TEMP_DIR/all_discovered_xdp_functions.txt" | \
     grep -v '^$' | sort -u > "$TEMP_DIR/clean_xdp_functions.txt"
+    log_info "Step 7.2 completed: $(wc -l < "$TEMP_DIR/clean_xdp_functions.txt") clean functions"
     
     local total_kernel=$(wc -l < "$TEMP_DIR/clean_xdp_functions.txt")
     local total_brf=$(wc -l < "$TEMP_DIR/brf_all_xdp_functions.txt" 2>/dev/null || echo "0")
     local missing=$((total_kernel - total_brf))
     
+    log_info "Step 7.3: Calculating statistics..."
+    log_info "Total kernel functions: $total_kernel"
+    log_info "Total BRF functions: $total_brf"
+    log_info "Missing functions: $missing"
+    
     # Generate comprehensive report
+    log_info "Step 7.4: Writing report to $OUTPUT_FILE..."
     cat > "$OUTPUT_FILE" << EOF
 COMPREHENSIVE XDP FUNCTION ANALYSIS REPORT
 ==========================================
@@ -344,7 +397,6 @@ Script: $0
 EXECUTION SUMMARY
 ================
 - Files with XDP content: $(wc -l < "$TEMP_DIR/xdp_related_files.txt")
-- Files with BPF content: $(wc -l < "$TEMP_DIR/bpf_related_files.txt")
 - Total relevant files: $(wc -l < "$TEMP_DIR/all_relevant_files.txt")
 
 FUNCTION DISCOVERY SUMMARY
@@ -360,6 +412,7 @@ DETAILED BREAKDOWN
 ----------------------------------------
 EOF
 
+    log_info "Step 7.5: Writing proto patterns to report..."
     if [[ -f "$TEMP_DIR/xdp_proto_patterns.txt" ]]; then
         cat "$TEMP_DIR/xdp_proto_patterns.txt" >> "$OUTPUT_FILE"
     fi
@@ -370,86 +423,29 @@ EOF
 -------------------------------------------
 EOF
 
+    log_info "Step 7.6: Writing function constants to report..."
     if [[ -f "$TEMP_DIR/xdp_func_constants.txt" ]]; then
         cat "$TEMP_DIR/xdp_func_constants.txt" >> "$OUTPUT_FILE"
     fi
 
     cat >> "$OUTPUT_FILE" << EOF
 
-3. XDP KFUNCS (__bpf_kfunc xdp_*)
------------------------------------
-EOF
-
-    if [[ -f "$TEMP_DIR/xdp_kfuncs.txt" ]]; then
-        cat "$TEMP_DIR/xdp_kfuncs.txt" >> "$OUTPUT_FILE"
-    fi
-
-    cat >> "$OUTPUT_FILE" << EOF
-
-4. XDP BTF PATTERNS (BTF_ID_FLAGS xdp_*)
-------------------------------------------
-EOF
-
-    if [[ -f "$TEMP_DIR/xdp_btf_patterns.txt" ]]; then
-        cat "$TEMP_DIR/xdp_btf_patterns.txt" >> "$OUTPUT_FILE"
-    fi
-
-    cat >> "$OUTPUT_FILE" << EOF
-
-5. GENERIC XDP PATTERNS (bpf_xdp_*)
--------------------------------------
-EOF
-
-    if [[ -f "$TEMP_DIR/xdp_generic_patterns.txt" ]]; then
-        cat "$TEMP_DIR/xdp_generic_patterns.txt" >> "$OUTPUT_FILE"
-    fi
-
-    cat >> "$OUTPUT_FILE" << EOF
-
-6. XDP FUNC PROTO RETURNS
---------------------------
-EOF
-
-    if [[ -f "$TEMP_DIR/xdp_func_proto_returns.txt" ]]; then
-        cat "$TEMP_DIR/xdp_func_proto_returns.txt" >> "$OUTPUT_FILE"
-    fi
-
-    cat >> "$OUTPUT_FILE" << EOF
-
-7. SK BASE FUNCTIONS (Available to XDP)
----------------------------------------
-EOF
-
-    if [[ -f "$TEMP_DIR/sk_base_functions.txt" ]]; then
-        cat "$TEMP_DIR/sk_base_functions.txt" >> "$OUTPUT_FILE"
-    fi
-
-    cat >> "$OUTPUT_FILE" << EOF
-
-8. BASE FUNCTIONS (Available to XDP)
-------------------------------------
-EOF
-
-    if [[ -f "$TEMP_DIR/base_functions.txt" ]]; then
-        cat "$TEMP_DIR/base_functions.txt" >> "$OUTPUT_FILE"
-    fi
-
-    cat >> "$OUTPUT_FILE" << EOF
-
-9. BRF COVERAGE
+3. BRF COVERAGE
 ---------------
 EOF
 
+    log_info "Step 7.7: Writing BRF coverage to report..."
     if [[ -f "$TEMP_DIR/brf_all_xdp_functions.txt" ]]; then
         cat "$TEMP_DIR/brf_all_xdp_functions.txt" >> "$OUTPUT_FILE"
     fi
 
     cat >> "$OUTPUT_FILE" << EOF
 
-10. MISSING FUNCTIONS (Need to be added to BRF)
+4. MISSING FUNCTIONS (Need to be added to BRF)
 ===============================================
 EOF
 
+    log_info "Step 7.8: Calculating missing functions..."
     # Find missing functions
     if [[ -f "$TEMP_DIR/clean_xdp_functions.txt" ]] && [[ -f "$TEMP_DIR/brf_all_xdp_functions.txt" ]]; then
         comm -23 <(sort "$TEMP_DIR/clean_xdp_functions.txt") <(sort "$TEMP_DIR/brf_all_xdp_functions.txt") >> "$OUTPUT_FILE"
@@ -457,12 +453,13 @@ EOF
 
     cat >> "$OUTPUT_FILE" << EOF
 
-11. RAW DISCOVERY DATA
+5. RAW DISCOVERY DATA
 ======================
 
 All discovered XDP functions (raw):
 EOF
 
+    log_info "Step 7.9: Writing raw data to report..."
     cat "$TEMP_DIR/clean_xdp_functions.txt" >> "$OUTPUT_FILE"
 
     cat >> "$OUTPUT_FILE" << EOF
@@ -472,7 +469,8 @@ EOF
 
     cat "$TEMP_DIR/brf_all_xdp_functions.txt" >> "$OUTPUT_FILE"
 
-    log_info "Comprehensive report generated: $OUTPUT_FILE"
+    log_info "Step 7 completed: Report written to $OUTPUT_FILE"
+    log_info "Report size: $(wc -l < "$OUTPUT_FILE") lines"
 }
 
 # Step 8: Cleanup and final summary
@@ -490,7 +488,11 @@ cleanup_and_summary() {
     log_info "Missing functions: $missing"
     log_info "Report saved to: $OUTPUT_FILE"
     
+    # Show report location
+    log_info "Report absolute path: $(readlink -f "$OUTPUT_FILE")"
+    
     # Cleanup temporary files
+    log_info "Cleaning up temporary files..."
     rm -rf "$TEMP_DIR"
     
     log_info "Analysis complete! Check $OUTPUT_FILE for comprehensive results"
