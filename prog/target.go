@@ -158,8 +158,25 @@ func (target *Target) lazyInit() {
 
 func (target *Target) initBrf() {
 	enable := false
+	fmt.Printf("🔍 BRF Debug: Checking for required syscalls...\n")
+	fmt.Printf("🔍 BRF Debug: Target OS: %s, Arch: %s\n", target.OS, target.Arch)
+	fmt.Printf("🔍 BRF Debug: Total syscalls in target: %d\n", len(target.SyscallMap))
+
+	// Check for the specific syscalls we need
+	requiredSyscalls := []string{"syz_bpf_prog_open", "syz_bpf_prog_load", "syz_bpf_prog_attach", "bpf$BPF_PROG_TEST_RUN"}
+	for _, syscall := range requiredSyscalls {
+		if _, ok := target.SyscallMap[syscall]; ok {
+			fmt.Printf("✅ BRF Debug: Found syscall: %s\n", syscall)
+		} else {
+			fmt.Printf("❌ BRF Debug: Missing syscall: %s\n", syscall)
+		}
+	}
+
 	if _, ok := target.SyscallMap["syz_bpf_prog_open"]; ok {
 		enable = true
+		fmt.Printf("✅ BRF Debug: BRF will be ENABLED\n")
+	} else {
+		fmt.Printf("❌ BRF Debug: BRF will be DISABLED (missing syz_bpf_prog_open)\n")
 	}
 
 	target.Brf = NewBpfRuntimeFuzzer(enable)
