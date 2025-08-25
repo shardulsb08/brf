@@ -33,6 +33,7 @@ func NewBpfRuntimeFuzzer(enable bool) *BpfRuntimeFuzzer {
 		// The mount is only needed for VM sharing, not for local file operations
 	}
 
+	fmt.Printf("BRF Debug: Setting brf.isEnabled to true!\n")
 	brf.isEnabled = true
 	brf.helperFuncMap = make(map[string]*BpfHelper)
 	brf.progTypeMap = make(map[BpfProgTypeEnum]*BpfProgType)
@@ -311,7 +312,7 @@ func (brf *BpfRuntimeFuzzer) mutBpfProg(r *randGen, p *BpfProg, opt BrfGenProgOp
 
 func (brf *BpfRuntimeFuzzer) compileBpfProg(p *BpfProg) error {
 	var timeout time.Duration = 10000000000
-	cmd := exec.Command("clang-16", "-g", "-D__TARGET_ARCH_x86", "-mlittle-endian",
+	cmd := exec.Command("/mnt/work_4gb/Tools/003_kernel_testing/prana_kernel_testing/container_kernel_workspace/brf/deps/llvm-project/build/bin/clang-20", "-g", "-D__TARGET_ARCH_x86", "-mlittle-endian",
 		"-idirafter", "/usr/local/include",
 		"-idirafter", "/usr/local/llvm/include",
 		"-idirafter", "/usr/include/x86_64-linux-gnu",
