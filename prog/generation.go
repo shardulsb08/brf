@@ -4,18 +4,30 @@
 package prog
 
 import (
+	"fmt"
 	"math/rand"
 )
 
 // Generate generates a random program with ncalls calls.
 // ct contains a set of allowed syscalls, if nil all syscalls are used.
 func (target *Target) Generate(rs rand.Source, ncalls int, ct *ChoiceTable) *Prog {
+	fmt.Printf("🔍 BRF Debug: Generate() called with ncalls=%d\n", ncalls)
+	fmt.Printf("🔍 BRF Debug: target.Brf = %v\n", target.Brf)
+
 	p := &Prog{
 		Target: target,
 	}
 	r := newRand(target, rs)
 	s := newState(target, ct, nil)
-	target.Brf.GenPrologue(r, s, p)
+
+	if target.Brf != nil {
+		fmt.Printf("✅ BRF Debug: Calling target.Brf.GenPrologue()\n")
+		target.Brf.GenPrologue(r, s, p)
+		fmt.Printf("✅ BRF Debug: GenPrologue completed, prog has %d calls\n", len(p.Calls))
+	} else {
+		fmt.Printf("❌ BRF Debug: target.Brf is nil, skipping GenPrologue\n")
+	}
+
 	for len(p.Calls) < ncalls {
 		calls := r.generateCall(s, p, len(p.Calls))
 		for _, c := range calls {
@@ -32,5 +44,7 @@ func (target *Target) Generate(rs rand.Source, ncalls int, ct *ChoiceTable) *Pro
 	}
 	p.sanitizeFix()
 	p.debugValidate()
+
+	fmt.Printf("🔍 BRF Debug: Generate() completed, final prog has %d calls\n", len(p.Calls))
 	return p
 }
