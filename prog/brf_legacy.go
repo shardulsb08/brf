@@ -1769,6 +1769,9 @@ func (sd *StructDef) fieldIdx(f string) int {
 			return i
 		}
 	}
+        if f == "default" { // avoid logging on sentinel
+            return -1
+        }
 	fmt.Printf("cannot find field %v (%v) in %v\n", f, fieldName, sd.Name)
 	return -1
 }
