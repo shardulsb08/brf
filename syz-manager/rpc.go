@@ -89,7 +89,7 @@ func startRPCServer(mgr *Manager) (*RPCServer, error) {
 }
 
 func (serv *RPCServer) Connect(a *rpctype.ConnectArgs, r *rpctype.ConnectRes) error {
-	log.Logf(1, "fuzzer %v connected", a.Name)
+	log.Logf(0, "fuzzer %v connected", a.Name)
 	serv.stats.vmRestarts.inc()
 
 	if serv.canonicalModules == nil {
@@ -116,6 +116,10 @@ func (serv *RPCServer) Connect(a *rpctype.ConnectArgs, r *rpctype.ConnectRes) er
 
 	instCoverFilter := f.instModules.DecanonicalizeFilter(execCoverFilter)
 	r.CoverFilterBitmap = createCoverageBitmap(serv.cfg.SysTarget, instCoverFilter)
+        log.Logf(0, "BRF Debug: rpc.go Connect: instCoverFilter: %d", instCoverFilter)
+	if r.CoverFilterBitmap == nil {
+            log.Logf(0, "BRF Debug: rpc.go Connect: r.CoverFilterBitmap is nil")
+        }
 	r.EnabledCalls = serv.cfg.Syscalls
 	r.NoMutateCalls = serv.cfg.NoMutateCalls
 	r.GitRevision = prog.GitRevision

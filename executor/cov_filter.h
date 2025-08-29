@@ -38,7 +38,7 @@ static void init_coverage_filter(char* filename)
 
 static bool coverage_filter(uint64 pc)
 {
-	if (!flag_coverage_filter)
+	if (!flag_coverage_filter) //Code is currently exiting from here.
 		return true;
 	if (cov_filter == NULL)
 		fail("coverage filter was enabled but bitmap initialization failed");
@@ -51,6 +51,7 @@ static bool coverage_filter(uint64 pc)
 	pc32 = pc32 >> 4;
 	uint32 idx = pc32 / 8;
 	uint32 shift = pc32 % 8;
+	debug("BRF Debug: Starting coverage filter\n");
 	return (cov_filter->bitmap[idx] & (1 << shift)) > 0;
 }
 
