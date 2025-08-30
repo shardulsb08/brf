@@ -138,11 +138,7 @@ func (ci *CanonicalizerInstance) Decanonicalize(cov []uint32, sign signal.Serial
 func (ci *CanonicalizerInstance) DecanonicalizeFilter(bitmap map[uint32]uint32) map[uint32]uint32 {
 	// Skip conversion if modules or filter are not used.
 	if ci.canonical.moduleKeys == nil || len(bitmap) == 0 {
-            log.Logf(0, "BRF Debug: DecanonicalizeFilter: Early exit! ci.canonical.moduleKeys: %v, len(bitmap): %d",
-            ci.canonical.moduleKeys, len(bitmap))
-            if ci.canonical.moduleKeys == nil {
-                log.Logf(0, "BRF Debug: DecanonicalizeFilter: ci.canonical.moduleKeys is nil")
-            }
+            log.Logf(0, "BRF Debug: DecanonicalizeFilter: Early exit!")
 		return bitmap
 	}
 	instBitmap := make(map[uint32]uint32)

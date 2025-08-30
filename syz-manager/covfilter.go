@@ -18,17 +18,14 @@ import (
 )
 
 func (mgr *Manager) createCoverageFilter() (map[uint32]uint32, map[uint32]uint32, error) {
-	log.Logf(0, "BRF Debug: createCoverageFilter: 1: mgr.cfg.CovFilter.Functions: %v, len(mgr.cfg.CovFilter.Files): %d, len(mgr.cfg.CovFilter.RawPCs): %d", mgr.cfg.CovFilter.Functions, len(mgr.cfg.CovFilter.Files), len(mgr.cfg.CovFilter.RawPCs))
 	if len(mgr.cfg.CovFilter.Functions)+len(mgr.cfg.CovFilter.Files)+len(mgr.cfg.CovFilter.RawPCs) == 0 {
 		return nil, nil, nil
 	}
-	log.Logf(0, "BRF Debug: createCoverageFilter: 2")
 	// Always initialize ReportGenerator because RPCServer.NewInput will need it to filter coverage.
 	rg, err := getReportGenerator(mgr.cfg, mgr.modules)
 	if err != nil {
 		return nil, nil, err
 	}
-	log.Logf(0, "BRF Debug: createCoverageFilter: 3")
 	pcs := make(map[uint32]uint32)
 	foreachSymbol := func(apply func(*backend.ObjectUnit)) {
 		for _, sym := range rg.Symbols {
@@ -38,7 +35,6 @@ func (mgr *Manager) createCoverageFilter() (map[uint32]uint32, map[uint32]uint32
 	if err := covFilterAddFilter(pcs, mgr.cfg.CovFilter.Functions, foreachSymbol); err != nil {
 		return nil, nil, err
 	}
-	log.Logf(0, "BRF Debug: createCoverageFilter: 4")
 	foreachUnit := func(apply func(*backend.ObjectUnit)) {
 		for _, unit := range rg.Units {
 			apply(&unit.ObjectUnit)
@@ -47,31 +43,24 @@ func (mgr *Manager) createCoverageFilter() (map[uint32]uint32, map[uint32]uint32
 	if err := covFilterAddFilter(pcs, mgr.cfg.CovFilter.Files, foreachUnit); err != nil {
 		return nil, nil, err
 	}
-	log.Logf(0, "BRF Debug: createCoverageFilter: 5")
 	if err := covFilterAddRawPCs(pcs, mgr.cfg.CovFilter.RawPCs); err != nil {
 		return nil, nil, err
 	}
-	log.Logf(0, "BRF Debug: createCoverageFilter: 6")
 	if len(pcs) == 0 {
 		return nil, nil, nil
 	}
-	log.Logf(0, "BRF Debug: createCoverageFilter: 7")
 	if !mgr.cfg.SysTarget.ExecutorUsesShmem {
 		return nil, nil, fmt.Errorf("coverage filter is only supported for targets that use shmem")
 	}
-	log.Logf(0, "BRF Debug: createCoverageFilter: 8")
 	// Copy pcs into execPCs. This is used to filter coverage in the executor.
 	execPCs := make(map[uint32]uint32)
 	for pc, val := range pcs {
-	        log.Logf(0, "BRF Debug: createCoverageFilter: Assigning execPCs[%d]: %v"
-                    pc, val)
 		execPCs[pc] = val
 	}
 	// PCs from CMPs are deleted to calculate `filtered coverage` statistics
 	// in syz-manager.
 	for _, sym := range rg.Symbols {
 		for _, pc := range sym.CMPs {
-	                log.Logf(0, "BRF Debug: createCoverageFilter: deleting pcs: %d", pcs)
 			delete(pcs, uint32(pc))
 		}
 	}

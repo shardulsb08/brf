@@ -1323,11 +1323,9 @@ func (mgr *Manager) collectSyscallInfoUnlocked() map[string]*CallCov {
 
 func (mgr *Manager) fuzzerConnect(modules []host.KernelModule) (
 	[]rpctype.Input, BugFrames, map[uint32]uint32, map[uint32]uint32, error) {
-	log.Errorf("BRF Debug: fuzzerConnect 1")
 	mgr.mu.Lock()
 	defer mgr.mu.Unlock()
 
-	log.Errorf("BRF Debug: fuzzerConnect 2")
 	mgr.minimizeCorpus()
 	corpus := make([]rpctype.Input, 0, len(mgr.corpus))
 	for _, inp := range mgr.corpus {
@@ -1350,11 +1348,8 @@ func (mgr *Manager) fuzzerConnect(modules []host.KernelModule) (
 		if err != nil {
 			log.Fatalf("failed to create coverage filter: %v", err)
 		}
-                log.Errorf("BRF Debug: fuzzerConnect: Modules initialized, mgr.execCoverFilter (len: %d): %v",
-                len(mgr.execCoverFilter), mgr.execCoverFilter)
 		mgr.modulesInitialized = true
 	}
-	log.Errorf("BRF Debug: fuzzerConnect 6")
 	return corpus, frames, mgr.coverFilter, mgr.execCoverFilter, nil
 }
 
