@@ -220,13 +220,10 @@ func main() {
 		log.SyzFatalf("%v", err)
 	}
 	if r.CoverFilterBitmap != nil {
-            log.Logf(0, "BRF Debug: fuzzer.go: main: r.CoverFilterBitmap is valid!")
 		if err := osutil.WriteFile("syz-cover-bitmap", r.CoverFilterBitmap); err != nil {
 			log.SyzFatalf("failed to write syz-cover-bitmap: %v", err)
 		}
-	} else {
-            log.Logf(0, "BRF Debug: r.CoverFilterBitmap is nil!")
-        }
+	}
 	if r.CheckResult == nil {
 		checkArgs.gitRevision = r.GitRevision
 		checkArgs.targetRevision = r.TargetRevision

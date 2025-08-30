@@ -71,7 +71,6 @@ func NewCanonicalizer(modules []host.KernelModule, flagSignal bool) *Canonicaliz
 
 func (can *Canonicalizer) NewInstance(modules []host.KernelModule) *CanonicalizerInstance {
 	if can.moduleKeys == nil {
-            log.Errorf("BRF Debug: NewInstance CanonicalizerInstance: moduleKeys nil \n")
 		return &CanonicalizerInstance{}
 	}
 	// Save sorted list of module offsets.
@@ -138,7 +137,6 @@ func (ci *CanonicalizerInstance) Decanonicalize(cov []uint32, sign signal.Serial
 func (ci *CanonicalizerInstance) DecanonicalizeFilter(bitmap map[uint32]uint32) map[uint32]uint32 {
 	// Skip conversion if modules or filter are not used.
 	if ci.canonical.moduleKeys == nil || len(bitmap) == 0 {
-            log.Logf(0, "BRF Debug: DecanonicalizeFilter: Early exit!")
 		return bitmap
 	}
 	instBitmap := make(map[uint32]uint32)
@@ -151,9 +149,8 @@ func (ci *CanonicalizerInstance) DecanonicalizeFilter(bitmap map[uint32]uint32) 
 		}
 	}
 	if msg := convCtx.discarded(); msg != "" {
-		log.Logf(0, "error in bitmap conversion: %v", msg)
+		log.Logf(4, "error in bitmap conversion: %v", msg)
 	}
-        log.Logf(0, "BRF Debug: DecanonicalizeFilter: Proper exit")
 	return instBitmap
 }
 

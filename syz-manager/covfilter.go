@@ -64,7 +64,6 @@ func (mgr *Manager) createCoverageFilter() (map[uint32]uint32, map[uint32]uint32
 			delete(pcs, uint32(pc))
 		}
 	}
-	log.Logf(0, "BRF Debug: createCoverageFilter: execPCs(len=%d): %v", len(execPCs), execPCs)
 	return execPCs, pcs, nil
 }
 
@@ -138,7 +137,6 @@ func covFilterAddRawPCs(pcs map[uint32]uint32, rawPCsFiles []string) error {
 func createCoverageBitmap(target *targets.Target, pcs map[uint32]uint32) []byte {
 	// Return nil if filtering is not used.
 	if len(pcs) == 0 {
-	        log.Logf(0, "BRF Debug: createCoverageBitmap: len(pcs) == 0, exiting early")
 		return nil
 	}
 	start, size := coverageFilterRegion(pcs)
