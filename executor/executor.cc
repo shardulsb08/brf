@@ -1724,6 +1724,17 @@ void debug(const char* msg, ...)
 	errno = err;
 }
 
+void debug_info(const char* msg, ...)
+{
+	int err = errno;
+	va_list args;
+	va_start(args, msg);
+	vfprintf(stderr, msg, args);
+	va_end(args);
+	fflush(stderr);
+	errno = err;
+}
+
 void debug_dump_data(const char* data, int length)
 {
 	if (!flag_debug)
