@@ -1,11 +1,7 @@
 
 #define OBJ_LIST_SIZE 32
-#ifndef BPF_LOG_BUF_SIZE
-#define BPF_LOG_BUF_SIZE (8 << 20)
-#endif
 
 static struct bpf_object *bpf_object_list[OBJ_LIST_SIZE];
-static char *obj_kernel_log_buf[OBJ_LIST_SIZE];
 
 struct bpf_res {
 	int prog_fds[32];
@@ -18,50 +14,26 @@ static long syz_bpf_prog_open(volatile long a0)
 {
 	const char* file = (char*)a0;
 	struct bpf_object* obj;
-    struct bpf_object_open_opts opts = {};
-    opts.sz = sizeof(opts);
-    struct bpf_program *prog;
 	char bpf_err_buf[256];
 	unsigned int i;
 	long err;
 
-    // Allocate a kernel log buffer to capture verifier/BTF logs.
-    char *klog = (char*)malloc(BPF_LOG_BUF_SIZE);
-    if (klog) {
-        opts.kernel_log_buf = klog;
-        opts.kernel_log_size = BPF_LOG_BUF_SIZE;
-        opts.kernel_log_level = 2;
-    }
-
-    obj = bpf_object__open_file(file, &opts);
+	obj = bpf_object__open(file);
 	err = libbpf_get_error(obj);
 	if (err) {
-        debug("syz_bpf_prog_open: failed to open bpf object %s: %s\n", file, bpf_err_buf);
-        if (klog)
-            free(klog);
+		debug("syz_bpf_prog_open: failed to open bpf object %s: %s\n", file, bpf_err_buf);
 		return -1;
 	}
-
-    // Ensure each program has its own log buffer and level.
-    bpf_object__for_each_program(prog, obj) {
-        char *plog = (char*)malloc(BPF_LOG_BUF_SIZE);
-        if (plog)
-            bpf_program__set_log_buf(prog, plog, BPF_LOG_BUF_SIZE);
-        bpf_program__set_log_level(prog, 2);
-    }
 
 	for (i = 0; i < OBJ_LIST_SIZE; i++) {
 		if (!bpf_object_list[i]) {
 			bpf_object_list[i] = obj;
-            obj_kernel_log_buf[i] = klog;
 			return 0;
 		}
 	}
 
-    debug("syz_bpf_prog_open: bpf_object_list full\n");
-    if (klog)
-        free(klog);
-    return -1;
+	debug("syz_bpf_prog_open: bpf_object_list full\n");
+	return -1;
 }
 
 static struct bpf_object *find_bpf_object_by_basename(const char *path)
@@ -93,7 +65,6 @@ static long syz_bpf_prog_load(volatile long a0, volatile long a1)
 	struct bpf_object *obj;
 	struct bpf_map *map;
 	int i, err;
-    int obj_index = -1;
 
 	obj = find_bpf_object_by_basename(file);
 	if (!obj) {
@@ -101,38 +72,11 @@ static long syz_bpf_prog_load(volatile long a0, volatile long a1)
 		return -1;
 	}
 
-    // Find object index to access kernel log buffer.
-    for (i = 0; i < OBJ_LIST_SIZE; i++) {
-        if (bpf_object_list[i] == obj) {
-            obj_index = i;
-            break;
-        }
-    }
-
-    err = bpf_object__load(obj);
+	err = bpf_object__load(obj);
 	if (err) {
-        debug("syz_bpf_prog_load: failed to load bpf prog, errno %d\n", err);
-        // Dump verifier logs on error.
-        if (obj_index >= 0 && obj_kernel_log_buf[obj_index] && obj_kernel_log_buf[obj_index][0])
-            debug("%s\n", obj_kernel_log_buf[obj_index]);
-        bpf_object__for_each_program(prog, obj) {
-            size_t lsz = 0;
-            const char *pbuf = bpf_program__log_buf(prog, &lsz);
-            if (pbuf && lsz > 0 && pbuf[0])
-                debug("%s\n", pbuf);
-        }
+		debug("syz_bpf_prog_load: failed to load bpf prog, errno %d\n", err);
 		return -1;
 	}
-
-    // Dump verifier logs on success as well for completeness.
-    if (obj_index >= 0 && obj_kernel_log_buf[obj_index] && obj_kernel_log_buf[obj_index][0])
-        debug("%s\n", obj_kernel_log_buf[obj_index]);
-    bpf_object__for_each_program(prog, obj) {
-        size_t lsz = 0;
-        const char *pbuf = bpf_program__log_buf(prog, &lsz);
-        if (pbuf && lsz > 0 && pbuf[0])
-            debug("%s\n", pbuf);
-    }
 
 	i = 0;
 	bpf_object__for_each_program(prog, obj)
