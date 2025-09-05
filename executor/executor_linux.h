@@ -181,6 +181,11 @@ static bool use_cover_edges(uint64 pc)
 }
 #endif
 
+static inline __u64 kcov_common_handle(void)
+{
+	return kcov_remote_handle(KCOV_SUBSYSTEM_COMMON, procid + 1);
+}
+
 static bool detect_kernel_bitness()
 {
 	if (sizeof(void*) == 8)

@@ -57,6 +57,8 @@ static struct bpf_object *find_bpf_object_by_basename(const char *path)
 	return NULL;
 }
 
+static __u64 kcov_common_handle(void);
+
 static long syz_bpf_prog_load(volatile long a0, volatile long a1)
 {
 	const char *file = (char *)a0;
@@ -72,6 +74,7 @@ static long syz_bpf_prog_load(volatile long a0, volatile long a1)
 		return -1;
 	}
 
+	bpf_object__add_kcov_handle(obj, kcov_common_handle());
 	err = bpf_object__load(obj);
 	if (err) {
 		debug("syz_bpf_prog_load: failed to load bpf prog, errno %d\n", err);

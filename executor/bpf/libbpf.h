@@ -254,6 +254,18 @@ bpf_object__open_mem(const void *obj_buf, size_t obj_buf_sz,
  */
 int bpf_object__prepare(struct bpf_object *obj);
 
+ /**
+  * @brief **bpf_object__add_kcov_handle()** saves user processes' remote
+  * handle in bpf_object structure which can later be used by __bpf_prog_run
+  * to start coverage collection when bpf programs run
+  * @param obj Pointer to a valid BPF object instance returned by
+  * **bpf_object__open*()** APIs
+  * @param kcov_remote_handle handle of the user space thread, used by
+  * kcov_remote_start like functions in kernel
+  */
+
+LIBBPF_API void bpf_object__add_kcov_handle(struct bpf_object *obj, __u64 kcov_remote_handle);
+
 /**
  * @brief **bpf_object__load()** loads BPF object into kernel.
  * @param obj Pointer to a valid BPF object instance returned by
