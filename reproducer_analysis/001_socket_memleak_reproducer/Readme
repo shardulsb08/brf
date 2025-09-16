@@ -1,0 +1,29 @@
+Crash logs:
+#Report 1:
+workdir/fedora/crashes/e15a61ae3a3aaf4deb3f293a696c3b6ac687c622/report9
+
+syz-repro logs:
+/mnt/work_4gb/Tools/003_kernel_testing/prana_kernel_testing/host_drive/tests/bpf_runtime_fuzzer/git_repo/brf/brf_logs/run_20250913_121627/brf_log_20250913_121628.log
+
+
+#Report 2:
+workdir/fedora/crashes/e15a61ae3a3aaf4deb3f293a696c3b6ac687c622/report7
+
+syz-repro logs:
+/mnt/work_4gb/Tools/003_kernel_testing/prana_kernel_testing/host_drive/tests/bpf_runtime_fuzzer/git_repo/brf/brf_logs/run_20250912_193326/brf_log_20250912_193326.log
+
+
+Above syz-repro produced the repro.txt file which is present in this directory.
+
+Ran syz-executor with the repro.txt in the VM manually:
+sudo ./bin/linux_amd64/syz-execprog -executor=bin/linux_amd64/syz-executor -repeat=0 -procs=16 -cover=0 repro.txt 
+
+The issue is not reproducing without "-repeat=0".
+Some more commands for which issue isn't reproducing:
+sudo ./bin/linux_amd64/syz-execprog -executor=bin/linux_amd64/syz-executor -repeat=0 -procs=1 -threaded=0 -collide=0 repro.txt
+
+Issue reproducing for:
+sudo ./bin/linux_amd64/syz-execprog -executor=bin/linux_amd64/syz-executor -repeat=0 -threaded=0 -collide=0 repro.txt
+-For above, procs by default seems to become 24 or something.
+
+sudo ./bin/linux_amd64/syz-execprog -executor=bin/linux_amd64/syz-executor -repeat=0 -procs=1 -threaded=0 -collide=0 repro.txt
