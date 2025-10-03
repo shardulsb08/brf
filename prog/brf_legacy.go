@@ -1305,7 +1305,7 @@ func (t PtrToStackRegType) Generate(p *BpfProg, r *randGen, call *BpfCall, arg i
 	call.StackVarSize = varSize
 	a.IsNotNull = true
 	a.Name = fmt.Sprintf("v%d", p.VarId)
-	a.Prepare = fmt.Sprintf("	char %p[%d] = {};\n", a.Name, varSize)
+	a.Prepare = fmt.Sprintf("	char %s[%d] = {};\n", a.Name, varSize)
 	p.VarId += 1
 	return a
 }
