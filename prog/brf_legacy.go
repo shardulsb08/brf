@@ -126,7 +126,7 @@ func (m *BpfMap) String() string {
 		fmt.Fprintf(s, "    __type(value, %v);\n", m.Val.Name)
 	}
 	if m.InnerMap != nil {
-		fmt.Fprintf(s, "} %v SEC(\".maps\") = { .values = {&%v}, };\n", m.Name, m.InnerMap.Name)
+		fmt.Fprintf(s, "} %v SEC(\".maps\") = { .value = {&%v}, };\n", m.Name, m.InnerMap.Name)
 	} else {
 		fmt.Fprintf(s, "} %v SEC(\".maps\");\n", m.Name)
 	}
