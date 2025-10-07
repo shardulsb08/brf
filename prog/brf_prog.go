@@ -23,6 +23,10 @@ type BpfProg struct {
 	RetVal      int
 	SecStr      string
 	Sec         SecDef
+	TotalStackUsage int
+	ScratchMapName  string
+	ScratchMapVars  []string
+	ScratchMapIndex int
 }
 
 type BrfGenProgOpt struct {

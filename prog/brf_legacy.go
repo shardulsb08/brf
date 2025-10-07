@@ -308,6 +308,10 @@ func NewBpfProg(pt *BpfProgType, r *randGen, opt BrfGenProgOpt) *BpfProg {
 		Externs: make(map[string]string),
 		CtxVars: make(map[string]string),
 		CtxTypes: make(map[string]string),
+		TotalStackUsage: 0,
+		ScratchMapName:  "scratch_map",
+		ScratchMapVars:  make([]string, 3), // Pool of 3 scratch buffers
+		ScratchMapIndex: 0,
 	}
 
 	if (opt.useTestSrc) {
@@ -315,6 +319,32 @@ func NewBpfProg(pt *BpfProgType, r *randGen, opt BrfGenProgOpt) *BpfProg {
 		p.UseTestSrc = true
 	} else {
 		p.BasePath = opt.basePath + fmt.Sprintf("/prog_%x", time.Now().UnixNano())
+	}
+
+	// Always create scratch map for hybrid stack allocation
+	scratchMap := &BpfMap{
+		Name:  "scratch_map",
+		Type:  "BPF_MAP_TYPE_PERCPU_ARRAY",
+		Flags: []string{},
+		Key: &StructDef{
+			Name:       "uint32_t",
+			FieldTypes: []string{"uint32_t"},
+			Size:       4,
+			IsStruct:   false,
+		},
+		Val: &StructDef{
+			Name:       "char [256]",
+			FieldTypes: []string{"char [256]"},
+			Size:       256,
+			IsStruct:   false,
+		},
+		MaxEntries: 3, // 3 buffers in the pool
+	}
+	p.Maps = append(p.Maps, scratchMap)
+	// Generate scratch map lookup variables for each buffer in the pool
+	for i := 0; i < 3; i++ {
+		p.ScratchMapVars[i] = fmt.Sprintf("v%d", p.VarId)
+		p.VarId += 1
 	}
 
 	if r != nil {
@@ -1302,12 +1332,24 @@ func (t PtrToStackRegType) Generate(p *BpfProg, r *randGen, call *BpfCall, arg i
 		}
 	}
 
-	call.StackVarSize = varSize
-	a.IsNotNull = true
-	a.Name = fmt.Sprintf("v%d", p.VarId)
-	a.Prepare = fmt.Sprintf("	char %s[%d] = {};\n", a.Name, varSize)
-	p.VarId += 1
-	return a
+	// HYBRID LOGIC: Check stack budget first
+	if p.TotalStackUsage+varSize <= 500 {
+		// Stack has space - use stack allocation
+		call.StackVarSize = varSize
+		a.IsNotNull = true
+		a.Name = fmt.Sprintf("v%d", p.VarId)
+		a.Prepare = fmt.Sprintf("	char %s[%d] = {};\n", a.Name, varSize)
+		p.VarId += 1
+		p.TotalStackUsage += varSize
+		return a
+	} else {
+		// Stack is full - use scratch map fallback with round-robin selection
+		a.IsNotNull = true
+		a.Name = p.ScratchMapVars[p.ScratchMapIndex]    // Use next buffer in pool
+		a.Prepare = ""                                  // No preparation needed - already looked up
+		p.ScratchMapIndex = (p.ScratchMapIndex + 1) % 3 // Round-robin to next buffer
+		return a
+	}
 }
 
 func (t PtrToStackRegType) CheckAccess(p *BpfProg, h *BpfHelper, isWrite bool) bool {
@@ -2078,7 +2120,13 @@ func bpfRetType(call *BpfCall) string {
 		if call.ArgMap.Val == nil {
 			return "void *"
 		} else {
-			return fmt.Sprintf("%v*", call.ArgMap.Val.Name)
+			// Handle array types specially (e.g., "char [256]")
+			valName := call.ArgMap.Val.Name
+			if strings.Contains(valName, "[") {
+				// For array types like "char [256]", just use "char *"
+				return "char *"
+			}
+			return fmt.Sprintf("%v*", valName)
 		}
 	} else if call.Helper.Ret == "RET_PTR_TO_BTF_ID_OR_NULL" ||
 		call.Helper.Ret == "RET_PTR_TO_BTF_ID" {
@@ -2619,6 +2667,15 @@ func (p *BpfProg) genCSource() string {
 	for field, v := range p.CtxVars {
 		fmt.Fprintf(s, "	%s %s = ctx->%s;\n", p.CtxTypes[field], v, field)
 	}
+
+	// Add scratch map lookup for hybrid stack allocation
+	fmt.Fprintf(s, "        uint32_t scratch_key = 0;\n")
+	for i := 0; i < 3; i++ {
+		fmt.Fprintf(s, "        char *%s = bpf_map_lookup_elem(&%s, &scratch_key);\n", p.ScratchMapVars[i], p.ScratchMapName)
+		fmt.Fprintf(s, "        if (!%s) return 0;\n", p.ScratchMapVars[i]) // Safety check
+		fmt.Fprintf(s, "        scratch_key++;\n")                          // Move to next buffer
+	}
+
 	for i, call := range p.Calls {
 		for j, arg := range call.Args {
 			if arg == nil {
