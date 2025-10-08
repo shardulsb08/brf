@@ -798,14 +798,19 @@ func generateStruct(p *BpfProg, r *randGen, sizeConstraints []int, hints map[Arg
 	if min == max {
 		size = min
 	} else if max > min {
-		// XXX Re-adjust max to 128 for now
+		// XXX Re-adjust max to 128 for now, but ensure it's not less than min
 		if max > 128 {
 			max = 128
 		}
-		size = r.Intn(max-min+1) + min
-		// adjust size according to alignment
-		if align != 1 {
-			size = size - (size%align)
+		// If min was adjusted to be larger than our capped max, use min as the size
+		if min > max {
+			size = min
+		} else {
+			size = r.Intn(max-min+1) + min
+			// adjust size according to alignment
+			if align != 1 {
+				size = size - (size%align)
+			}
 		}
 	} else {
 		fmt.Printf("error: max < min\n")
