@@ -11107,13 +11107,13 @@ static void setup_leak()
 	if (!write_file(KMEMLEAK_FILE, "scan"))
 		fail("failed to write(kmemleak, \"scan\")");
         else
-                debug_info("setup_leak: kmemleak scan success- 1\n");
+                debug("setup_leak: kmemleak scan success- 1\n");
 
 	sleep(5);
 	if (!write_file(KMEMLEAK_FILE, "scan"))
 		fail("failed to write(kmemleak, \"scan\")");
         else
-                debug_info("setup_leak: kmemleak scan success- 2\n");
+                debug("setup_leak: kmemleak scan success- 2\n");
 
 	if (!write_file(KMEMLEAK_FILE, "clear"))
 		fail("failed to write(kmemleak, \"clear\")");
@@ -11127,13 +11127,19 @@ static void check_leaks(void)
 #endif
 {
 	int fd = open(KMEMLEAK_FILE, O_RDWR);
+	uint64 start;
+	int nleaks = 0;
+	static char buf[128 << 10];
+	ssize_t n;
+	char* pos;
+	char* end;
 	if (fd == -1)
 		fail("failed to open(kmemleak)");
-	uint64 start = current_time_ms();
+	start = current_time_ms();
 	if (write(fd, "scan", 4) != 4)
 		fail("failed to write(kmemleak, \"scan\")");
         else
-                debug_info("check_leaks: kmemleak scan success- 1\n");
+                debug("check_leaks: kmemleak scan success- 1\n");
 
 	sleep(1);
 	while (current_time_ms() - start < 4 * 1000)
@@ -11141,34 +11147,33 @@ static void check_leaks(void)
 	if (write(fd, "scan", 4) != 4)
 		fail("failed to write(kmemleak, \"scan\")");
         else
-                debug_info("check_leaks: kmemleak scan success- 2\n");
-	static char buf[128 << 10];
-	ssize_t n = read(fd, buf, sizeof(buf) - 1);
+                debug("check_leaks: kmemleak scan success- 2\n");
+	n = read(fd, buf, sizeof(buf) - 1);
 	if (n < 0)
 		fail("failed to read(kmemleak)");
-	int nleaks = 0;
 	if (n != 0) {
 		sleep(1);
 		if (write(fd, "scan", 4) != 4)
 			fail("failed to write(kmemleak, \"scan\")");
                 else
-                        debug_info("check_leaks: kmemleak scan success- 3\n");
+                        debug("check_leaks: kmemleak scan success- 3\n");
 		if (lseek(fd, 0, SEEK_SET) < 0)
 			fail("failed to lseek(kmemleak)");
 		n = read(fd, buf, sizeof(buf) - 1);
 		if (n < 0)
 			fail("failed to read(kmemleak)");
 		buf[n] = 0;
-		char* pos = buf;
-		char* end = buf + n;
+		pos = buf;
+		end = buf + n;
 		while (pos < end) {
 			char* next = strstr(pos + 1, "unreferenced object");
+			int f;
+			char prev;
 			if (!next)
 				next = end;
-			char prev = *next;
+			prev = *next;
 			*next = 0;
 #if SYZ_EXECUTOR
-			int f;
 			for (f = 0; f < nframes; f++) {
 				if (strstr(pos, frames[f]))
 					break;
