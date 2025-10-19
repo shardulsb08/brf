@@ -250,6 +250,12 @@ const (
 	BPF_FUNC_user_ringbuf_drain
 	BPF_FUNC_cgrp_storage_get
 	BPF_FUNC_cgrp_storage_delete
+	BPF_FUNC_xdp_fib_lookup_proto
+	BPF_FUNC_xdp_get_buff_len_proto
+	BPF_FUNC_xdp_load_bytes_proto
+	BPF_FUNC_xdp_store_bytes_proto
+
+	BPF_FUNC_sock_hash_update_proto
 )
 
 var HelperFuncMap = map[string]*BpfHelper{
@@ -352,6 +358,9 @@ var HelperFuncMap = map[string]*BpfHelper{
 	"sk_reuseport_load_bytes_relative_proto":   &BpfHelper{Uname: "bpf_skb_load_bytes_relative", Enum: BPF_FUNC_skb_load_bytes_relative, Impl: "sk_reuseport_load_bytes_relative", Proto: "sk_reuseport_load_bytes_relative_proto", Args: []string{"ARG_PTR_TO_CTX", "ARG_ANYTHING", "ARG_PTR_TO_UNINIT_MEM", "ARG_CONST_SIZE", "ARG_ANYTHING"}, Ret: "RET_INTEGER"},
 	"bpf_skb_fib_lookup_proto":                 &BpfHelper{Uname: "bpf_fib_lookup", Enum: BPF_FUNC_fib_lookup, Impl: "bpf_skb_fib_lookup", Proto: "bpf_skb_fib_lookup_proto", Args: []string{"ARG_PTR_TO_CTX", "ARG_PTR_TO_MEM", "ARG_CONST_SIZE", "ARG_ANYTHING"}, Ret: "RET_INTEGER", GplOnly: true},
 	"bpf_xdp_fib_lookup_proto":                 &BpfHelper{Uname: "bpf_fib_lookup", Enum: BPF_FUNC_fib_lookup, Impl: "bpf_xdp_fib_lookup", Proto: "bpf_xdp_fib_lookup_proto", Args: []string{"ARG_PTR_TO_CTX", "ARG_PTR_TO_MEM", "ARG_CONST_SIZE", "ARG_ANYTHING"}, Ret: "RET_INTEGER", GplOnly: true},
+	"bpf_xdp_get_buff_len_proto":               &BpfHelper{Uname: "bpf_xdp_get_buff_len", Enum: BPF_FUNC_xdp_get_buff_len, Impl: "bpf_xdp_get_buff_len", Proto: "bpf_xdp_get_buff_len_proto", Args: []string{"ARG_PTR_TO_CTX"}, Ret: "RET_INTEGER"},
+	"bpf_xdp_load_bytes_proto":                 &BpfHelper{Uname: "bpf_xdp_load_bytes", Enum: BPF_FUNC_xdp_load_bytes, Impl: "bpf_xdp_load_bytes", Proto: "bpf_xdp_load_bytes_proto", Args: []string{"ARG_PTR_TO_CTX", "ARG_ANYTHING", "ARG_PTR_TO_UNINIT_MEM", "ARG_CONST_SIZE"}, Ret: "RET_INTEGER"},
+	"bpf_xdp_store_bytes_proto":                &BpfHelper{Uname: "bpf_xdp_store_bytes", Enum: BPF_FUNC_xdp_store_bytes, Impl: "bpf_xdp_store_bytes", Proto: "bpf_xdp_store_bytes_proto", Args: []string{"ARG_PTR_TO_CTX", "ARG_ANYTHING", "ARG_PTR_TO_MEM", "ARG_CONST_SIZE"}, Ret: "RET_INTEGER"},
 	"bpf_sock_hash_update_proto":               &BpfHelper{Uname: "bpf_sock_hash_update", Enum: BPF_FUNC_sock_hash_update, Impl: "bpf_sock_hash_update", Proto: "bpf_sock_hash_update_proto", Args: []string{"ARG_PTR_TO_CTX", "ARG_CONST_MAP_PTR", "ARG_PTR_TO_MAP_KEY", "ARG_ANYTHING"}, Ret: "RET_INTEGER"},
 	"bpf_msg_redirect_hash_proto":              &BpfHelper{Uname: "bpf_msg_redirect_hash", Enum: BPF_FUNC_msg_redirect_hash, Impl: "bpf_msg_redirect_hash", Proto: "bpf_msg_redirect_hash_proto", Args: []string{"ARG_PTR_TO_CTX", "ARG_CONST_MAP_PTR", "ARG_PTR_TO_MAP_KEY", "ARG_ANYTHING"}, Ret: "RET_INTEGER"},
 	"bpf_sk_redirect_hash_proto":               &BpfHelper{Uname: "bpf_sk_redirect_hash", Enum: BPF_FUNC_sk_redirect_hash, Impl: "bpf_sk_redirect_hash", Proto: "bpf_sk_redirect_hash_proto", Args: []string{"ARG_PTR_TO_CTX", "ARG_CONST_MAP_PTR", "ARG_PTR_TO_MAP_KEY", "ARG_ANYTHING"}, Ret: "RET_INTEGER"},
@@ -1067,6 +1076,7 @@ var ProgTypeMap = map[BpfProgTypeEnum]*BpfProgType{
 			"bpf_xdp_adjust_meta_proto", "bpf_xdp_redirect_proto", "bpf_xdp_redirect_map_proto", "bpf_xdp_adjust_tail_proto",
 			"bpf_xdp_fib_lookup_proto", "bpf_xdp_check_mtu_proto", "bpf_xdp_sk_lookup_udp_proto", "bpf_xdp_sk_lookup_tcp_proto",
 			"bpf_sk_release_proto", "bpf_xdp_skc_lookup_tcp_proto", "bpf_tcp_check_syncookie_proto", "bpf_tcp_gen_syncookie_proto",
+			"bpf_xdp_get_buff_len_proto", "bpf_xdp_load_bytes_proto", "bpf_xdp_store_bytes_proto",
 			//bpf_sk_base_func_proto
 			"bpf_skc_to_tcp6_sock_proto", "bpf_skc_to_tcp_sock_proto", "bpf_skc_to_tcp_timewait_sock_proto", "bpf_skc_to_tcp_request_sock_proto",
 			"bpf_skc_to_udp6_sock_proto", "bpf_ktime_get_coarse_ns_proto",
