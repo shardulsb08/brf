@@ -655,7 +655,7 @@ var bpfMapTypes = []BpfMapType {
 		   []int{4,4},[]int{4,4},-1},
 	BpfMapType{"BPF_MAP_TYPE_PERCPU_HASH",
 		   [][]string{},
-		   [][]string{[]string{"BPF_F_NO_PREALLOC"},[]string{"BPF_F_WRONLY","BPF_F_RDONLY"},[]string{"BPF_F_WRONLY_PROG","BPF_F_RDONLY_PROG"},[]string{"BPF_F_ZERO_SEED"}},
+		   [][]string{[]string{"BPF_F_NO_PREALLOC"},[]string{"BPF_F_WRONLY","BPF_F_RDONLY"},[]string{"BPF_F_WRONLY_PROG","BPF_F_RDONLY_PROG"},[]string{"BPF_F_ZERO_SEED"},[]string{"BPF_F_NUMA_NODE"}},
 		   []int{1,1<<12},[]int{1,1<<12},-1},
 	BpfMapType{"BPF_MAP_TYPE_PERCPU_ARRAY",
 		   [][]string{},
@@ -757,6 +757,34 @@ var bpfMapTypes = []BpfMapType {
 		   [][]string{[]string{"BPF_F_NO_PREALLOC"}},
 		   [][]string{[]string{"BPF_F_CLONE"}},
 		   []int{4,4},[]int{1,1<<16},0}, // XXX 16 for max for now
+	BpfMapType{"BPF_MAP_TYPE_CGRP_STORAGE",
+		   [][]string{[]string{"BPF_F_NO_PREALLOC"}},	// Mandatory
+		   [][]string{[]string{"BPF_F_CLONE"}},         // Optional
+		   []int{4,4},                                  // Key: exactly 4 bytes
+		   []int{1,1<<16},                              // Value: 1 to 65536 bytes
+		   0},                                          // MaxEntries: must be 0
+	BpfMapType{"BPF_MAP_TYPE_BLOOM_FILTER",
+		   [][]string{},                                // No mandatory flags
+		   [][]string{[]string{"BPF_F_NUMA_NODE"},
+			      []string{"BPF_F_ZERO_SEED"},
+			      []string{"BPF_F_WRONLY","BPF_F_RDONLY"},
+			      []string{"BPF_F_WRONLY_PROG","BPF_F_RDONLY_PROG"}},
+		   []int{0,0},                                  // Key: must be 0
+		   []int{1,1<<12},                              // Value: 1 to 4096 bytes (conservative)
+		   -1},                                         // MaxEntries: no specific limit
+	BpfMapType{"BPF_MAP_TYPE_USER_RINGBUF",
+		   [][]string{},                                // No mandatory flags
+		   [][]string{[]string{"BPF_F_NUMA_NODE"}},     // Optional
+		   []int{0,0},                                  // Key: must be 0
+		   []int{0,0},                                  // Value: must be 0
+		   24},                                         // MaxEntries: 1<<24 pages (same as RINGBUF)
+	BpfMapType{"BPF_MAP_TYPE_ARENA",
+		   [][]string{[]string{"BPF_F_MMAPABLE"}},      // Mandatory
+		   [][]string{[]string{"BPF_F_SEGV_ON_FAULT"},
+			      []string{"BPF_F_NO_USER_CONV"}},  // Optional
+		   []int{0,0},                                  // Key: must be 0
+		   []int{0,0},                                  // Value: must be 0
+		   -1},                                         // MaxEntries: page count, no fixed upper limit
 }
 
 func generateStruct(p *BpfProg, r *randGen, sizeConstraints []int, hints map[ArgHint]bool, useHint bool, minSizeHint int) (*StructDef, bool) {
