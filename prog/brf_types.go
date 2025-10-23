@@ -485,6 +485,8 @@ var HelperFuncMap = map[string]*BpfHelper{
 	"bpf_get_attach_cookie_proto_trace":        &BpfHelper{Uname: "bpf_get_attach_cookie", Enum: BPF_FUNC_get_attach_cookie, Impl: "bpf_get_attach_cookie_trace", Proto: "bpf_get_attach_cookie_proto_trace", Args: []string{"ARG_PTR_TO_CTX"}, Ret: "RET_INTEGER"},
 	"bpf_get_attach_cookie_proto_pe":           &BpfHelper{Uname: "bpf_get_attach_cookie", Enum: BPF_FUNC_get_attach_cookie, Impl: "bpf_get_attach_cookie_pe", Proto: "bpf_get_attach_cookie_proto_pe", Args: []string{"ARG_PTR_TO_CTX"}, Ret: "RET_INTEGER"},
 	"bpf_task_pt_regs_proto":                   &BpfHelper{Uname: "bpf_task_pt_regs", Enum: BPF_FUNC_task_pt_regs, Impl: "bpf_task_pt_regs", Proto: "bpf_task_pt_regs_proto", Args: []string{"ARG_PTR_TO_BTF_ID"}, ArgBtfIds: []string{"struct task_struct"}, Ret: "RET_PTR_TO_BTF_ID", RetBtfId: "struct pt_regs", GplOnly: true},
+	"bpf_cgrp_storage_get_proto":               &BpfHelper{Uname: "bpf_cgrp_storage_get", Enum: BPF_FUNC_cgrp_storage_get, Impl: "bpf_cgrp_storage_get", Proto: "bpf_cgrp_storage_get_proto", Args: []string{"ARG_CONST_MAP_PTR", "ARG_PTR_TO_BTF_ID", "ARG_PTR_TO_MAP_VALUE_OR_NULL", "ARG_ANYTHING"}, ArgBtfIds: []string{"struct cgroup"}, Ret: "RET_PTR_TO_MAP_VALUE_OR_NULL"},
+	"bpf_cgrp_storage_delete_proto":            &BpfHelper{Uname: "bpf_cgrp_storage_delete", Enum: BPF_FUNC_cgrp_storage_delete, Impl: "bpf_cgrp_storage_delete", Proto: "bpf_cgrp_storage_delete_proto", Args: []string{"ARG_CONST_MAP_PTR", "ARG_PTR_TO_BTF_ID"}, ArgBtfIds: []string{"struct cgroup"}, Ret: "RET_INTEGER"},
 }
 
 var ProgTypeMap = map[BpfProgTypeEnum]*BpfProgType{
@@ -1343,6 +1345,31 @@ var ProgTypeMap = map[BpfProgTypeEnum]*BpfProgType{
 //		},
 //		FuncProtos: []string{//XXX: why missing this prog type
 //	}},
+	BPF_PROG_TYPE_NETFILTER: &BpfProgType{
+		Name: "netfilter",
+		User: "struct bpf_nf_ctx",
+		Kern: "struct bpf_nf_ctx",
+		Enum: BPF_PROG_TYPE_NETFILTER,
+		SecDefs: []SecDef{
+			SecDef{"netfilter", nil, false},
+		},
+		FuncProtos: []string{
+			//bpf_base_func_proto - unprivileged helpers
+			"bpf_map_lookup_elem_proto", "bpf_map_update_elem_proto", "bpf_map_delete_elem_proto", "bpf_map_push_elem_proto",
+			"bpf_map_pop_elem_proto", "bpf_map_peek_elem_proto", "bpf_get_prandom_u32_proto", "bpf_get_raw_smp_processor_id_proto",
+			"bpf_get_numa_node_id_proto", "bpf_tail_call_proto", "bpf_ktime_get_ns_proto", "bpf_ktime_get_boot_ns_proto",
+			"bpf_ringbuf_output_proto", "bpf_ringbuf_reserve_proto", "bpf_ringbuf_submit_proto", "bpf_ringbuf_discard_proto",
+			"bpf_ringbuf_query_proto", "bpf_get_current_pid_tgid_proto", "bpf_get_current_uid_gid_proto",
+			//bpf_base_func_proto - CAP_BPF helpers
+			"bpf_spin_lock_proto", "bpf_spin_unlock_proto", "bpf_jiffies64_proto", "bpf_per_cpu_ptr_proto",
+			"bpf_this_cpu_ptr_proto", "bpf_timer_init_proto", "bpf_timer_set_callback_proto", "bpf_timer_start_proto",
+			"bpf_timer_cancel_proto", "bpf_for_each_map_elem_proto", "bpf_cgrp_storage_get_proto", "bpf_cgrp_storage_delete_proto",
+			"bpf_get_current_cgroup_id_proto", "bpf_get_current_ancestor_cgroup_id_proto", "bpf_current_task_under_cgroup_proto",
+			//bpf_base_func_proto - CAP_PERFMON helpers
+			"bpf_trace_printk_proto", "bpf_get_current_task_proto", "bpf_get_current_task_btf_proto", "bpf_get_current_comm_proto",
+			"bpf_probe_read_user_proto", "bpf_probe_read_kernel_proto", "bpf_probe_read_user_str_proto", "bpf_probe_read_kernel_str_proto",
+			"bpf_snprintf_btf_proto", "bpf_snprintf_proto", "bpf_task_pt_regs_proto",
+		}},
 }
 
 type TracingIterCtx struct {
@@ -1968,6 +1995,19 @@ var CtxAccessMap = map[BpfProgTypeEnum]*BpfCtxAccess{
 			{rangeInCtx: []string{"remote_port", "remote_port"}, canRead: true, defaultSize: 4, narrowAccess: true,},
 			{rangeInCtx: []string{"local_port", "local_port"}, canRead: true, defaultSize: 4, narrowAccess: true,},
 			{rangeInCtx: []string{"default"},},
+		},
+	},
+	BPF_PROG_TYPE_NETFILTER: &BpfCtxAccess{
+		regTypeMap: map[string][][]string{
+			"PTR_TO_BTF_ID": [][]string{
+				[]string{"offsetof", "struct bpf_nf_ctx", "state", "struct nf_hook_state"},
+				[]string{"offsetof", "struct bpf_nf_ctx", "skb", "struct sk_buff"},
+			},
+		},
+		others: map[string]*BpfCtxAccess{},
+		accesses: []BpfCtxAccessAttr{
+			{rangeInCtx: []string{"state", "state"}, canRead: true, size: 8, regType: &PtrToBtfIdRegType{}},
+			{rangeInCtx: []string{"skb", "skb"}, canRead: true, size: 8, regType: &PtrToBtfIdRegType{}},
 		},
 	},
 }

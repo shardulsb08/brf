@@ -606,6 +606,13 @@ var ctxStructsMap = map[string]*StructDef{
 		Size: 168,
 		IsStruct: true,
 	},
+	"bpf_nf_ctx": &StructDef{
+		Name:       "bpf_nf_ctx",
+		FieldTypes: []string{"void *", "void *"},
+		FieldNames: []string{"state", "skb"},
+		Size:       16,
+		IsStruct:   true,
+	},
 }
 
 type PtrToCtxRegType struct {
@@ -943,6 +950,8 @@ var funcCompMaps = map[BpfHelperEnum][]string {
 	BPF_FUNC_inode_storage_delete: []string{"BPF_MAP_TYPE_INODE_STORAGE"},
 	BPF_FUNC_task_storage_get: []string{"BPF_MAP_TYPE_TASK_STORAGE"},
 	BPF_FUNC_task_storage_delete: []string{"BPF_MAP_TYPE_TASK_STORAGE"},
+	BPF_FUNC_cgrp_storage_get:          []string{"BPF_MAP_TYPE_CGRP_STORAGE"},
+	BPF_FUNC_cgrp_storage_delete:       []string{"BPF_MAP_TYPE_CGRP_STORAGE"},
 }
 
 var mapCompFuncs = map[string][]BpfHelperEnum {
@@ -969,6 +978,7 @@ var mapCompFuncs = map[string][]BpfHelperEnum {
 	"BPF_MAP_TYPE_SK_STORAGE": []BpfHelperEnum{BPF_FUNC_sk_storage_get,BPF_FUNC_sk_storage_delete},
 	"BPF_MAP_TYPE_INODE_STORAGE": []BpfHelperEnum{BPF_FUNC_inode_storage_get,BPF_FUNC_inode_storage_delete},
 	"BPF_MAP_TYPE_TASK_STORAGE": []BpfHelperEnum{BPF_FUNC_task_storage_get,BPF_FUNC_task_storage_delete},
+	"BPF_MAP_TYPE_CGRP_STORAGE":        []BpfHelperEnum{BPF_FUNC_cgrp_storage_get, BPF_FUNC_cgrp_storage_delete},
 }
 
 func isMapFuncCompatible(m string, f BpfHelperEnum) bool {
@@ -2659,6 +2669,8 @@ func genRandReturnVal(r *randGen, e BpfProgTypeEnum) int {
 			retVal = 0
 		case BPF_PROG_TYPE_SK_LOOKUP:
 			retVal = r.Intn(2) //(SK_DROP, SK_PASS)
+		case BPF_PROG_TYPE_NETFILTER:
+			retVal = r.Intn(2) //(NF_DROP=0, NF_ACCEPT=1)
 		default:
 			retVal = r.Intn(1<<32)
 	}
