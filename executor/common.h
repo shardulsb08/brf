@@ -226,7 +226,7 @@ static void use_temporary_dir(void)
 #elif GOOS_fuchsia
 	char tmpdir_template[] = "/tmp/syzkaller.XXXXXX";
 #else
-	char tmpdir_template[] = "./syzkaller.XXXXXX";
+	char tmpdir_template[] = "/tmp/syzkaller.XXXXXX";
 #endif
 	char* tmpdir = mkdtemp(tmpdir_template);
 	if (!tmpdir)
