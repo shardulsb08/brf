@@ -488,6 +488,17 @@ var HelperFuncMap = map[string]*BpfHelper{
 	"bpf_task_pt_regs_proto":                   &BpfHelper{Uname: "bpf_task_pt_regs", Enum: BPF_FUNC_task_pt_regs, Impl: "bpf_task_pt_regs", Proto: "bpf_task_pt_regs_proto", Args: []string{"ARG_PTR_TO_BTF_ID"}, ArgBtfIds: []string{"struct task_struct"}, Ret: "RET_PTR_TO_BTF_ID", RetBtfId: "struct pt_regs", GplOnly: true},
 	"bpf_cgrp_storage_get_proto":               &BpfHelper{Uname: "bpf_cgrp_storage_get", Enum: BPF_FUNC_cgrp_storage_get, Impl: "bpf_cgrp_storage_get", Proto: "bpf_cgrp_storage_get_proto", Args: []string{"ARG_CONST_MAP_PTR", "ARG_PTR_TO_BTF_ID", "ARG_PTR_TO_MAP_VALUE_OR_NULL", "ARG_ANYTHING"}, ArgBtfIds: []string{"struct cgroup"}, Ret: "RET_PTR_TO_MAP_VALUE_OR_NULL"},
 	"bpf_cgrp_storage_delete_proto":            &BpfHelper{Uname: "bpf_cgrp_storage_delete", Enum: BPF_FUNC_cgrp_storage_delete, Impl: "bpf_cgrp_storage_delete", Proto: "bpf_cgrp_storage_delete_proto", Args: []string{"ARG_CONST_MAP_PTR", "ARG_PTR_TO_BTF_ID"}, ArgBtfIds: []string{"struct cgroup"}, Ret: "RET_INTEGER"},
+	"bpf_ima_file_hash_proto":                  &BpfHelper{Uname: "bpf_ima_file_hash", Enum: BPF_FUNC_ima_file_hash, Impl: "bpf_ima_file_hash", Proto: "bpf_ima_file_hash_proto", Args: []string{"ARG_PTR_TO_BTF_ID", "ARG_PTR_TO_UNINIT_MEM", "ARG_CONST_SIZE"}, ArgBtfIds: []string{"struct file"}, Ret: "RET_INTEGER"},
+	"bpf_get_attach_cookie_proto_lsm":          &BpfHelper{Uname: "bpf_get_attach_cookie", Enum: BPF_FUNC_get_attach_cookie, Impl: "bpf_get_attach_cookie", Proto: "bpf_get_attach_cookie_proto_lsm", Args: []string{"ARG_PTR_TO_CTX"}, Ret: "RET_INTEGER"},
+	"bpf_unlocked_sk_setsockopt_proto":         &BpfHelper{Uname: "bpf_setsockopt", Enum: BPF_FUNC_setsockopt, Impl: "bpf_unlocked_sk_setsockopt", Proto: "bpf_unlocked_sk_setsockopt_proto", Args: []string{"ARG_PTR_TO_BTF_ID_SOCK_COMMON", "ARG_ANYTHING", "ARG_ANYTHING", "ARG_PTR_TO_MEM", "ARG_CONST_SIZE"}, Ret: "RET_INTEGER"},
+	"bpf_unlocked_sk_getsockopt_proto":         &BpfHelper{Uname: "bpf_getsockopt", Enum: BPF_FUNC_getsockopt, Impl: "bpf_unlocked_sk_getsockopt", Proto: "bpf_unlocked_sk_getsockopt_proto", Args: []string{"ARG_PTR_TO_BTF_ID_SOCK_COMMON", "ARG_ANYTHING", "ARG_ANYTHING", "ARG_PTR_TO_UNINIT_MEM", "ARG_CONST_SIZE"}, Ret: "RET_INTEGER"},
+	"bpf_get_retval_proto":                     &BpfHelper{Uname: "bpf_get_retval", Enum: BPF_FUNC_get_retval, Impl: "bpf_get_retval", Proto: "bpf_get_retval_proto", Ret: "RET_INTEGER"},
+	"bpf_set_retval_proto":                     &BpfHelper{Uname: "bpf_set_retval", Enum: BPF_FUNC_set_retval, Impl: "bpf_set_retval", Proto: "bpf_set_retval_proto", Args: []string{"ARG_ANYTHING"}, Ret: "RET_INTEGER"},
+	"bpf_kptr_xchg_proto":                      &BpfHelper{Uname: "bpf_kptr_xchg", Enum: BPF_FUNC_kptr_xchg, Impl: "bpf_kptr_xchg", Proto: "bpf_kptr_xchg_proto", Args: []string{"ARG_PTR_TO_MEM", "ARG_PTR_TO_BTF_ID_OR_NULL"}, Ret: "RET_PTR_TO_BTF_ID_OR_NULL"},
+	"bpf_loop_proto":                           &BpfHelper{Uname: "bpf_loop", Enum: BPF_FUNC_loop, Impl: "bpf_loop", Proto: "bpf_loop_proto", Args: []string{"ARG_ANYTHING", "ARG_PTR_TO_FUNC", "ARG_PTR_TO_STACK_OR_NULL", "ARG_ANYTHING"}, Ret: "RET_INTEGER"},
+	"bpf_user_ringbuf_drain_proto":             &BpfHelper{Uname: "bpf_user_ringbuf_drain", Enum: BPF_FUNC_user_ringbuf_drain, Impl: "bpf_user_ringbuf_drain", Proto: "bpf_user_ringbuf_drain_proto", Args: []string{"ARG_CONST_MAP_PTR", "ARG_PTR_TO_FUNC", "ARG_PTR_TO_STACK_OR_NULL", "ARG_ANYTHING"}, Ret: "RET_INTEGER"},
+	"bpf_strncmp_proto":                        &BpfHelper{Uname: "bpf_strncmp", Enum: BPF_FUNC_strncmp, Impl: "bpf_strncmp", Proto: "bpf_strncmp_proto", Args: []string{"ARG_PTR_TO_MEM", "ARG_CONST_SIZE", "ARG_PTR_TO_CONST_STR"}, Ret: "RET_INTEGER"},
+	"bpf_ktime_get_tai_ns_proto":               &BpfHelper{Uname: "bpf_ktime_get_tai_ns", Enum: BPF_FUNC_ktime_get_tai_ns, Impl: "bpf_ktime_get_tai_ns", Proto: "bpf_ktime_get_tai_ns_proto", Ret: "RET_INTEGER"},
 }
 
 var ProgTypeMap = map[BpfProgTypeEnum]*BpfProgType{
@@ -1308,16 +1319,42 @@ var ProgTypeMap = map[BpfProgTypeEnum]*BpfProgType{
 //		},
 //		FuncProtos: []string{//XXX: why missing this prog type
 //	}},
-//	BPF_PROG_TYPE_LSM: &BpfProgType{
-//		Name: "lsm",
-//		User: "void *",
-//		Kern: "void *",
-//		Enum: BPF_PROG_TYPE_LSM,
-//		SecDefs: []SecDef{
-//			SecDef{"lsm/", nil, false},
-//			SecDef{"lsm.s/", nil, true},
-//		},
-//		FuncProtos: []string{//XXX: why missing this prog type
+	BPF_PROG_TYPE_LSM: &BpfProgType{
+		Name: "lsm",
+		User: "void *",
+		Kern: "void *",
+		Enum: BPF_PROG_TYPE_LSM,
+		SecDefs: []SecDef{
+			SecDef{"lsm/", GenLsmEntry, false},
+			SecDef{"lsm.s/", GenLsmEntry, true},
+		},
+		FuncProtos: []string{
+			// LSM-specific helpers (10)
+			"bpf_inode_storage_get_proto", "bpf_inode_storage_delete_proto", "bpf_sk_storage_get_proto", "bpf_sk_storage_delete_proto",
+			"bpf_spin_lock_proto", "bpf_spin_unlock_proto", "bpf_bprm_opts_set_proto", "bpf_ima_inode_hash_proto", "bpf_ima_file_hash_proto",
+			"bpf_get_attach_cookie_proto_lsm",
+			// LSM CGROUP helpers (7)
+			"bpf_get_local_storage_proto", "bpf_get_retval_proto", "bpf_set_retval_proto",
+			"bpf_unlocked_sk_setsockopt_proto", "bpf_unlocked_sk_getsockopt_proto", "bpf_sk_setsockopt_proto", "bpf_sk_getsockopt_proto",
+			// Additional base helpers (5)
+			"bpf_kptr_xchg_proto", "bpf_loop_proto", "bpf_user_ringbuf_drain_proto", "bpf_strncmp_proto", "bpf_ktime_get_tai_ns_proto",
+			// bpf_tracing_func_proto (42 helpers)
+			"bpf_map_lookup_elem_proto", "bpf_map_update_elem_proto", "bpf_map_delete_elem_proto", "bpf_map_push_elem_proto",
+			"bpf_map_pop_elem_proto", "bpf_map_peek_elem_proto", "bpf_ktime_get_ns_proto", "bpf_ktime_get_boot_ns_proto",
+			"bpf_tail_call_proto", "bpf_get_current_pid_tgid_proto", "bpf_get_current_task_proto", "bpf_get_current_task_btf_proto",
+			"bpf_task_pt_regs_proto", "bpf_get_current_uid_gid_proto", "bpf_get_current_comm_proto", "bpf_trace_printk_proto",
+			"bpf_get_smp_processor_id_proto", "bpf_get_numa_node_id_proto", "bpf_perf_event_read_proto", "bpf_current_task_under_cgroup_proto",
+			"bpf_get_prandom_u32_proto", "bpf_probe_write_user_proto", "bpf_probe_read_user_proto", "bpf_probe_read_kernel_proto",
+			"bpf_probe_read_user_str_proto", "bpf_probe_read_kernel_str_proto", "bpf_probe_read_compat_proto", "bpf_probe_read_compat_str_proto",
+			"bpf_get_current_cgroup_id_proto", "bpf_get_current_ancestor_cgroup_id_proto", "bpf_send_signal_proto", "bpf_send_signal_thread_proto",
+			"bpf_perf_event_read_value_proto", "bpf_get_ns_current_pid_tgid_proto", "bpf_ringbuf_output_proto", "bpf_ringbuf_reserve_proto",
+			"bpf_ringbuf_submit_proto", "bpf_ringbuf_discard_proto", "bpf_ringbuf_query_proto", "bpf_jiffies64_proto",
+			"bpf_get_task_stack_proto", "bpf_copy_from_user_proto", "bpf_snprintf_btf_proto", "bpf_per_cpu_ptr_proto",
+			"bpf_this_cpu_ptr_proto", "bpf_task_storage_get_proto", "bpf_task_storage_delete_proto", "bpf_for_each_map_elem_proto",
+			"bpf_snprintf_proto", "bpf_get_func_ip_proto_tracing", "bpf_cgrp_storage_get_proto", "bpf_cgrp_storage_delete_proto",
+			"bpf_timer_init_proto", "bpf_timer_set_callback_proto", "bpf_timer_start_proto", "bpf_timer_cancel_proto",
+		}},
+
 //			"bpf_inode_storage_get_proto","bpf_inode_storage_delete_proto","bpf_sk_storage_get_proto", "bpf_sk_storage_delete_proto",
 //			"bpf_spin_lock_proto", "bpf_spin_unlock_proto", "bpf_bprm_opts_set_proto", "bpf_ima_inode_hash_proto",
 //			//bpf_tracing_func_proto
@@ -1459,6 +1496,15 @@ func GenBPFTrampoline(r *randGen) (string, *StructDef) {
 func GenTracingIter(r *randGen) (string, *StructDef) {
 	i := r.Intn(len(tracingIterCtxs))
 	return tracingIterCtxs[i].Name, nil
+}
+
+func GenLsmEntry(r *randGen) (string, *StructDef) {
+	hooks := []string{
+		"file_open", "file_permission", "inode_permission",
+		"task_alloc", "socket_create", "socket_connect",
+		"bprm_check_security",
+	}
+	return hooks[r.Intn(len(hooks))], nil
 }
 
 var CtxAccessMap = map[BpfProgTypeEnum]*BpfCtxAccess{
@@ -2044,6 +2090,14 @@ var CtxAccessMap = map[BpfProgTypeEnum]*BpfCtxAccess{
 		accesses: []BpfCtxAccessAttr{
 			// syscall_prog_is_valid_access allows any aligned access within U16_MAX
 			{rangeInCtx: []string{"default"}, canRead: true, canWrite: true},
+		},
+	},
+	BPF_PROG_TYPE_LSM: &BpfCtxAccess{
+		regTypeMap: map[string][][]string{},
+		others:     map[string]*BpfCtxAccess{},
+		accesses: []BpfCtxAccessAttr{
+			// btf_ctx_access - BTF-based context access (hook-specific)
+			{rangeInCtx: []string{"default"}, canRead: true},
 		},
 	},
 }
