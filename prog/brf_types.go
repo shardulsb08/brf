@@ -476,6 +476,7 @@ var HelperFuncMap = map[string]*BpfHelper{
 	"bpf_sys_bpf_proto":                        &BpfHelper{Uname: "bpf_sys_bpf", Enum: BPF_FUNC_sys_bpf, Impl: "bpf_sys_bpf", Proto: "bpf_sys_bpf_proto", Args: []string{"ARG_ANYTHING", "ARG_PTR_TO_MEM", "ARG_CONST_SIZE"}, Ret: "RET_INTEGER"},
 	"bpf_btf_find_by_name_kind_proto":          &BpfHelper{Uname: "bpf_btf_find_by_name_kind", Enum: BPF_FUNC_btf_find_by_name_kind, Impl: "bpf_btf_find_by_name_kind", Proto: "bpf_btf_find_by_name_kind_proto", Args: []string{"ARG_PTR_TO_MEM", "ARG_CONST_SIZE", "ARG_ANYTHING", "ARG_ANYTHING"}, Ret: "RET_INTEGER"},
 	"bpf_sys_close_proto":                      &BpfHelper{Uname: "bpf_sys_close", Enum: BPF_FUNC_sys_close, Impl: "bpf_sys_close", Proto: "bpf_sys_close_proto", Args: []string{"ARG_ANYTHING"}, Ret: "RET_INTEGER"},
+	"bpf_kallsyms_lookup_name_proto":           &BpfHelper{Uname: "bpf_kallsyms_lookup_name", Enum: BPF_FUNC_kallsyms_lookup_name, Impl: "bpf_kallsyms_lookup_name", Proto: "bpf_kallsyms_lookup_name_proto", Args: []string{"ARG_PTR_TO_MEM", "ARG_CONST_SIZE_OR_ZERO", "ARG_ANYTHING", "ARG_PTR_TO_FIXED_SIZE_MEM"}, Ret: "RET_INTEGER"},
 	"bpf_timer_init_proto":                     &BpfHelper{Uname: "bpf_timer_init", Enum: BPF_FUNC_timer_init, Impl: "bpf_timer_init", Proto: "bpf_timer_init_proto", Args: []string{"ARG_PTR_TO_TIMER", "ARG_CONST_MAP_PTR", "ARG_ANYTHING"}, Ret: "RET_INTEGER", GplOnly: true},
 	"bpf_timer_set_callback_proto":             &BpfHelper{Uname: "bpf_timer_set_callback", Enum: BPF_FUNC_timer_set_callback, Impl: "bpf_timer_set_callback", Proto: "bpf_timer_set_callback_proto", Args: []string{"ARG_PTR_TO_TIMER", "ARG_PTR_TO_FUNC"}, Ret: "RET_INTEGER", GplOnly: true},
 	"bpf_timer_start_proto":                    &BpfHelper{Uname: "bpf_timer_start", Enum: BPF_FUNC_timer_start, Impl: "bpf_timer_start", Proto: "bpf_timer_start_proto", Args: []string{"ARG_PTR_TO_TIMER", "ARG_ANYTHING", "ARG_ANYTHING"}, Ret: "RET_INTEGER", GplOnly: true},
@@ -1345,6 +1346,33 @@ var ProgTypeMap = map[BpfProgTypeEnum]*BpfProgType{
 //		},
 //		FuncProtos: []string{//XXX: why missing this prog type
 //	}},
+	BPF_PROG_TYPE_SYSCALL: &BpfProgType{
+		Name: "bpf_syscall",
+		User: "void *",
+		Kern: "void *",
+		Enum: BPF_PROG_TYPE_SYSCALL,
+		SecDefs: []SecDef{
+			SecDef{"syscall", nil, false},
+		},
+		FuncProtos: []string{
+			// syscall-specific helpers
+			"bpf_sys_bpf_proto", "bpf_btf_find_by_name_kind_proto", "bpf_sys_close_proto", "bpf_kallsyms_lookup_name_proto",
+			// bpf_tracing_func_proto
+			"bpf_map_lookup_elem_proto", "bpf_map_update_elem_proto", "bpf_map_delete_elem_proto", "bpf_map_push_elem_proto",
+			"bpf_map_pop_elem_proto", "bpf_map_peek_elem_proto", "bpf_ktime_get_ns_proto", "bpf_ktime_get_boot_ns_proto",
+			"bpf_tail_call_proto", "bpf_get_current_pid_tgid_proto", "bpf_get_current_task_proto", "bpf_get_current_task_btf_proto",
+			"bpf_task_pt_regs_proto", "bpf_get_current_uid_gid_proto", "bpf_get_current_comm_proto", "bpf_trace_printk_proto",
+			"bpf_get_smp_processor_id_proto", "bpf_get_numa_node_id_proto", "bpf_perf_event_read_proto", "bpf_current_task_under_cgroup_proto",
+			"bpf_get_prandom_u32_proto", "bpf_probe_write_user_proto", "bpf_probe_read_user_proto", "bpf_probe_read_kernel_proto",
+			"bpf_probe_read_user_str_proto", "bpf_probe_read_kernel_str_proto", "bpf_probe_read_compat_proto", "bpf_probe_read_compat_str_proto",
+			"bpf_get_current_cgroup_id_proto", "bpf_get_current_ancestor_cgroup_id_proto", "bpf_send_signal_proto", "bpf_send_signal_thread_proto",
+			"bpf_perf_event_read_value_proto", "bpf_get_ns_current_pid_tgid_proto", "bpf_ringbuf_output_proto", "bpf_ringbuf_reserve_proto",
+			"bpf_ringbuf_submit_proto", "bpf_ringbuf_discard_proto", "bpf_ringbuf_query_proto", "bpf_jiffies64_proto",
+			"bpf_get_task_stack_proto", "bpf_copy_from_user_proto", "bpf_snprintf_btf_proto", "bpf_per_cpu_ptr_proto",
+			"bpf_this_cpu_ptr_proto", "bpf_task_storage_get_proto", "bpf_task_storage_delete_proto", "bpf_for_each_map_elem_proto",
+			"bpf_snprintf_proto", "bpf_get_func_ip_proto_tracing", "bpf_spin_lock_proto", "bpf_spin_unlock_proto",
+			"bpf_timer_init_proto", "bpf_timer_set_callback_proto", "bpf_timer_start_proto", "bpf_timer_cancel_proto",
+	}},
 	BPF_PROG_TYPE_NETFILTER: &BpfProgType{
 		Name: "netfilter",
 		User: "struct bpf_nf_ctx",
@@ -2008,6 +2036,14 @@ var CtxAccessMap = map[BpfProgTypeEnum]*BpfCtxAccess{
 		accesses: []BpfCtxAccessAttr{
 			{rangeInCtx: []string{"state", "state"}, canRead: true, size: 8, regType: &PtrToBtfIdRegType{}},
 			{rangeInCtx: []string{"skb", "skb"}, canRead: true, size: 8, regType: &PtrToBtfIdRegType{}},
+		},
+	},
+	BPF_PROG_TYPE_SYSCALL: &BpfCtxAccess{
+		regTypeMap: map[string][][]string{},
+		others:     map[string]*BpfCtxAccess{},
+		accesses: []BpfCtxAccessAttr{
+			// syscall_prog_is_valid_access allows any aligned access within U16_MAX
+			{rangeInCtx: []string{"default"}, canRead: true, canWrite: true},
 		},
 	},
 }

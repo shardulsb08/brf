@@ -1832,6 +1832,7 @@ var compatibleRegType = map[string][]RegType {
 	"ARG_PTR_TO_MEM": mem_types,
 	"ARG_PTR_TO_MEM_OR_NULL": mem_types,
 	"ARG_PTR_TO_UNINIT_MEM": mem_types,
+	"ARG_PTR_TO_FIXED_SIZE_MEM": mem_types,
 	"ARG_PTR_TO_ALLOC_MEM": alloc_mem_types,
 	"ARG_PTR_TO_ALLOC_MEM_OR_NULL": alloc_mem_types,
 	"ARG_PTR_TO_INT": int_ptr_types,
