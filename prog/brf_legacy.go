@@ -1828,6 +1828,7 @@ var compatibleRegType = map[string][]RegType {
 	"ARG_PTR_TO_SOCKET": fullsock_types,
 	"ARG_PTR_TO_SOCKET_OR_NULL": fullsock_types,
 	"ARG_PTR_TO_BTF_ID": btf_ptr_types,
+	"ARG_PTR_TO_BTF_ID_OR_NULL": btf_ptr_types,
 	"ARG_PTR_TO_SPIN_LOCK": spin_lock_types,
 	"ARG_PTR_TO_MEM": mem_types,
 	"ARG_PTR_TO_MEM_OR_NULL": mem_types,
@@ -2001,8 +2002,10 @@ func (p *BpfProg) genCompatibleRegTypes(call *BpfCall, arg int) ([]RegType, stri
 	}
 
 	btfId := ""
-	if argType == "ARG_PTR_TO_BTF_ID" {
-		btfId = call.Helper.ArgBtfIds[0] //XXX helpers have only one at most now
+	if argType == "ARG_PTR_TO_BTF_ID" || argType == "ARG_PTR_TO_BTF_ID_OR_NULL" {
+		if len(call.Helper.ArgBtfIds) > 0 {
+			btfId = call.Helper.ArgBtfIds[0] //XXX helpers have only one at most now
+		}
 	} else if argType == "ARG_PTR_TO_BTF_ID_SOCK_COMMON" {
 		btfId = "struct sock_common"
 	}
