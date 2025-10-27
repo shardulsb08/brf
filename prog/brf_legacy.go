@@ -310,7 +310,7 @@ func NewBpfProg(pt *BpfProgType, r *randGen, opt BrfGenProgOpt) *BpfProg {
 		CtxTypes: make(map[string]string),
 		TotalStackUsage: 0,
 		ScratchMapName:  "scratch_map",
-		ScratchMapVars:  make([]string, 3), // Pool of 3 scratch buffers
+		ScratchMapVars:  make([]string, 10), // Pool of 10 scratch buffers (increased from 3)
 		ScratchMapIndex: 0,
 	}
 
@@ -338,11 +338,11 @@ func NewBpfProg(pt *BpfProgType, r *randGen, opt BrfGenProgOpt) *BpfProg {
 			Size:       256,
 			IsStruct:   false,
 		},
-		MaxEntries: 3, // 3 buffers in the pool
+		MaxEntries: 10, // 10 buffers in the pool (increased from 3)
 	}
 	p.Maps = append(p.Maps, scratchMap)
 	// Generate scratch map lookup variables for each buffer in the pool
-	for i := 0; i < 3; i++ {
+	for i := 0; i < 10; i++ {
 		p.ScratchMapVars[i] = fmt.Sprintf("v%d", p.VarId)
 		p.VarId += 1
 	}
@@ -483,11 +483,29 @@ func (t ScalarValRegType) Generate(p *BpfProg, r *randGen, call *BpfCall, arg in
 		size = call.StackVarSize
 	}
 
-	a.IsNotNull = true
-	a.Name = fmt.Sprintf("v%d", p.VarId)
-	a.Prepare = fmt.Sprintf("	int64_t %s = %d;\n", a.Name, size) // XXX does uint64 or int64 matter?
-	p.VarId += 1
-	return a
+	// Track stack usage for int64_t (8 bytes per variable)
+	// Conservative threshold (400 bytes) to account for all stack allocations
+	const int64Size = 8
+	if p.TotalStackUsage+int64Size <= 400 {
+		// Stack has space - use stack allocation
+		a.IsNotNull = true
+		a.Name = fmt.Sprintf("v%d", p.VarId)
+		a.Prepare = fmt.Sprintf("	int64_t %s = %d;\n", a.Name, size)
+		p.VarId += 1
+		p.TotalStackUsage += int64Size
+		return a
+	} else {
+		// Stack is full - reuse scratch buffer (cast char* to int64_t*)
+		// This avoids stack overflow while maintaining functionality
+		a.IsNotNull = true
+		bufferVar := p.ScratchMapVars[p.ScratchMapIndex]
+		a.Name = fmt.Sprintf("v%d", p.VarId)
+		a.Prepare = fmt.Sprintf("	int64_t *%s_ptr = (int64_t*)%s;\n	int64_t %s = %d;\n	if (%s_ptr) *%s_ptr = %s;\n",
+			a.Name, bufferVar, a.Name, size, a.Name, a.Name, a.Name)
+		p.VarId += 1
+		p.ScratchMapIndex = (p.ScratchMapIndex + 1) % 10
+		return a
+	}
 }
 
 func (t ScalarValRegType) CheckAccess(p *BpfProg, h *BpfHelper, isWrite bool) bool {
@@ -1376,7 +1394,8 @@ func (t PtrToStackRegType) Generate(p *BpfProg, r *randGen, call *BpfCall, arg i
 	}
 
 	// HYBRID LOGIC: Check stack budget first
-	if p.TotalStackUsage+varSize <= 500 {
+	// Conservative threshold (400 bytes) to account for all stack allocations
+	if p.TotalStackUsage+varSize <= 400 {
 		// Stack has space - use stack allocation
 		call.StackVarSize = varSize
 		a.IsNotNull = true
@@ -1390,7 +1409,7 @@ func (t PtrToStackRegType) Generate(p *BpfProg, r *randGen, call *BpfCall, arg i
 		a.IsNotNull = true
 		a.Name = p.ScratchMapVars[p.ScratchMapIndex]    // Use next buffer in pool
 		a.Prepare = ""                                  // No preparation needed - already looked up
-		p.ScratchMapIndex = (p.ScratchMapIndex + 1) % 3 // Round-robin to next buffer
+		p.ScratchMapIndex = (p.ScratchMapIndex + 1) % 10 // Round-robin to next buffer (10 total)
 		return a
 	}
 }
@@ -2719,7 +2738,7 @@ func (p *BpfProg) genCSource() string {
 
 	// Add scratch map lookup for hybrid stack allocation
 	fmt.Fprintf(s, "        uint32_t scratch_key = 0;\n")
-	for i := 0; i < 3; i++ {
+	for i := 0; i < 10; i++ {
 		fmt.Fprintf(s, "        char *%s = bpf_map_lookup_elem(&%s, &scratch_key);\n", p.ScratchMapVars[i], p.ScratchMapName)
 		fmt.Fprintf(s, "        if (!%s) return 0;\n", p.ScratchMapVars[i]) // Safety check
 		fmt.Fprintf(s, "        scratch_key++;\n")                          // Move to next buffer
