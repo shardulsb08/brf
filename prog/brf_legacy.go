@@ -2439,7 +2439,13 @@ func (p *BpfProg) genRandBpfHelperCall(r *randGen, call *BpfCall, arg int) (*Bpf
 }
 
 func (brf *BpfRuntimeFuzzer) GenBpfProg(r *randGen, opt BrfGenProgOpt) (*BpfProg, bool) {
-	pt := brf.progTypeMap[BpfProgTypeEnum(r.Intn(int(BPF_PROG_TYPE_TRACING))+1)]
+	// Temporarily restrict program type selection to the three
+	// recently-added types (LSM, SYSCALL, NETFILTER) so fuzzing
+	// effort is concentrated on the new paths. Revert to a uniform
+	// draw over 1..BPF_PROG_TYPE_TRACING once these stabilise.
+	pt := brf.progTypeMap[BpfProgTypeEnum(
+		[]int{int(BPF_PROG_TYPE_LSM), int(BPF_PROG_TYPE_SYSCALL), int(BPF_PROG_TYPE_NETFILTER)}[r.Intn(3)],
+	)]
 	helper := pt.Helpers[r.Intn(len(pt.Helpers))]
 	p := NewBpfProg(pt, r, opt)
 
