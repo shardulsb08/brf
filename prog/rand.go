@@ -563,7 +563,7 @@ func (r *randGen) generateCall(s *state, p *Prog, insertionPoint int) []*Call {
 	if insertionPoint > 0 {
 		// Choosing the base call is based on the insertion point of the new calls sequence.
 		insertionCall := p.Calls[r.Intn(insertionPoint)].Meta
-		if !insertionCall.Attrs.NoGenerate {
+		if !insertionCall.Attrs.NoGenerate && s.ct.Generatable(insertionCall.ID) {
 			// We must be careful not to bias towards a non-generatable call.
 			biasCall = insertionCall.ID
 		}
