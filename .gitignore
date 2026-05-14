@@ -27,3 +27,10 @@ dashboard/app/.gcloudignore
 
 # vscode
 .vscode
+
+# Claude Code: per-developer / per-machine working state.
+# CLAUDE.md, .claude/README.md, .claude/SESSION_SETUP_PATTERN.md
+# and any .claude/principles/ files are tracked; everything below
+# is local-only.  See .claude/README.md for the full split.
+/.claude/tasks/
+/.claude/settings.local.json
