@@ -216,33 +216,42 @@ Steps in C:
  3. socket(AF_INET, SOCK_STREAM, IPPROTO_MPTCP) for client.  Set
     setsockopt(SOL_MPTCP, MPTCP_INFO_xxx) as needed for csum mode.
  4. connect() client to server.  Wait for ESTABLISHED.
- 5. Capture local_key and remote_key via wire-peek.
+ 5. Capture local_key and remote_key via the new MPTCP_DEBUG_KEYS
+    getsockopt.
 
-    **Settled, 2026-05-15:**  Verified against `mptcp_brf_fuzz_base`
-    (export/20260515T083717) that `struct mptcp_info`
-    (`include/uapi/linux/mptcp.h`) exposes only `mptcpi_token` (32
-    bits), not the full 64-bit keys.  `MPTCP_FULL_INFO` adds
-    subflow-info but no keys either.  No uapi path exposes
-    `msk->local_key` / `msk->remote_key`.
+    **Resettled, 2026-05-15 (after the initial wire-peek decision):**
+    we added a small CONFIG_KCOV-gated MPTCP_DEBUG_KEYS getsockopt
+    to the kernel (patch 0003 of the mptcp_kcov series) that
+    returns `struct mptcp_debug_keys` { local_key, remote_key }
+    from the msk.  The pair_init impl calls
+    `getsockopt(client_msk_fd, SOL_MPTCP, MPTCP_DEBUG_KEYS, &keys,
+    &len)` right after `accept()` to grab both keys; the token is
+    read via the existing `MPTCP_INFO` getsockopt's mptcpi_token
+    field (set by mptcp_crypto_key_sha at MP_CAPABLE time, so the
+    value already matches what the kernel will compare against).
 
-    Therefore: capture both keys by peeking the wire.  Two sub-
-    options for the peek:
+    Rationale for moving from wire-peek to a debug sockopt:
 
-    (a) **Same-host two-netns + veth + AF_PACKET observer.**  Run
-        server in netns A, client (us) in netns B, veth pair
-        between them, AF_PACKET socket on one side to observe.
-        Server is a real IPPROTO_MPTCP socket; client is also a
-        real socket for `pair_init` (no mutation needed yet).
-        Extract local_key from client's MP_CAPABLE SYN; extract
-        remote_key from server's MP_CAPABLE SYN-ACK.  Cleanest;
-        unprivileged for the observer once veth is set up.
+    - The harness controls both endpoints; wire-peek is the
+      pattern for an external observer that does not own the
+      sockets.  We do own them.
+    - Removes ~300 lines of AF_PACKET / TCP-option parsing from
+      the harness in exchange for ~30 lines of kernel code.
+    - Removes the netns + veth setup requirement that previously
+      justified the cost of wire-peek; pair_init can run entirely
+      on 127.0.0.1 in the calling task's netns.
+    - CONFIG_KCOV gating keeps the new sockopt firmly in the
+      test/debug domain (production builds without CONFIG_KCOV do
+      not expose the keys).
+    - Wire-level injection is still required for the *mutation*
+      paths in syz_mptcp_join_subflow / syz_mptcp_drive_traffic;
+      key capture in pair_init is a separate concern.
 
-    (b) **Loopback + AF_PACKET on `lo`.**  Same idea on a single
-        netns.  Simpler setup but more contention with kernel's
-        loopback TCP behaviour.  Use if (a) turns out to have
-        netns setup latency we don't want.
-
-    Recommendation: (a).
+    Original wire-peek plan kept as historical context:
+    `MPTCP_INFO` and `MPTCP_FULL_INFO` expose only the 32-bit
+    token, not the keys.  Two-netns + veth + AF_PACKET observer
+    (recommended) and loopback + AF_PACKET on `lo` (fallback)
+    were the two pre-sockopt approaches.
  6. Compute token = upper 32 bits of SHA-256(remote_key).
  7. Compute idsn_local = lower 64 bits of SHA-256(local_key);
     idsn_remote = lower 64 bits of SHA-256(remote_key).
@@ -544,13 +553,14 @@ infrastructure is incomplete without them.
    veth + AF_PACKET observer vs (b) loopback + AF_PACKET on lo;
    recommendation (a) for cleanliness.  See Section 5.1.
 2. **netns vs loopback isolation.**  ~~Per-pair fresh netns is
-   cleanest but adds setup latency.~~  **Settled 2026-05-15.**
-   Persistent two-netns + veth pair set up at executor init
-   time, reused across all `syz_mptcp_pair_init` calls.  Per-
-   pair isolation comes from the state-carrier pool, not from
-   per-pair netns.  Cost: one-time at startup; per-pair zero.
-   Syzlang descriptions don't mention netns, so a future switch
-   to loopback isolation is C-side only -- door stays open.
+   cleanest but adds setup latency.~~  ~~Persistent two-netns +
+   veth pair.~~  **Resettled 2026-05-15.**  v01 uses *no* netns
+   isolation: both endpoints live on 127.0.0.1 in the calling
+   task's netns.  The wire-peek requirement that previously
+   justified veth+netns went away when key capture moved to the
+   MPTCP_DEBUG_KEYS sockopt (Q1 above).  netns isolation can be
+   reintroduced in v02 if cross-pair contention shows up in
+   parallel fuzz runs; the syzlang surface does not change.
 3. **Kcov-handle plumbing path.**  ~~setsockopt vs other.~~
    **Settled 2026-05-15.** New `setsockopt(SOL_MPTCP,
    MPTCP_KCOV_HANDLE, &handle)` under `CONFIG_KCOV`.  See 7.3.

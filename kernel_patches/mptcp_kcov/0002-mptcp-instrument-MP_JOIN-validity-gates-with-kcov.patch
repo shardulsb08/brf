@@ -1,7 +1,7 @@
 From 8df76b851c6fb6453809af61744ed858172f1ee8 Mon Sep 17 00:00:00 2001
 From: Shardul Bankar <shardul.b@mpiricsoftware.com>
 Date: Fri, 15 May 2026 18:43:35 +0530
-Subject: [PATCH 2/2] mptcp: instrument MP_JOIN validity gates with kcov
+Subject: [PATCH 2/3] mptcp: instrument MP_JOIN validity gates with kcov
 
 Wrap three MPTCP subflow-level validity gates with
 kcov_remote_start_prealloc / kcov_remote_stop_prealloc so coverage

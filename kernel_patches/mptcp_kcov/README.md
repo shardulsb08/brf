@@ -28,14 +28,17 @@ text below are informal iteration markers, not directory names.
 
 ## What this series adds
 
-Two patches:
+Three patches:
 
-1. **`MPTCP_KCOV_HANDLE` setsockopt + per-msk scratch area**,
-   CONFIG_KCOV-gated.  User sets a kcov remote handle on a
-   `struct mptcp_sock` via the new sockopt; the handler vmalloc()s
-   a 64 KB scratch buffer used by kcov_remote_start_prealloc.
-   v01 puts the buffer on the msk (shared across subflows).
-   The buffer is freed in mptcp_destroy().
+1. **`MPTCP_KCOV_HANDLE` setsockopt + per-msk scratch area +
+   kcov_owner ownership marker**, CONFIG_KCOV-gated.  User sets a
+   kcov remote handle on a `struct mptcp_sock` via the new
+   sockopt; the handler vmalloc()s a 64 KB scratch buffer used by
+   kcov_remote_start_prealloc.  v01 puts the buffer on the msk
+   (shared across subflows).  Accepted msks inherit the pointer
+   via sk_clone_lock()'s memcpy, so a `kcov_owner` field marks
+   the allocating msk; only that msk vfree()s on destroy.
+
 2. **Coverage-collection wrappers** around three MPTCP subflow
    validity gates:
      - `subflow_token_join_request` (token lookup, post-success)
@@ -46,6 +49,14 @@ Two patches:
    handle once into a local to avoid racing with setsockopt
    between start and stop, and reduce to a single branch when
    the handle is zero.
+
+3. **`MPTCP_DEBUG_KEYS` getsockopt** that returns
+   `struct mptcp_debug_keys` (local_key, remote_key) from the msk,
+   CONFIG_KCOV-gated.  Lets the BRF protocol-flow harness in this
+   tree obtain the MP_CAPABLE-captured cryptographic state
+   without parsing TCP-option bytes from the wire via AF_PACKET.
+   Required by `syz_mptcp_pair_init` in
+   `executor/common_brf_linux_mptcp.h`.
 
 ## Prerequisites
 
@@ -76,6 +87,7 @@ git am < $BRF/kernel_patches/bpf_kcov/0001-kcov-bpf-Add-support-for-preallocated
 # 2. This series.
 git am < $BRF/kernel_patches/mptcp_kcov/0001-mptcp-add-kcov_remote_handle-fields-and-MPTCP_KCOV_H.patch
 git am < $BRF/kernel_patches/mptcp_kcov/0002-mptcp-instrument-MP_JOIN-validity-gates-with-kcov.patch
+git am < $BRF/kernel_patches/mptcp_kcov/0003-mptcp-add-MPTCP_DEBUG_KEYS-getsockopt-for-test-harne.patch
 ```
 
 If a patch fails to apply (e.g. after the upstream base moves),

@@ -1,7 +1,7 @@
 From f354039dab126fbe133a9389147a301ba3446ac2 Mon Sep 17 00:00:00 2001
 From: Shardul Bankar <shardul.b@mpiricsoftware.com>
 Date: Fri, 15 May 2026 18:39:45 +0530
-Subject: [PATCH 1/2] mptcp: add kcov_remote_handle fields and
+Subject: [PATCH 1/3] mptcp: add kcov_remote_handle fields and
  MPTCP_KCOV_HANDLE setsockopt
 
 Add the data structures and the setsockopt path that let userspace
@@ -223,8 +223,7 @@ index 87b5796d01353..2ebc38d4faafa 100644
  		return -ENOPROTOOPT;
  
 
-base-commit: 1b7b378e36da46465441e8873bfc57de74103220
-prerequisite-patch-id: 63e53edb91492d3ff6b601868b89baecb11fff69
+base-commit: 289cf819f4d5bf449062c888a2dc3b0315ec275f
 -- 
 2.34.1
 

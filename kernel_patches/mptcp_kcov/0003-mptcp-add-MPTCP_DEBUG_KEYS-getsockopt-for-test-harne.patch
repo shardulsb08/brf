@@ -1,0 +1,113 @@
+From 232989ca6524825837d3ec4e234660fc564e91e2 Mon Sep 17 00:00:00 2001
+From: Shardul Bankar <shardul.b@mpiricsoftware.com>
+Date: Fri, 15 May 2026 22:47:43 +0530
+Subject: [PATCH 3/3] mptcp: add MPTCP_DEBUG_KEYS getsockopt for test harnesses
+
+Add a small CONFIG_KCOV-gated getsockopt that returns the msk's
+MP_CAPABLE-captured local_key and remote_key to userspace, in a
+new struct mptcp_debug_keys.
+
+Motivation: the BRF protocol-flow harness in shardulsb08/brf
+needs both keys after the MP_CAPABLE exchange so it can compute
+the HMAC-SHA256 value the kernel expects for MP_JOIN
+authentication.  Without this, the harness would have to peek
+the wire via AF_PACKET on a veth/loopback observer and parse
+MP_CAPABLE TCP option bytes from the SYN and SYN-ACK -- roughly
+300 lines of TCP-option parsing code in userspace that adds no
+test value.  Exposing the keys via a sibling sockopt of
+MPTCP_KCOV_HANDLE collapses that to a single getsockopt call
+and keeps the harness focused on the protocol-state-machine
+fuzzing it is actually meant to exercise.
+
+Same gating rationale as MPTCP_KCOV_HANDLE: this is a test
+feature; CONFIG_KCOV is itself a test/debug option that is not
+enabled in production builds, so leaking session keys via
+getsockopt is bounded to fuzzing environments.
+
+Co-developed-by: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+Signed-off-by: Shardul Bankar <shardul.b@mpiricsoftware.com>
+---
+ include/uapi/linux/mptcp.h | 14 ++++++++++++++
+ net/mptcp/sockopt.c        | 35 +++++++++++++++++++++++++++++++++++
+ 2 files changed, 49 insertions(+)
+
+diff --git a/include/uapi/linux/mptcp.h b/include/uapi/linux/mptcp.h
+index c0fa8ae609c42..2949e66fb9a4f 100644
+--- a/include/uapi/linux/mptcp.h
++++ b/include/uapi/linux/mptcp.h
+@@ -143,5 +143,19 @@ struct mptcp_full_info {
+ 					 * subflows for runtime coverage
+ 					 * collection during fuzzing.
+ 					 */
++#define MPTCP_DEBUG_KEYS	6	/* CONFIG_KCOV: read back the msk's
++					 * local_key and remote_key in a
++					 * struct mptcp_debug_keys.  Used by
++					 * the BRF protocol-flow harness to
++					 * obtain the cryptographic state
++					 * captured during MP_CAPABLE without
++					 * wire-peeking the loopback.  Not
++					 * for production use.
++					 */
++
++struct mptcp_debug_keys {
++	__u64	local_key;
++	__u64	remote_key;
++};
+ 
+ #endif /* _UAPI_MPTCP_H */
+diff --git a/net/mptcp/sockopt.c b/net/mptcp/sockopt.c
+index 2ebc38d4faafa..67d99cabf241e 100644
+--- a/net/mptcp/sockopt.c
++++ b/net/mptcp/sockopt.c
+@@ -1557,6 +1557,37 @@ static int mptcp_getsockopt_v6(struct mptcp_sock *msk, int optname,
+ 	return -EOPNOTSUPP;
+ }
+ 
++#ifdef CONFIG_KCOV
++/* Return the msk's MP_CAPABLE-captured local_key and remote_key to
++ * userspace.  Test/debug only; protected by CONFIG_KCOV so it does
++ * not exist on production builds.  Used by the BRF protocol-flow
++ * harness in shardulsb08/brf to plumb cryptographic state into the
++ * user-side harness without parsing wire packets via AF_PACKET.
++ */
++static int mptcp_getsockopt_debug_keys(struct mptcp_sock *msk,
++				       char __user *optval, int __user *optlen)
++{
++	struct mptcp_debug_keys keys;
++	int len;
++
++	if (get_user(len, optlen))
++		return -EFAULT;
++	if (len < (int)sizeof(keys))
++		return -EINVAL;
++
++	lock_sock((struct sock *)msk);
++	keys.local_key = msk->local_key;
++	keys.remote_key = msk->remote_key;
++	release_sock((struct sock *)msk);
++
++	if (copy_to_user(optval, &keys, sizeof(keys)))
++		return -EFAULT;
++	if (put_user(sizeof(keys), optlen))
++		return -EFAULT;
++	return 0;
++}
++#endif
++
+ static int mptcp_getsockopt_sol_mptcp(struct mptcp_sock *msk, int optname,
+ 				      char __user *optval, int __user *optlen)
+ {
+@@ -1569,6 +1600,10 @@ static int mptcp_getsockopt_sol_mptcp(struct mptcp_sock *msk, int optname,
+ 		return mptcp_getsockopt_tcpinfo(msk, optval, optlen);
+ 	case MPTCP_SUBFLOW_ADDRS:
+ 		return mptcp_getsockopt_subflow_addrs(msk, optval, optlen);
++#ifdef CONFIG_KCOV
++	case MPTCP_DEBUG_KEYS:
++		return mptcp_getsockopt_debug_keys(msk, optval, optlen);
++#endif
+ 	}
+ 
+ 	return -EOPNOTSUPP;
+-- 
+2.34.1
+
