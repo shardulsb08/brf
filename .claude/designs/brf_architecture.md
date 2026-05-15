@@ -414,9 +414,45 @@ material and on-wire bytes.
 
 ### Step 6: Add kcov instrumentation hooks (kernel-side patch)
 
-BRF added kcov remote-handle support so `bpf_prog_run` could feed
-coverage back to the fuzzer (`prog/brf_legacy.go` references this,
-and `executor/common_brf_linux.h:60 kcov_common_handle`).
+BRF needs kernel-side patches so coverage from kernel execution
+points (the eBPF program runtime; for us, protocol-state-machine
+entry points) feeds back to the fuzzer.  This is BRF's layer L7
+(runtime coverage feedback), and the BRF paper mentions it in
+passing as "kernel modifications required."  Shardul has authored
+the implementation as three patches, currently at version v06:
+
+```
+/mnt/work_4gb/Tools/003_kernel_testing/prana_kernel_testing/
+  container_kernel_workspace/kernel_patches/ebpf/brf/kcov_for_bpf/v06/
+    0001-kcov-bpf-Add-support-for-preallocated-coverage-area.patch
+    0002-bpf-Add-BRF-coverage-collection-support-via-kcov-rem.patch
+    0003-bpf-Support-getting-kcov_remote_handle-using-bpf_pro.patch
+```
+
+What each patch does:
+
+1. **0001 (general-purpose, reusable as-is).**  Adds
+   `kcov_remote_start_prealloc()` and `kcov_remote_stop_prealloc()`
+   variants to `kernel/kcov.c` + `include/linux/kcov.h`.  The
+   existing `kcov_remote_start()` uses `vmalloc()` which can sleep,
+   so it cannot be called from interrupt context.  The prealloc
+   variants accept caller-owned memory, making them safe in any
+   context.  **This patch is subsystem-agnostic** and applies
+   unchanged to any future protocol-harness work that needs in-IRQ
+   or in-atomic coverage collection.
+2. **0002 (eBPF-specific; the pattern transfers).**  Wires kcov
+   into BPF: adds `kcov_remote_handle`, `kcov_coverage_area`, and
+   `kcov_area_size` to `struct bpf_prog` (`include/linux/bpf.h`);
+   wraps `__bpf_prog_run()` in `kcov_remote_start_prealloc()` /
+   `kcov_remote_stop_prealloc()` calls (`include/linux/filter.h`);
+   extends `union bpf_attr` and libbpf's `bpf_prog_load_opts` to
+   pass the handle from userspace.  The pattern -- add handle +
+   prealloc area to subsystem struct, wrap entry point, extend
+   uapi -- is what we replicate for protocol subsystems.
+3. **0003 (eBPF-specific).**  Exposes `kcov_remote_handle` via
+   `struct bpf_prog_info` so userspace can confirm coverage is
+   enabled on a loaded program.  Pattern reusable if a protocol
+   harness needs the same visibility (probably not for our v1).
 
 For protocol harnesses, the analogous instrumentation points are:
 
@@ -424,10 +460,24 @@ For protocol harnesses, the analogous instrumentation points are:
 - `mptcp_pm_*` for path-manager events
 - `quic_packet_rcv` for QUIC packet receive
 - `tls_rx_one_record` for kTLS receive
-- `handshake_*` for NET_HANDSHAKE
+- `handshake_*` (in `net/handshake/`) for NET_HANDSHAKE
 
-Each needs a remote kcov handle plumbed in via a small kernel patch.
-BRF's kcov-remote-handle patch is precedent.
+For each subsystem, the recipe is:
+1. Reuse patch 0001 verbatim (it lives in `kernel/kcov.c`, not in
+   any subsystem-specific code).
+2. Author a per-subsystem analogue of patch 0002 that adds a
+   kcov handle to the subsystem's per-flow state struct (per-msk
+   for MPTCP, per-quic-sock for QUIC, per-handshake_req for tlshd)
+   and wraps the chosen entry points with the prealloc calls.
+3. Add 0003-style uapi exposure only if the harness needs to
+   verify coverage from userspace.
+
+**Reference status (2026-05-15):** patches v06 are believed to
+work but not 100% verified.  Reuse them as-is for any BRF revival
+work on eBPF.  For protocol-harness work, treat 0001 as
+load-bearing prior art and re-derive 0002/0003 for the target
+subsystem.  See also project memory
+`reference_kcov_brf_patches.md` for the patch-set version history.
 
 ## 8. The lift to protocol-flow fuzzing (architectural sketch)
 
