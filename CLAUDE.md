@@ -88,6 +88,8 @@ Session contract:
 | Touching `prog/brf*.go`, `executor/common_brf*.h`, BRF pseudo-       | `.claude/designs/brf_architecture.md`                   |
 | syscall lifecycle, or designing a new BRF-style harness extension    |                                                         |
 | (MPTCP, QUIC, tlshd, or any new protocol substrate)                  |                                                         |
+| Implementing, debugging, or extending the MPTCP MP_JOIN harness      | `.claude/designs/mptcp_join_harness_design.md`          |
+| (sys/linux/socket_mptcp_crypto.txt, executor/common_brf_linux_mptcp.h, or kernel-side kcov patches for net/mptcp/) |                                                         |
 
 ## Design principles (binding on all work in this tree)
 
