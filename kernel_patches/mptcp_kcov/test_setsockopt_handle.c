@@ -46,6 +46,13 @@
 #ifndef MPTCP_KCOV_HANDLE
 #define MPTCP_KCOV_HANDLE	5
 #endif
+#ifndef MPTCP_DEBUG_KEYS
+#define MPTCP_DEBUG_KEYS	6
+struct mptcp_debug_keys {
+	uint64_t local_key;
+	uint64_t remote_key;
+};
+#endif
 #ifndef IPPROTO_MPTCP
 #define IPPROTO_MPTCP	262
 #endif
@@ -219,6 +226,40 @@ int main(void)
 		goto out;
 	}
 	printf("MP_CAPABLE handshake: completed without errors.\n");
+
+	/* 4.5. PATCH 0003 TEST: read both keys via MPTCP_DEBUG_KEYS.
+	 *      On unpatched kernel: -1 / errno=ENOPROTOOPT.
+	 *      On patched kernel: 0, with non-zero keys after MP_CAPABLE. */
+	{
+		struct mptcp_debug_keys keys = { 0 };
+		socklen_t klen = sizeof(keys);
+
+		if (getsockopt(client, SOL_MPTCP, MPTCP_DEBUG_KEYS,
+			       &keys, &klen)) {
+			fprintf(stderr,
+				"getsockopt(MPTCP_DEBUG_KEYS) failed: %s\n",
+				strerror(errno));
+			if (errno == ENOPROTOOPT) {
+				fprintf(stderr,
+					"FAIL: kernel does not know "
+					"MPTCP_DEBUG_KEYS; patch 0003 missing.\n");
+				rc = 2;
+			} else {
+				rc = 3;
+			}
+			goto out;
+		}
+		printf("PASS: getsockopt(MPTCP_DEBUG_KEYS) -> 0\n");
+		printf("      local_key=0x%016llx\n",
+		       (unsigned long long)keys.local_key);
+		printf("      remote_key=0x%016llx\n",
+		       (unsigned long long)keys.remote_key);
+		if (keys.local_key == 0 || keys.remote_key == 0) {
+			fprintf(stderr,
+				"WARN: zero key returned -- MP_CAPABLE state "
+				"may not have settled yet on this fd.\n");
+		}
+	}
 
 	/* 5. Read coverage buffer count.  Expected zero for MP_CAPABLE
 	 *    in v01; non-zero is fine too if the kernel got more
