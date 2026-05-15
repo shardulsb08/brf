@@ -422,12 +422,17 @@ passing as "kernel modifications required."  Shardul has authored
 the implementation as three patches, currently at version v06:
 
 ```
-/mnt/work_4gb/Tools/003_kernel_testing/prana_kernel_testing/
-  container_kernel_workspace/kernel_patches/ebpf/brf/kcov_for_bpf/v06/
+brf/kernel_patches/bpf_kcov/
+    README.md
     0001-kcov-bpf-Add-support-for-preallocated-coverage-area.patch
     0002-bpf-Add-BRF-coverage-collection-support-via-kcov-rem.patch
     0003-bpf-Support-getting-kcov_remote_handle-using-bpf_pro.patch
 ```
+
+(Original location at `/mnt/work_4gb/Tools/003_kernel_testing/
+prana_kernel_testing/container_kernel_workspace/kernel_patches/
+ebpf/brf/bpf_kcov/` is kept as a historical reference;
+the in-tree copy here is the canonical source going forward.)
 
 What each patch does:
 

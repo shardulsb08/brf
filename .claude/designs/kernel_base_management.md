@@ -31,7 +31,7 @@ where its kernel base comes from.
                               v
                     BUILT KERNEL FOR FUZZING
    ----------------------------------------------------
-   ${base} + brf/kernel_patches/<harness>_kcov/vNN/*.patch
+   ${base} + brf/kernel_patches/<harness>_kcov/*.patch
 ```
 
 Three principles:
@@ -41,7 +41,7 @@ Three principles:
    nothing local to preserve).
 2. **Our kernel-side patches live in the BRF repo**, not in the
    kernel tree.  They are applied at build time, exactly like
-   `kcov_for_bpf/v06`.  This means the kernel tree stays
+   `bpf_kcov`.  This means the kernel tree stays
    "upstream-clean" -- useful for diffing against upstream and for
    reproducing bugs against the unmodified base.
 3. **Reproducibility = upstream snapshot + our patch version.**
@@ -95,18 +95,22 @@ git describe --tags                 # closest upstream tag, e.g.
 
 ## Applying our patches
 
-Our kernel-side patches are versioned series in the BRF repo:
+Our kernel-side patch series live in the BRF repo, one directory
+per `<subsystem>_kcov` series.  Files are flat inside each
+directory (no version subdirs); iterations live in BRF git
+history, and the "current" patches are always whatever is in the
+directory at the BRF commit being used.
 
 ```
 brf/kernel_patches/
-    kcov_for_bpf/v06/      # BRF runtime coverage (eBPF; existing)
-    mptcp_kcov/v??/        # MPTCP runtime coverage (future, when written)
-    quic_kcov/v??/         # QUIC runtime coverage (future)
-    handshake_kcov/v??/    # NET_HANDSHAKE runtime coverage (future)
+    bpf_kcov/              # eBPF runtime coverage (subsystem-agnostic 0001 + BPF wiring)
+    mptcp_kcov/            # MPTCP runtime coverage (current; MP_JOIN harness)
+    quic_kcov/             # in-kernel QUIC runtime coverage (future)
+    handshake_kcov/        # NET_HANDSHAKE runtime coverage (future)
 ```
 
-Apply order: first the subsystem-agnostic kcov patch (`kcov_for_bpf/
-v06/0001-...`), then the per-subsystem-specific patches.
+Apply order: first the subsystem-agnostic kcov prereq
+(`bpf_kcov/0001-...`), then the per-subsystem-specific patches.
 
 A small shell helper (TBD path) should automate this so a single
 command sets up a buildable kernel:
@@ -115,8 +119,7 @@ command sets up a buildable kernel:
 # Sketch only -- not yet written
 ./brf/scripts/setup_kernel_for_harness.sh \
     --base   mptcp/export \
-    --harness mptcp_kcov \
-    --patch-version v01
+    --harness mptcp_kcov
 ```
 
 For now, do it manually:
@@ -126,11 +129,15 @@ cd /mnt/work_4gb/Dev/mpiric_kernel_dev_env/open/src/kernel/linux
 git checkout mptcp_brf_fuzz_base
 git reset --hard mptcp/export
 
-# Apply the kcov core patch
-git am < /mnt/work_4gb/Tools/.../kcov_for_bpf/v06/0001-*.patch
+# All patches now live inside the BRF repo (self-contained dev flow).
+BRF=/mnt/work_4gb/Dev/mpiric_kernel_dev_env/open/src/fuzzing/brf
 
-# Apply the MPTCP-specific kcov patch when it exists
-# git am < /path/to/brf/kernel_patches/mptcp_kcov/v01/0002-*.patch
+# 1. Subsystem-agnostic kcov prereq.
+git am < $BRF/kernel_patches/bpf_kcov/0001-kcov-bpf-Add-support-for-preallocated-coverage-area.patch
+
+# 2. Subsystem-specific patches for whatever harness is being built.
+git am < $BRF/kernel_patches/mptcp_kcov/0001-mptcp-add-kcov_remote_handle-fields-and-MPTCP_KCOV_H.patch
+git am < $BRF/kernel_patches/mptcp_kcov/0002-mptcp-instrument-MP_JOIN-validity-gates-with-kcov.patch
 ```
 
 (Patches are 3-way mergeable in `git am`, so most upstream churn
@@ -146,10 +153,13 @@ When a harness produces a finding worth reporting upstream, capture:
        describe --tags    # e.g., export/20260515T083717
    git -C ...              log --oneline -1  # exact commit hash
    ```
-2. **Our patch series version:** e.g., `mptcp_kcov v01` (path to
-   the directory in this BRF repo).
-3. **BRF tree commit:** `git -C brf log --oneline -1` -- so the
-   harness binary is reproducible.
+2. **BRF tree commit covering the patches:** `git -C brf log
+   --oneline -1 -- kernel_patches/mptcp_kcov/` (or whichever
+   harness).  This is the canonical version identifier; iteration
+   history lives in BRF git, not in a directory name.
+3. **BRF tree commit covering the harness binary:** `git -C brf
+   log --oneline -1` -- so the userspace harness is reproducible
+   too.
 
 A standard footer for any bug report or commit message:
 
@@ -157,7 +167,7 @@ A standard footer for any bug report or commit message:
 Reproduced on:
   mptcp_net-next.git mptcp/export  @ export/20260515T083717
   brf protocol_flow_fuzzing_harness @ <commit>
-  kernel patches: brf/kernel_patches/mptcp_kcov/v01/
+  kernel patches: brf/kernel_patches/mptcp_kcov/
 ```
 
 This footer is what maintainers need to confirm the bug on their

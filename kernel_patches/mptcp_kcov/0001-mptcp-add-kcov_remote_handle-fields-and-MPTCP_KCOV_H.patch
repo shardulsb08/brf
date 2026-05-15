@@ -1,0 +1,212 @@
+From 42b0c592b18c670d11a5364a9614fb1b80555cee Mon Sep 17 00:00:00 2001
+From: Shardul Bankar <shardul.b@mpiricsoftware.com>
+Date: Fri, 15 May 2026 18:39:45 +0530
+Subject: [PATCH 1/2] mptcp: add kcov_remote_handle fields and
+ MPTCP_KCOV_HANDLE setsockopt
+
+Add the data structures and the setsockopt path that let userspace
+plumb a kcov remote handle and pre-allocated coverage area through
+to MPTCP for runtime coverage collection during fuzzing.  This is
+the load-bearing prerequisite for BRF-style protocol-flow coverage
+on net/mptcp/ entry points; the actual entry-point instrumentation
+lands in the follow-up patch.
+
+Three pieces:
+
+1. uapi: add MPTCP_KCOV_HANDLE = 5 to include/uapi/linux/mptcp.h.
+   Userspace sets the handle via setsockopt(SOL_MPTCP,
+   MPTCP_KCOV_HANDLE, &u64).
+
+2. Per-msk state in struct mptcp_sock, CONFIG_KCOV-gated:
+   kcov_remote_handle (the user-supplied kcov handle),
+   kcov_coverage_area (vmalloc'd prealloc scratch buffer used by
+   kcov_remote_start_prealloc), kcov_area_size (size of that
+   buffer).  v01 puts the buffer at msk scope, shared across the
+   msk's subflows; cross-subflow concurrent access on different
+   CPUs is a known v01 limitation noted inline.
+
+3. New mptcp_setsockopt_sol_mptcp dispatcher (paralleling the
+   existing mptcp_getsockopt_sol_mptcp), with MPTCP_KCOV_HANDLE
+   as the first option.  The handler vmalloc()s a 64 KB area
+   when the user sets a non-zero handle and vfree()s + clears
+   when the user sets zero.  The matching free path also lives
+   in mptcp_destroy() so the area cannot leak if the socket is
+   closed with the handle still set.
+
+This patch alone introduces no behavioural change: the new
+fields and sockopt are unused until the follow-up patch wires
+in the kcov_remote_start_prealloc / _stop_prealloc calls.
+
+Depends-on: kcov,bpf: Add support for preallocated coverage area
+  (already in tree at this commit; landed via brf/kernel_patches/
+  bpf_kcov/0001-kcov-bpf-Add-support-for-preallocated-
+  coverage-area.patch)
+
+Signed-off-by: Shardul Bankar <shardul.b@mpiricsoftware.com>
+Co-developed-by: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+---
+ include/uapi/linux/mptcp.h |  5 ++++
+ net/mptcp/protocol.c       | 10 +++++++
+ net/mptcp/protocol.h       | 15 ++++++++++
+ net/mptcp/sockopt.c        | 59 ++++++++++++++++++++++++++++++++++++++
+ 4 files changed, 89 insertions(+)
+
+diff --git a/include/uapi/linux/mptcp.h b/include/uapi/linux/mptcp.h
+index 72a5d030154e1..c0fa8ae609c42 100644
+--- a/include/uapi/linux/mptcp.h
++++ b/include/uapi/linux/mptcp.h
+@@ -138,5 +138,10 @@ struct mptcp_full_info {
+ #define MPTCP_TCPINFO		2
+ #define MPTCP_SUBFLOW_ADDRS	3
+ #define MPTCP_FULL_INFO		4
++#define MPTCP_KCOV_HANDLE	5	/* CONFIG_KCOV: plumb a kcov remote
++					 * handle into the msk; inherited by
++					 * subflows for runtime coverage
++					 * collection during fuzzing.
++					 */
+ 
+ #endif /* _UAPI_MPTCP_H */
+diff --git a/net/mptcp/protocol.c b/net/mptcp/protocol.c
+index ce8372fb3c6af..4867c7d2390ec 100644
+--- a/net/mptcp/protocol.c
++++ b/net/mptcp/protocol.c
+@@ -11,6 +11,7 @@
+ #include <linux/netdevice.h>
+ #include <linux/sched/signal.h>
+ #include <linux/atomic.h>
++#include <linux/vmalloc.h>
+ #include <net/aligned_data.h>
+ #include <net/rps.h>
+ #include <net/sock.h>
+@@ -3630,6 +3631,15 @@ static void mptcp_destroy(struct sock *sk)
+ 	msk->free_first = 1;
+ 	mptcp_destroy_common(msk);
+ 	sk_sockets_allocated_dec(sk);
++
++#ifdef CONFIG_KCOV
++	if (msk->kcov_coverage_area) {
++		vfree(msk->kcov_coverage_area);
++		msk->kcov_coverage_area = NULL;
++		msk->kcov_area_size = 0;
++		msk->kcov_remote_handle = 0;
++	}
++#endif
+ }
+ 
+ void __mptcp_data_acked(struct sock *sk)
+diff --git a/net/mptcp/protocol.h b/net/mptcp/protocol.h
+index 661600f8b5735..042e681c7c909 100644
+--- a/net/mptcp/protocol.h
++++ b/net/mptcp/protocol.h
+@@ -281,6 +281,21 @@ struct mptcp_data_frag {
+ struct mptcp_sock {
+ 	/* inet_connection_sock must be the first member */
+ 	struct inet_connection_sock sk;
++#ifdef CONFIG_KCOV
++	/* Remote-coverage handle + scratch area plumbed via
++	 * setsockopt(SOL_MPTCP, MPTCP_KCOV_HANDLE).  Zero handle =
++	 * disabled.  The scratch area is the prealloc buffer passed
++	 * to kcov_remote_start_prealloc() from per-subflow validity
++	 * gates; v01 puts it on the msk (one area shared across
++	 * subflows of this msk) accepting the race when two subflows
++	 * fire validity gates concurrently on different CPUs.  v02
++	 * may promote to per-subflow or per-CPU if profiling shows
++	 * the race matters in practice.
++	 */
++	u64		kcov_remote_handle;
++	void		*kcov_coverage_area;
++	size_t		kcov_area_size;
++#endif
+ 	u64		local_key;		/* protected by the first subflow socket lock
+ 						 * lockless access read
+ 						 */
+diff --git a/net/mptcp/sockopt.c b/net/mptcp/sockopt.c
+index 87b5796d01353..e5f48b5a886d1 100644
+--- a/net/mptcp/sockopt.c
++++ b/net/mptcp/sockopt.c
+@@ -8,6 +8,7 @@
+ 
+ #include <linux/kernel.h>
+ #include <linux/module.h>
++#include <linux/kcov.h>
+ #include <net/sock.h>
+ #include <net/protocol.h>
+ #include <net/tcp.h>
+@@ -899,6 +900,61 @@ static int mptcp_setsockopt_sol_tcp(struct mptcp_sock *msk, int optname,
+ 	return ret;
+ }
+ 
++#ifdef CONFIG_KCOV
++#include <linux/vmalloc.h>
++
++#define MPTCP_KCOV_AREA_SIZE	(64 * 1024)
++
++/* Set the kcov remote handle on this msk and allocate the per-msk
++ * prealloc scratch area used by BRF_MPTCP_KCOV_START in subflow
++ * validity gates.  Setting handle to zero disables coverage and
++ * frees the area.
++ *
++ * Caller should set the handle on the listening / connecting msk
++ * before any MP_CAPABLE / MP_JOIN exchange begins.  Subflows on
++ * this msk reach the area via subflow->conn during validity-gate
++ * execution; v01 shares the area across subflows of one msk.
++ */
++static int mptcp_setsockopt_kcov_handle(struct mptcp_sock *msk,
++					sockptr_t optval, unsigned int optlen)
++{
++	u64 handle;
++	void *area = NULL;
++
++	if (optlen < sizeof(handle))
++		return -EINVAL;
++	if (copy_from_sockptr(&handle, optval, sizeof(handle)))
++		return -EFAULT;
++
++	if (handle) {
++		area = vmalloc(MPTCP_KCOV_AREA_SIZE);
++		if (!area)
++			return -ENOMEM;
++	}
++
++	lock_sock((struct sock *)msk);
++	if (msk->kcov_coverage_area)
++		vfree(msk->kcov_coverage_area);
++	msk->kcov_coverage_area = area;
++	msk->kcov_area_size = area ? MPTCP_KCOV_AREA_SIZE : 0;
++	WRITE_ONCE(msk->kcov_remote_handle, handle);
++	release_sock((struct sock *)msk);
++	return 0;
++}
++#endif /* CONFIG_KCOV */
++
++static int mptcp_setsockopt_sol_mptcp(struct mptcp_sock *msk, int optname,
++				      sockptr_t optval, unsigned int optlen)
++{
++	switch (optname) {
++#ifdef CONFIG_KCOV
++	case MPTCP_KCOV_HANDLE:
++		return mptcp_setsockopt_kcov_handle(msk, optval, optlen);
++#endif
++	}
++	return -EOPNOTSUPP;
++}
++
+ int mptcp_setsockopt(struct sock *sk, int level, int optname,
+ 		     sockptr_t optval, unsigned int optlen)
+ {
+@@ -910,6 +966,9 @@ int mptcp_setsockopt(struct sock *sk, int level, int optname,
+ 	if (level == SOL_SOCKET)
+ 		return mptcp_setsockopt_sol_socket(msk, optname, optval, optlen);
+ 
++	if (level == SOL_MPTCP)
++		return mptcp_setsockopt_sol_mptcp(msk, optname, optval, optlen);
++
+ 	if (!mptcp_supported_sockopt(level, optname))
+ 		return -ENOPROTOOPT;
+ 
+
+base-commit: 1b7b378e36da46465441e8873bfc57de74103220
+prerequisite-patch-id: 63e53edb91492d3ff6b601868b89baecb11fff69
+-- 
+2.34.1
+

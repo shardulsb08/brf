@@ -1,0 +1,187 @@
+From e3665933067540754fd2712db93ec243abb1310e Mon Sep 17 00:00:00 2001
+From: Shardul Bankar <shardulsb08@gmail.com>
+Date: Wed, 3 Sep 2025 16:27:07 +0530
+Subject: [PATCH 2/3] bpf: Add BRF coverage collection support via kcov remote
+ coverage
+
+Implement the BPF Runtime Fuzzer (BRF) coverage collection mechanism
+as described in the BRF paper:
+https://dl.acm.org/doi/pdf/10.1145/3643778.
+This allows collecting coverage information from eBPF programs
+running in kernel contexts different from the original fuzzer process.
+
+Changes:
+- Add kcov_remote_handle, kcov_coverage_area, and kcov_area_size
+  fields to struct bpf_prog
+- Modify __bpf_prog_run() to call kcov_remote_start_prealloc() and
+  kcov_remote_stop_prealloc() when coverage is enabled
+- Update bpf_prog_load() to allocate coverage area and set kcov handle
+- Add kcov_remote_handle field to union bpf_attr and bpf_prog_load_opts
+- Use preallocated coverage area to avoid sleeping in interrupt context
+
+This enables BRF to collect coverage from eBPF programs regardless
+of their execution context, improving fuzzing effectiveness.
+
+Signed-off-by: Shardul Bankar <shardulsb08@gmail.com>
+---
+ include/linux/bpf.h            |  5 +++++
+ include/linux/filter.h         | 15 +++++++++++++++
+ include/uapi/linux/bpf.h       |  5 +++++
+ kernel/bpf/syscall.c           | 20 ++++++++++++++++++++
+ tools/include/uapi/linux/bpf.h |  5 +++++
+ tools/lib/bpf/bpf.c            |  1 +
+ tools/lib/bpf/bpf.h            |  5 ++++-
+ 7 files changed, 55 insertions(+), 1 deletion(-)
+
+diff --git a/include/linux/bpf.h b/include/linux/bpf.h
+index a98c83346134..52afa192d947 100644
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@ -1743,6 +1743,11 @@ struct bpf_prog {
+ 					    const struct bpf_insn *insn);
+ 	struct bpf_prog_aux	*aux;		/* Auxiliary fields */
+ 	struct sock_fprog_kern	*orig_prog;	/* Original BPF program */
++#ifdef CONFIG_KCOV
++	u64			kcov_remote_handle;	/* For BRF coverage collection */
++	void			*kcov_coverage_area;	/* Pre-allocated memory */
++	size_t			kcov_area_size;
++#endif
+ 	/* Instructions for interpreter */
+ 	union {
+ 		DECLARE_FLEX_ARRAY(struct sock_filter, insns);
+diff --git a/include/linux/filter.h b/include/linux/filter.h
+index f5c859b8131a..68f11e41cfc7 100644
+--- a/include/linux/filter.h
++++ b/include/linux/filter.h
+@@ -23,6 +23,7 @@
+ #include <linux/sockptr.h>
+ #include <crypto/sha1.h>
+ #include <linux/u64_stats_sync.h>
++#include <linux/kcov.h>
+ 
+ #include <net/sch_generic.h>
+ 
+@@ -703,6 +704,13 @@ static __always_inline u32 __bpf_prog_run(const struct bpf_prog *prog,
+ {
+ 	u32 ret;
+ 
++	/* BRF: Start coverage collection with pre-allocated area */
++#ifdef CONFIG_KCOV
++	if (prog->kcov_remote_handle && prog->kcov_coverage_area)
++		kcov_remote_start_prealloc(prog->kcov_remote_handle,
++				prog->kcov_coverage_area, prog->kcov_area_size);
++#endif
++
+ 	cant_migrate();
+ 	if (static_branch_unlikely(&bpf_stats_enabled_key)) {
+ 		struct bpf_prog_stats *stats;
+@@ -720,6 +728,13 @@ static __always_inline u32 __bpf_prog_run(const struct bpf_prog *prog,
+ 	} else {
+ 		ret = dfunc(ctx, prog->insnsi, prog->bpf_func);
+ 	}
++
++	/* BRF: Stop coverage collection */
++#ifdef CONFIG_KCOV
++	if (prog->kcov_remote_handle && prog->kcov_coverage_area)
++		kcov_remote_stop_prealloc();
++#endif
++
+ 	return ret;
+ }
+ 
+diff --git a/include/uapi/linux/bpf.h b/include/uapi/linux/bpf.h
+index ae83d8649ef1..4d7b10c9953c 100644
+--- a/include/uapi/linux/bpf.h
++++ b/include/uapi/linux/bpf.h
+@@ -1621,6 +1621,11 @@ union bpf_attr {
+ 		 * verification.
+ 		 */
+ 		__s32		keyring_id;
++		/* Calling process kcov handle for collecting coverage
++		 * information from eBPF programs running in kernel contexts
++		 * different from the original fuzzer process.
++		 */
++		__u64		kcov_remote_handle;
+ 	};
+ 
+ 	struct { /* anonymous struct used by BPF_OBJ_* commands */
+diff --git a/kernel/bpf/syscall.c b/kernel/bpf/syscall.c
+index a48fa86f82a7..a2daa2a09ced 100644
+--- a/kernel/bpf/syscall.c
++++ b/kernel/bpf/syscall.c
+@@ -2981,6 +2981,26 @@ static int bpf_prog_load(union bpf_attr *attr, bpfptr_t uattr, u32 uattr_size)
+ 	prog->aux->dev_bound = !!attr->prog_ifindex;
+ 	prog->aux->xdp_has_frags = attr->prog_flags & BPF_F_XDP_HAS_FRAGS;
+ 
++#ifdef CONFIG_KCOV
++	/* Allocate coverage area if kcov is enabled */
++	if (attr->kcov_remote_handle) {
++		size_t area_size = CONFIG_KCOV_IRQ_AREA_SIZE * sizeof(unsigned long);
++		prog->kcov_coverage_area = vmalloc(area_size);  // Safe here
++		if (!prog->kcov_coverage_area) {
++			// Handle allocation failure
++			prog->kcov_remote_handle = 0;
++			prog->kcov_coverage_area = 0;
++			prog->kcov_area_size = 0;
++		} else {
++			prog->kcov_remote_handle = attr->kcov_remote_handle;
++			prog->kcov_area_size = area_size;
++		}
++	}
++	else {
++		prog->kcov_remote_handle = 0;  // No coverage collection
++	}
++#endif
++
+ 	/* move token into prog->aux, reuse taken refcnt */
+ 	prog->aux->token = token;
+ 	token = NULL;
+diff --git a/tools/include/uapi/linux/bpf.h b/tools/include/uapi/linux/bpf.h
+index ae83d8649ef1..4d7b10c9953c 100644
+--- a/tools/include/uapi/linux/bpf.h
++++ b/tools/include/uapi/linux/bpf.h
+@@ -1621,6 +1621,11 @@ union bpf_attr {
+ 		 * verification.
+ 		 */
+ 		__s32		keyring_id;
++		/* Calling process kcov handle for collecting coverage
++		 * information from eBPF programs running in kernel contexts
++		 * different from the original fuzzer process.
++		 */
++		__u64		kcov_remote_handle;
+ 	};
+ 
+ 	struct { /* anonymous struct used by BPF_OBJ_* commands */
+diff --git a/tools/lib/bpf/bpf.c b/tools/lib/bpf/bpf.c
+index 339b19797237..1ae75b0c6c5f 100644
+--- a/tools/lib/bpf/bpf.c
++++ b/tools/lib/bpf/bpf.c
+@@ -270,6 +270,7 @@ int bpf_prog_load(enum bpf_prog_type prog_type,
+ 	attr.prog_ifindex = OPTS_GET(opts, prog_ifindex, 0);
+ 	attr.kern_version = OPTS_GET(opts, kern_version, 0);
+ 	attr.prog_token_fd = OPTS_GET(opts, token_fd, 0);
++	attr.kcov_remote_handle = OPTS_GET(opts, kcov_remote_handle, 0);
+ 
+ 	if (prog_name && feat_supported(NULL, FEAT_PROG_NAME))
+ 		libbpf_strlcpy(attr.prog_name, prog_name, sizeof(attr.prog_name));
+diff --git a/tools/lib/bpf/bpf.h b/tools/lib/bpf/bpf.h
+index e983a3e40d61..357e2b35251b 100644
+--- a/tools/lib/bpf/bpf.h
++++ b/tools/lib/bpf/bpf.h
+@@ -113,9 +113,12 @@ struct bpf_prog_load_opts {
+ 
+ 	/* if set, provides the length of fd_array */
+ 	__u32 fd_array_cnt;
++
++	/* Get user process kcov handle for bpf coverage support*/
++	__u64 kcov_remote_handle;
+ 	size_t :0;
+ };
+-#define bpf_prog_load_opts__last_field fd_array_cnt
++#define bpf_prog_load_opts__last_field kcov_remote_handle
+ 
+ LIBBPF_API int bpf_prog_load(enum bpf_prog_type prog_type,
+ 			     const char *prog_name, const char *license,
+-- 
+2.34.1
+

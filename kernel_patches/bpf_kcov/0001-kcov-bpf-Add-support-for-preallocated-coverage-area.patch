@@ -1,0 +1,224 @@
+From 78fea905e8f0a0c84df8d674ff8223f5752edd47 Mon Sep 17 00:00:00 2001
+From: Shardul Bankar <shardulsb08@gmail.com>
+Date: Wed, 3 Sep 2025 10:34:40 +0530
+Subject: [PATCH 1/3] kcov, bpf: Add support for preallocated coverage area
+
+The existing kcov_remote_start() and kcov_remote_stop() functions
+allocate memory using vmalloc() which can sleep and is not safe
+to call from interrupt context or with preemption disabled.
+
+Add new functions kcov_remote_start_prealloc() and kcov_remote_stop_prealloc()
+that accept a preallocated memory area, allowing coverage collection
+in contexts where sleeping is not permitted.
+
+This is required for BPF Runtime Fuzzer (BRF) coverage collection
+from eBPF programs running in interrupt contexts.
+
+Signed-off-by: Shardul Bankar <shardulsb08@gmail.com>
+---
+ include/linux/kcov.h |   5 ++
+ kernel/kcov.c        | 151 +++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 156 insertions(+)
+
+diff --git a/include/linux/kcov.h b/include/linux/kcov.h
+index 0143358874b0..69de0c6516ea 100644
+--- a/include/linux/kcov.h
++++ b/include/linux/kcov.h
+@@ -44,6 +44,8 @@ do {						\
+ void kcov_remote_start(u64 handle);
+ void kcov_remote_stop(void);
+ u64 kcov_common_handle(void);
++void kcov_remote_start_prealloc(u64 handle, void *preallocated_area, size_t kcov_area_size);
++void kcov_remote_stop_prealloc(void);
+ 
+ static inline void kcov_remote_start_common(u64 id)
+ {
+@@ -99,6 +101,9 @@ static inline void kcov_prepare_switch(struct task_struct *t) {}
+ static inline void kcov_finish_switch(struct task_struct *t) {}
+ static inline void kcov_remote_start(u64 handle) {}
+ static inline void kcov_remote_stop(void) {}
++static inline void kcov_remote_start_prealloc(u64 handle,
++		void *preallocated_area, size_t kcov_area_size) {}
++static inline void kcov_remote_stop_prealloc(void) {}
+ static inline u64 kcov_common_handle(void)
+ {
+ 	return 0;
+diff --git a/kernel/kcov.c b/kernel/kcov.c
+index 1d85597057e1..c43db219d08c 100644
+--- a/kernel/kcov.c
++++ b/kernel/kcov.c
+@@ -441,6 +441,14 @@ static void kcov_put(struct kcov *kcov)
+ 	}
+ }
+ 
++static void kcov_put_no_area(struct kcov *kcov)
++{
++	if (refcount_dec_and_test(&kcov->refcount)) {
++		kcov_remote_reset(kcov);
++		kfree(kcov);
++	}
++}
++
+ void kcov_task_exit(struct task_struct *t)
+ {
+ 	struct kcov *kcov;
+@@ -935,6 +943,80 @@ void kcov_remote_start(u64 handle)
+ }
+ EXPORT_SYMBOL(kcov_remote_start);
+ 
++void kcov_remote_start_prealloc(u64 handle, void *preallocated_area, size_t area_size)
++{
++	struct task_struct *t = current;
++	struct kcov_remote *remote;
++	struct kcov *kcov;
++	unsigned int mode;
++	void *area;
++	unsigned int size;
++	int sequence;
++	unsigned long flags;
++
++	if (WARN_ON(!kcov_check_handle(handle, true, true, true)))
++		return;
++	if (!in_task() && !in_softirq_really())
++		return;
++
++	local_lock_irqsave(&kcov_percpu_data.lock, flags);
++
++	/*
++	 * Check that kcov_remote_start() is not called twice in background
++	 * threads nor called by user tasks (with enabled kcov).
++	 */
++	mode = READ_ONCE(t->kcov_mode);
++	if (WARN_ON(in_task() && kcov_mode_enabled(mode))) {
++		local_unlock_irqrestore(&kcov_percpu_data.lock, flags);
++		return;
++	}
++	/*
++	 * Check that kcov_remote_start() is not called twice in softirqs.
++	 * Note, that kcov_remote_start() can be called from a softirq that
++	 * happened while collecting coverage from a background thread.
++	 */
++	if (WARN_ON(in_serving_softirq() && t->kcov_softirq)) {
++		local_unlock_irqrestore(&kcov_percpu_data.lock, flags);
++		return;
++	}
++
++	spin_lock(&kcov_remote_lock);
++	remote = kcov_remote_find(handle);
++	if (!remote) {
++		spin_unlock(&kcov_remote_lock);
++		local_unlock_irqrestore(&kcov_percpu_data.lock, flags);
++		return;
++	}
++	kcov_debug("handle = %llx, context: %s\n", handle,
++			in_task() ? "task" : "softirq");
++	kcov = remote->kcov;
++	/* Put in kcov_remote_stop(). */
++	kcov_get(kcov);
++	/*
++	 * Read kcov fields before unlock to prevent races with
++	 * KCOV_DISABLE / kcov_remote_reset().
++	 */
++	mode = kcov->mode;
++	sequence = kcov->sequence;
++
++	size = area_size;
++	area = preallocated_area;
++	spin_unlock(&kcov_remote_lock);
++
++	/* Reset coverage size. */
++	*(u64 *)area = 0;
++
++	if (in_serving_softirq()) {
++		kcov_remote_softirq_start(t);
++		t->kcov_softirq = 1;
++	}
++	kcov_start(t, kcov, size, area, mode, sequence);
++
++	local_unlock_irqrestore(&kcov_percpu_data.lock, flags);
++
++}
++EXPORT_SYMBOL(kcov_remote_start_prealloc);
++
+ static void kcov_move_area(enum kcov_mode mode, void *dst_area,
+ 				unsigned int dst_area_size, void *src_area)
+ {
+@@ -1059,6 +1141,75 @@ void kcov_remote_stop(void)
+ }
+ EXPORT_SYMBOL(kcov_remote_stop);
+ 
++/* See the comment before kcov_remote_start() for usage details. */
++void kcov_remote_stop_prealloc(void)
++{
++	struct task_struct *t = current;
++	struct kcov *kcov;
++	unsigned int mode;
++	void *area;
++	unsigned int size;
++	int sequence;
++	unsigned long flags;
++
++	if (!in_task() && !in_softirq_really())
++		return;
++
++	local_lock_irqsave(&kcov_percpu_data.lock, flags);
++
++	mode = READ_ONCE(t->kcov_mode);
++	barrier();
++	if (!kcov_mode_enabled(mode)) {
++		local_unlock_irqrestore(&kcov_percpu_data.lock, flags);
++		return;
++	}
++	/*
++	 * When in softirq, check if the corresponding kcov_remote_start()
++	 * actually found the remote handle and started collecting coverage.
++	 */
++	if (in_serving_softirq() && !t->kcov_softirq) {
++		local_unlock_irqrestore(&kcov_percpu_data.lock, flags);
++		return;
++	}
++	/* Make sure that kcov_softirq is only set when in softirq. */
++	if (WARN_ON(!in_serving_softirq() && t->kcov_softirq)) {
++		local_unlock_irqrestore(&kcov_percpu_data.lock, flags);
++		return;
++	}
++
++	kcov = t->kcov;
++	area = t->kcov_area;
++	size = t->kcov_size;
++	sequence = t->kcov_sequence;
++
++	kcov_stop(t);
++	if (in_serving_softirq()) {
++		t->kcov_softirq = 0;
++		kcov_remote_softirq_stop(t);
++	}
++
++	spin_lock(&kcov->lock);
++	/*
++	 * KCOV_DISABLE could have been called between kcov_remote_start()
++	 * and kcov_remote_stop(), hence the sequence check.
++	 */
++	if (sequence == kcov->sequence && kcov->remote)
++		kcov_move_area(kcov->mode, kcov->area, kcov->size, area);
++	spin_unlock(&kcov->lock);
++
++	if (in_task()) {
++		spin_lock(&kcov_remote_lock);
++		kcov_remote_area_put(area, size);
++		spin_unlock(&kcov_remote_lock);
++	}
++
++	local_unlock_irqrestore(&kcov_percpu_data.lock, flags);
++
++	/* Get in kcov_remote_start(). */
++	kcov_put_no_area(kcov);
++}
++EXPORT_SYMBOL(kcov_remote_stop_prealloc);
++
+ /* See the comment before kcov_remote_start() for usage details. */
+ u64 kcov_common_handle(void)
+ {
+-- 
+2.34.1
+

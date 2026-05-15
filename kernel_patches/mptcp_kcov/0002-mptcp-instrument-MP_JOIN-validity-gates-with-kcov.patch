@@ -1,0 +1,175 @@
+From 8095add850cfb320ea39b0f6c9680187fb77a7a5 Mon Sep 17 00:00:00 2001
+From: Shardul Bankar <shardul.b@mpiricsoftware.com>
+Date: Fri, 15 May 2026 18:43:35 +0530
+Subject: [PATCH 2/2] mptcp: instrument MP_JOIN validity gates with kcov
+
+Wrap three MPTCP subflow-level validity gates with
+kcov_remote_start_prealloc / kcov_remote_stop_prealloc so coverage
+from these functions is attributed to the kcov handle plumbed via
+MPTCP_KCOV_HANDLE on the parent msk (set up by the preceding
+patch).
+
+The gates instrumented are the ones a stateless fuzzer cannot
+clear by chance and where a stateful harness (e.g. the BRF MP_JOIN
+harness in shardulsb08/brf:.claude/designs/mptcp_join_harness_design.md)
+wants coverage feedback to know which mutation classes reach which
+kernel paths:
+
+  net/mptcp/subflow.c
+    subflow_token_join_request -- token-table lookup on incoming
+                                  MP_JOIN.  Coverage is collected
+                                  AFTER the successful lookup (the
+                                  bad-token branch is its own
+                                  signal via MPTCP_MIB_JOINNOTOKEN).
+    subflow_hmac_valid       -- server-side full HMAC compare on
+                                incoming MP_JOIN ACK.
+    subflow_thmac_valid      -- client-side truncated-HMAC compare
+                                on incoming MP_JOIN SYN-ACK.
+
+The BRF_MPTCP_KCOV_START / _STOP macros in protocol.h take an
+mptcp_sock pointer and read the handle once into a local to avoid
+racing with setsockopt unsetting the handle between start and stop.
+Each macro reduces to a single branch when the handle is zero
+(handle is the only condition that matters; when zero, the cost
+is one READ_ONCE + branch per wrapped call).  When CONFIG_KCOV=n
+the macros are empty.
+
+Not in v01 (deferred to v02):
+  * net/mptcp/options.c mptcp_parse_option -- per-suboption
+    dispatch.  No clean way to reach the relevant msk from a
+    bare sk_buff without an invasive refactor; the validity gates
+    in subflow.c are higher-impact and already give us the
+    coverage we need for the MP_JOIN harness.
+  * net/mptcp/subflow.c get_mapping_status -- DSS mapping
+    validation.  Has ~10 early-return paths; a clean wrap needs
+    a rename-and-wrap refactor (move body to __get_mapping_status,
+    add thin outer wrapper).  Doable but more change than v01
+    warrants; defer.
+
+Signed-off-by: Shardul Bankar <shardul.b@mpiricsoftware.com>
+Co-developed-by: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+---
+ net/mptcp/protocol.h | 43 +++++++++++++++++++++++++++++++++++++++++++
+ net/mptcp/subflow.c  | 16 ++++++++++++++--
+ 2 files changed, 57 insertions(+), 2 deletions(-)
+
+diff --git a/net/mptcp/protocol.h b/net/mptcp/protocol.h
+index 042e681c7c909..f24be722eadb4 100644
+--- a/net/mptcp/protocol.h
++++ b/net/mptcp/protocol.h
+@@ -1415,4 +1415,47 @@ mptcp_token_join_cookie_init_state(struct mptcp_subflow_request_sock *subflow_re
+ static inline void mptcp_join_cookie_init(void) {}
+ #endif
+ 
++#ifdef CONFIG_KCOV
++#include <linux/kcov.h>
++/* Wrap an MPTCP validity-gate function body with kcov remote
++ * start / stop calls, using the per-msk handle and prealloc
++ * scratch area set by setsockopt(SOL_MPTCP, MPTCP_KCOV_HANDLE).
++ *
++ * Caller passes the relevant mptcp_sock pointer.  The macro
++ * snapshots the handle once into a local so we do not race
++ * with setsockopt unsetting it between the start and stop
++ * call.  When the handle is zero or the area is NULL, the
++ * macro reduces to a single branch (no overhead on the hot
++ * path when the harness is not running).
++ *
++ * Cross-subflow concurrent execution on different CPUs is a
++ * known v01 limitation -- the scratch area is shared across
++ * subflows of the msk so concurrent gates race.  See the
++ * comment on kcov_coverage_area in struct mptcp_sock and the
++ * design doc kernel_base_management.md (sibling brf repo).
++ */
++#define BRF_MPTCP_KCOV_START(__msk)					\
++	do {								\
++		struct mptcp_sock *__m = (__msk);			\
++		u64 __h;						\
++		if (!__m)						\
++			break;						\
++		__h = READ_ONCE(__m->kcov_remote_handle);		\
++		if (__h && __m->kcov_coverage_area)			\
++			kcov_remote_start_prealloc(__h,			\
++				__m->kcov_coverage_area,		\
++				__m->kcov_area_size);			\
++	} while (0)
++#define BRF_MPTCP_KCOV_STOP(__msk)					\
++	do {								\
++		struct mptcp_sock *__m = (__msk);			\
++		if (__m && READ_ONCE(__m->kcov_remote_handle) &&	\
++		    __m->kcov_coverage_area)				\
++			kcov_remote_stop_prealloc();			\
++	} while (0)
++#else
++#define BRF_MPTCP_KCOV_START(__msk)	do { } while (0)
++#define BRF_MPTCP_KCOV_STOP(__msk)	do { } while (0)
++#endif /* CONFIG_KCOV */
++
+ #endif /* __MPTCP_PROTOCOL_H */
+diff --git a/net/mptcp/subflow.c b/net/mptcp/subflow.c
+index d562e149606f6..ba82c4713c6f6 100644
+--- a/net/mptcp/subflow.c
++++ b/net/mptcp/subflow.c
+@@ -94,14 +94,17 @@ static struct mptcp_sock *subflow_token_join_request(struct request_sock *req)
+ 		return NULL;
+ 	}
+ 
++	BRF_MPTCP_KCOV_START(msk);
+ 	local_id = mptcp_pm_get_local_id(msk, (struct sock_common *)req);
+ 	if (local_id < 0) {
++		BRF_MPTCP_KCOV_STOP(msk);
+ 		sock_put((struct sock *)msk);
+ 		return NULL;
+ 	}
+ 	subflow_req->local_id = local_id;
+ 	subflow_req->request_bkup = mptcp_pm_is_backup(msk, (struct sock_common *)req);
+ 
++	BRF_MPTCP_KCOV_STOP(msk);
+ 	return msk;
+ }
+ 
+@@ -413,9 +416,12 @@ static struct dst_entry *subflow_v6_route_req(const struct sock *sk,
+ /* validate received truncated hmac and create hmac for third ACK */
+ static bool subflow_thmac_valid(struct mptcp_subflow_context *subflow)
+ {
++	struct mptcp_sock *msk = subflow->conn ? mptcp_sk(subflow->conn) : NULL;
+ 	u8 hmac[SHA256_DIGEST_SIZE];
+ 	u64 thmac;
++	bool ok;
+ 
++	BRF_MPTCP_KCOV_START(msk);
+ 	subflow_generate_hmac(subflow->remote_key, subflow->local_key,
+ 			      subflow->remote_nonce, subflow->local_nonce,
+ 			      hmac);
+@@ -424,7 +430,9 @@ static bool subflow_thmac_valid(struct mptcp_subflow_context *subflow)
+ 	pr_debug("subflow=%p, token=%u, thmac=%llu, subflow->thmac=%llu\n",
+ 		 subflow, subflow->token, thmac, subflow->thmac);
+ 
+-	return thmac == subflow->thmac;
++	ok = thmac == subflow->thmac;
++	BRF_MPTCP_KCOV_STOP(msk);
++	return ok;
+ }
+ 
+ void mptcp_subflow_reset(struct sock *ssk)
+@@ -755,13 +763,17 @@ static bool subflow_hmac_valid(const struct mptcp_subflow_request_sock *subflow_
+ {
+ 	struct mptcp_sock *msk = subflow_req->msk;
+ 	u8 hmac[SHA256_DIGEST_SIZE];
++	bool ok;
+ 
++	BRF_MPTCP_KCOV_START(msk);
+ 	subflow_generate_hmac(READ_ONCE(msk->remote_key),
+ 			      READ_ONCE(msk->local_key),
+ 			      subflow_req->remote_nonce,
+ 			      subflow_req->local_nonce, hmac);
+ 
+-	return !crypto_memneq(hmac, mp_opt->hmac, MPTCPOPT_HMAC_LEN);
++	ok = !crypto_memneq(hmac, mp_opt->hmac, MPTCPOPT_HMAC_LEN);
++	BRF_MPTCP_KCOV_STOP(msk);
++	return ok;
+ }
+ 
+ static void subflow_ulp_fallback(struct sock *sk,
+-- 
+2.34.1
+

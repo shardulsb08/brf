@@ -1,0 +1,146 @@
+From 1141d706ba700606c05def357440f7a692303d40 Mon Sep 17 00:00:00 2001
+From: Shardul Bankar <shardulsb08@gmail.com>
+Date: Thu, 4 Sep 2025 15:12:39 +0530
+Subject: [PATCH 3/3] bpf: Support getting kcov_remote_handle using
+ bpf_prog_get_info_by_fd
+
+Add kcov_remote_handle field to struct bpf_prog_info to allow
+user space to retrieve the kcov handle associated with a BPF program.
+
+This enables BRF fuzzer to verify that coverage collection is
+properly enabled for BPF programs and monitor coverage status.
+
+Signed-off-by: Shardul Bankar <shardulsb08@gmail.com>
+---
+ include/uapi/linux/bpf.h       |  1 +
+ kernel/bpf/syscall.c           |  1 +
+ tools/include/uapi/linux/bpf.h |  1 +
+ tools/lib/bpf/gen_loader.c     |  3 +++
+ tools/lib/bpf/libbpf.c         | 12 ++++++++++++
+ tools/lib/bpf/libbpf.h         | 12 ++++++++++++
+ tools/lib/bpf/libbpf.map       |  1 +
+ 7 files changed, 31 insertions(+)
+
+diff --git a/include/uapi/linux/bpf.h b/include/uapi/linux/bpf.h
+index 4d7b10c9953c..06286543667e 100644
+--- a/include/uapi/linux/bpf.h
++++ b/include/uapi/linux/bpf.h
+@@ -6668,6 +6668,7 @@ struct bpf_prog_info {
+ 	__u32 verified_insns;
+ 	__u32 attach_btf_obj_id;
+ 	__u32 attach_btf_id;
++	__u64 kcov_remote_handle;
+ } __attribute__((aligned(8)));
+ 
+ struct bpf_map_info {
+diff --git a/kernel/bpf/syscall.c b/kernel/bpf/syscall.c
+index a2daa2a09ced..ea50961a3470 100644
+--- a/kernel/bpf/syscall.c
++++ b/kernel/bpf/syscall.c
+@@ -4988,6 +4988,7 @@ static int bpf_prog_get_info_by_fd(struct file *file,
+ 	info.created_by_uid = from_kuid_munged(current_user_ns(),
+ 					       prog->aux->user->uid);
+ 	info.gpl_compatible = prog->gpl_compatible;
++	info.kcov_remote_handle = prog->kcov_remote_handle;  // Copy kcov handle to user space
+ 
+ 	memcpy(info.tag, prog->tag, sizeof(prog->tag));
+ 	memcpy(info.name, prog->aux->name, sizeof(prog->aux->name));
+diff --git a/tools/include/uapi/linux/bpf.h b/tools/include/uapi/linux/bpf.h
+index 4d7b10c9953c..06286543667e 100644
+--- a/tools/include/uapi/linux/bpf.h
++++ b/tools/include/uapi/linux/bpf.h
+@@ -6668,6 +6668,7 @@ struct bpf_prog_info {
+ 	__u32 verified_insns;
+ 	__u32 attach_btf_obj_id;
+ 	__u32 attach_btf_id;
++	__u64 kcov_remote_handle;
+ } __attribute__((aligned(8)));
+ 
+ struct bpf_map_info {
+diff --git a/tools/lib/bpf/gen_loader.c b/tools/lib/bpf/gen_loader.c
+index 6945dd99a846..0b8cee581cf7 100644
+--- a/tools/lib/bpf/gen_loader.c
++++ b/tools/lib/bpf/gen_loader.c
+@@ -1092,6 +1092,9 @@ void bpf_gen__prog_load(struct bpf_gen *gen,
+ 		 core_relos, gen->core_relo_cnt,
+ 		 sizeof(struct bpf_core_relo));
+ 
++	if (load_attr->kcov_remote_handle)
++		attr.kcov_remote_handle = tgt_endian(load_attr->kcov_remote_handle);
++
+ 	/* convert all info blobs to target endianness */
+ 	if (gen->swapped_endian)
+ 		info_blob_bswap(gen, func_info, line_info, core_relos, load_attr);
+diff --git a/tools/lib/bpf/libbpf.c b/tools/lib/bpf/libbpf.c
+index f92083f51bdb..6daaaefe98d0 100644
+--- a/tools/lib/bpf/libbpf.c
++++ b/tools/lib/bpf/libbpf.c
+@@ -746,6 +746,10 @@ struct bpf_object {
+ 	char *token_path;
+ 	int token_fd;
+ 
++	/*
++	 *  Pass remote handle for storing coverage information
++	 */
++	__u64 kcov_remote_handle;
+ 	char path[];
+ };
+ 
+@@ -7575,6 +7579,8 @@ static int bpf_object_load_prog(struct bpf_object *obj, struct bpf_program *prog
+ 	load_attr.kern_version = kern_version;
+ 	load_attr.prog_ifindex = prog->prog_ifindex;
+ 	load_attr.expected_attach_type = prog->expected_attach_type;
++	if (obj->kcov_remote_handle)
++		load_attr.kcov_remote_handle = obj->kcov_remote_handle;
+ 
+ 	/* specify func_info/line_info only if kernel supports them */
+ 	if (obj->btf && btf__fd(obj->btf) >= 0 && kernel_supports(obj, FEAT_BTF_FUNC)) {
+@@ -8740,6 +8746,12 @@ int bpf_object__prepare(struct bpf_object *obj)
+ 	return libbpf_err(bpf_object_prepare(obj, NULL));
+ }
+ 
++void bpf_object__add_kcov_handle(struct bpf_object *obj, __u64 kcov_remote_handle)
++{
++	if (kcov_remote_handle)
++		obj->kcov_remote_handle = kcov_remote_handle;
++}
++
+ int bpf_object__load(struct bpf_object *obj)
+ {
+ 	return bpf_object_load(obj, 0, NULL);
+diff --git a/tools/lib/bpf/libbpf.h b/tools/lib/bpf/libbpf.h
+index 5118d0a90e24..69dc75d3790e 100644
+--- a/tools/lib/bpf/libbpf.h
++++ b/tools/lib/bpf/libbpf.h
+@@ -279,6 +279,18 @@ bpf_object__open_mem(const void *obj_buf, size_t obj_buf_sz,
+  */
+ LIBBPF_API int bpf_object__prepare(struct bpf_object *obj);
+ 
++ /**
++  * @brief **bpf_object__add_kcov_handle()** saves user processes' remote
++  * handle in bpf_object structure which can later be used by __bpf_prog_run
++  * to start coverage collection when bpf programs run
++  * @param obj Pointer to a valid BPF object instance returned by
++  * **bpf_object__open*()** APIs
++  * @param kcov_remote_handle handle of the user space thread, used by
++  * kcov_remote_start like functions in kernel
++  */
++
++LIBBPF_API void bpf_object__add_kcov_handle(struct bpf_object *obj, __u64 kcov_remote_handle);
++
+ /**
+  * @brief **bpf_object__load()** loads BPF object into kernel.
+  * @param obj Pointer to a valid BPF object instance returned by
+diff --git a/tools/lib/bpf/libbpf.map b/tools/lib/bpf/libbpf.map
+index 8ed8749907d4..cdbb3a147bf8 100644
+--- a/tools/lib/bpf/libbpf.map
++++ b/tools/lib/bpf/libbpf.map
+@@ -451,4 +451,5 @@ LIBBPF_1.7.0 {
+ 	global:
+ 		bpf_map__set_exclusive_program;
+ 		bpf_map__exclusive_program;
++		bpf_object__add_kcov_handle;
+ } LIBBPF_1.6.0;
+-- 
+2.34.1
+
