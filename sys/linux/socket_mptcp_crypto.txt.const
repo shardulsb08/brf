@@ -1,0 +1,26 @@
+# Harness-internal constants for MPTCP MP_JOIN pseudo-syscalls.
+# DO NOT EDIT BY HAND -- these must mirror the #defines in
+# executor/common_brf_linux_mptcp.h.  Values are arch-independent
+# (no kernel uapi constants here).
+arches = 386, amd64, arm, arm64, mips64le, ppc64le, riscv64, s390x
+MPTCP_INIT_CSUM_ON = 1
+MPTCP_INIT_CSUM_OFF = 2
+MPTCP_INIT_DENY_JOIN_ID0 = 4
+MPTCP_NONCE_NORMAL = 0
+MPTCP_NONCE_ZERO = 1
+MPTCP_NONCE_FLIP_HIGH = 2
+MPTCP_NONCE_FLIP_LOW = 3
+MPTCP_NONCE_REPLAY = 4
+MPTCP_HMAC_NORMAL = 0
+MPTCP_HMAC_ZERO = 1
+MPTCP_HMAC_BIT_FLIP = 2
+MPTCP_HMAC_TRUNCATE = 3
+MPTCP_HMAC_SWAP = 4
+MPTCP_MAP_NORMAL = 0
+MPTCP_MAP_STALE_SEQ = 1
+MPTCP_MAP_OFF_BY_ONE = 2
+MPTCP_MAP_INFINITE = 3
+MPTCP_MAP_HOLE = 4
+MPTCP_CTL_FAIL = 0
+MPTCP_CTL_FASTCLOSE = 1
+MPTCP_CTL_RST = 2

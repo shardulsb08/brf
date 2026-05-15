@@ -5691,3 +5691,9 @@ static long syz_pidfd_open(volatile long pid, volatile long flags)
 #include "common_brf_linux.h"
 
 #endif
+
+#if SYZ_EXECUTOR || __NR_syz_mptcp_pair_init || __NR_syz_mptcp_join_subflow || __NR_syz_mptcp_drive_traffic || __NR_syz_mptcp_send_control || __NR_syz_mptcp_pair_close
+
+#include "common_brf_linux_mptcp.h"
+
+#endif

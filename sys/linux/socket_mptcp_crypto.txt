@@ -1,0 +1,61 @@
+# MPTCP MP_JOIN harness -- pseudo-syscall descriptions.
+#
+# Companion design doc: .claude/designs/mptcp_join_harness_design.md
+# Executor implementation: executor/common_brf_linux_mptcp.h
+#
+# These pseudo-syscalls let a fuzz input express a stateful MPTCP
+# flow whose cryptographic dependencies (token, HMAC over keys+
+# nonces) are computed by the executor from captured wire state.
+# Mutation knobs in each syscall let syzkaller mutate specific byte
+# ranges *after* the executor has produced the valid form -- so
+# mutations are attributable, not blind.
+#
+# Syzlang grammar quirk: syscall declarations must be on a single
+# line (structs may span lines but syscalls may not).  The lines
+# below are long; do not wrap them.
+
+include <linux/socket.h>
+include <linux/in.h>
+include <linux/in6.h>
+
+resource mptcp_pair[intptr]
+
+# syz_mptcp_pair_init: create server + client pair, complete MP_CAPABLE,
+# capture cryptographic state.  See design doc Section 5.1.
+syz_mptcp_pair_init(server_addr ptr[in, sockaddr_storage], client_addr ptr[in, sockaddr_storage], init_flags flags[mptcp_init_flags], out_state ptr[out, mptcp_pair_state_t]) mptcp_pair
+
+# syz_mptcp_join_subflow: initiate MP_JOIN with valid token + HMAC.
+# nonce_mut / hmac_mut: rewrite the just-generated/computed bytes after.
+syz_mptcp_join_subflow(pair mptcp_pair, addr_id int8, backup int8[0:1], nonce_mut flags[mptcp_nonce_mut], hmac_mut flags[mptcp_hmac_mut])
+
+# syz_mptcp_drive_traffic: send data over an established subflow,
+# optionally rewriting the kernel-emitted DSS option bytes.
+syz_mptcp_drive_traffic(pair mptcp_pair, subflow_id int32, data ptr[in, array[int8]], data_len bytesize[data], map_mut flags[mptcp_map_mut])
+
+# syz_mptcp_send_control: inject MP_FAIL / MP_FASTCLOSE / MP_RST.
+syz_mptcp_send_control(pair mptcp_pair, subflow_id int32, suboption flags[mptcp_control_subopt])
+
+# syz_mptcp_pair_close: release pool slot, close sockets.
+# Explicit close required because mptcp_pair is an intptr (not an fd),
+# so syzkaller resource lifecycle cannot free pool slots automatically.
+syz_mptcp_pair_close(pair mptcp_pair)
+
+# Out-param struct.  Mirrors `struct brf_mptcp_pair_state_out` in
+# executor/common_brf_linux_mptcp.h.  Field order and sizes must
+# match exactly.
+mptcp_pair_state_t {
+	server_fd	int32
+	client_fd	int32
+	local_key	int64
+	remote_key	int64
+	token		int32
+	csum_enabled	int8
+}
+
+# Mutation knob enums.  Values in socket_mptcp_crypto.txt.const;
+# constant names must match executor/common_brf_linux_mptcp.h #defines.
+mptcp_init_flags = MPTCP_INIT_CSUM_ON, MPTCP_INIT_CSUM_OFF, MPTCP_INIT_DENY_JOIN_ID0
+mptcp_nonce_mut = MPTCP_NONCE_NORMAL, MPTCP_NONCE_ZERO, MPTCP_NONCE_FLIP_HIGH, MPTCP_NONCE_FLIP_LOW, MPTCP_NONCE_REPLAY
+mptcp_hmac_mut = MPTCP_HMAC_NORMAL, MPTCP_HMAC_ZERO, MPTCP_HMAC_BIT_FLIP, MPTCP_HMAC_TRUNCATE, MPTCP_HMAC_SWAP
+mptcp_map_mut = MPTCP_MAP_NORMAL, MPTCP_MAP_STALE_SEQ, MPTCP_MAP_OFF_BY_ONE, MPTCP_MAP_INFINITE, MPTCP_MAP_HOLE
+mptcp_control_subopt = MPTCP_CTL_FAIL, MPTCP_CTL_FASTCLOSE, MPTCP_CTL_RST
