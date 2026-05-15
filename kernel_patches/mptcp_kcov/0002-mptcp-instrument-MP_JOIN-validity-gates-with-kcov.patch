@@ -1,4 +1,4 @@
-From 8095add850cfb320ea39b0f6c9680187fb77a7a5 Mon Sep 17 00:00:00 2001
+From 8df76b851c6fb6453809af61744ed858172f1ee8 Mon Sep 17 00:00:00 2001
 From: Shardul Bankar <shardul.b@mpiricsoftware.com>
 Date: Fri, 15 May 2026 18:43:35 +0530
 Subject: [PATCH 2/2] mptcp: instrument MP_JOIN validity gates with kcov
@@ -54,10 +54,10 @@ Co-developed-by: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
  2 files changed, 57 insertions(+), 2 deletions(-)
 
 diff --git a/net/mptcp/protocol.h b/net/mptcp/protocol.h
-index 042e681c7c909..f24be722eadb4 100644
+index 738a348fbc7e5..71633c6ced591 100644
 --- a/net/mptcp/protocol.h
 +++ b/net/mptcp/protocol.h
-@@ -1415,4 +1415,47 @@ mptcp_token_join_cookie_init_state(struct mptcp_subflow_request_sock *subflow_re
+@@ -1424,4 +1424,47 @@ mptcp_token_join_cookie_init_state(struct mptcp_subflow_request_sock *subflow_re
  static inline void mptcp_join_cookie_init(void) {}
  #endif
  

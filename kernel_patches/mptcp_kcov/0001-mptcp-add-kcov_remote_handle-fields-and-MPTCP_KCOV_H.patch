@@ -1,4 +1,4 @@
-From 42b0c592b18c670d11a5364a9614fb1b80555cee Mon Sep 17 00:00:00 2001
+From f354039dab126fbe133a9389147a301ba3446ac2 Mon Sep 17 00:00:00 2001
 From: Shardul Bankar <shardul.b@mpiricsoftware.com>
 Date: Fri, 15 May 2026 18:39:45 +0530
 Subject: [PATCH 1/2] mptcp: add kcov_remote_handle fields and
@@ -45,11 +45,11 @@ Depends-on: kcov,bpf: Add support for preallocated coverage area
 Signed-off-by: Shardul Bankar <shardul.b@mpiricsoftware.com>
 Co-developed-by: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
 ---
- include/uapi/linux/mptcp.h |  5 ++++
- net/mptcp/protocol.c       | 10 +++++++
- net/mptcp/protocol.h       | 15 ++++++++++
- net/mptcp/sockopt.c        | 59 ++++++++++++++++++++++++++++++++++++++
- 4 files changed, 89 insertions(+)
+ include/uapi/linux/mptcp.h |  5 +++
+ net/mptcp/protocol.c       | 15 +++++++++
+ net/mptcp/protocol.h       | 24 +++++++++++++++
+ net/mptcp/sockopt.c        | 63 ++++++++++++++++++++++++++++++++++++++
+ 4 files changed, 107 insertions(+)
 
 diff --git a/include/uapi/linux/mptcp.h b/include/uapi/linux/mptcp.h
 index 72a5d030154e1..c0fa8ae609c42 100644
@@ -67,7 +67,7 @@ index 72a5d030154e1..c0fa8ae609c42 100644
  
  #endif /* _UAPI_MPTCP_H */
 diff --git a/net/mptcp/protocol.c b/net/mptcp/protocol.c
-index ce8372fb3c6af..4867c7d2390ec 100644
+index ce8372fb3c6af..d71d3073f61a7 100644
 --- a/net/mptcp/protocol.c
 +++ b/net/mptcp/protocol.c
 @@ -11,6 +11,7 @@
@@ -78,27 +78,32 @@ index ce8372fb3c6af..4867c7d2390ec 100644
  #include <net/aligned_data.h>
  #include <net/rps.h>
  #include <net/sock.h>
-@@ -3630,6 +3631,15 @@ static void mptcp_destroy(struct sock *sk)
+@@ -3630,6 +3631,20 @@ static void mptcp_destroy(struct sock *sk)
  	msk->free_first = 1;
  	mptcp_destroy_common(msk);
  	sk_sockets_allocated_dec(sk);
 +
 +#ifdef CONFIG_KCOV
-+	if (msk->kcov_coverage_area) {
++	/* sk_clone_lock() memcpy's our kcov fields into accepted
++	 * msks; only the msk that called setsockopt(MPTCP_KCOV_HANDLE)
++	 * (and is therefore == kcov_owner) actually owns the area.
++	 * The other (cloned) msks just clear their dangling references.
++	 */
++	if (msk->kcov_coverage_area && msk->kcov_owner == msk)
 +		vfree(msk->kcov_coverage_area);
-+		msk->kcov_coverage_area = NULL;
-+		msk->kcov_area_size = 0;
-+		msk->kcov_remote_handle = 0;
-+	}
++	msk->kcov_coverage_area = NULL;
++	msk->kcov_area_size = 0;
++	msk->kcov_remote_handle = 0;
++	msk->kcov_owner = NULL;
 +#endif
  }
  
  void __mptcp_data_acked(struct sock *sk)
 diff --git a/net/mptcp/protocol.h b/net/mptcp/protocol.h
-index 661600f8b5735..042e681c7c909 100644
+index 661600f8b5735..738a348fbc7e5 100644
 --- a/net/mptcp/protocol.h
 +++ b/net/mptcp/protocol.h
-@@ -281,6 +281,21 @@ struct mptcp_data_frag {
+@@ -281,6 +281,30 @@ struct mptcp_data_frag {
  struct mptcp_sock {
  	/* inet_connection_sock must be the first member */
  	struct inet_connection_sock sk;
@@ -112,16 +117,25 @@ index 661600f8b5735..042e681c7c909 100644
 +	 * fire validity gates concurrently on different CPUs.  v02
 +	 * may promote to per-subflow or per-CPU if profiling shows
 +	 * the race matters in practice.
++	 *
++	 * kcov_owner identifies the msk that allocated the area.
++	 * sk_clone_lock() memcpy's mptcp_sock fields into accepted
++	 * msks, so the area pointer is inherited; we use kcov_owner
++	 * to ensure only the original owner frees the area.  Without
++	 * this guard, the accepted msk would vfree() the listener's
++	 * area on close, tripping the "Trying to vfree() nonexistent
++	 * vm area" WARN.
 +	 */
 +	u64		kcov_remote_handle;
 +	void		*kcov_coverage_area;
 +	size_t		kcov_area_size;
++	struct mptcp_sock *kcov_owner;
 +#endif
  	u64		local_key;		/* protected by the first subflow socket lock
  						 * lockless access read
  						 */
 diff --git a/net/mptcp/sockopt.c b/net/mptcp/sockopt.c
-index 87b5796d01353..e5f48b5a886d1 100644
+index 87b5796d01353..2ebc38d4faafa 100644
 --- a/net/mptcp/sockopt.c
 +++ b/net/mptcp/sockopt.c
 @@ -8,6 +8,7 @@
@@ -132,7 +146,7 @@ index 87b5796d01353..e5f48b5a886d1 100644
  #include <net/sock.h>
  #include <net/protocol.h>
  #include <net/tcp.h>
-@@ -899,6 +900,61 @@ static int mptcp_setsockopt_sol_tcp(struct mptcp_sock *msk, int optname,
+@@ -899,6 +900,65 @@ static int mptcp_setsockopt_sol_tcp(struct mptcp_sock *msk, int optname,
  	return ret;
  }
  
@@ -169,10 +183,14 @@ index 87b5796d01353..e5f48b5a886d1 100644
 +	}
 +
 +	lock_sock((struct sock *)msk);
-+	if (msk->kcov_coverage_area)
++	/* Only free if we own the previous area (the field may have
++	 * been memcpy'd from a listener msk via sk_clone_lock).
++	 */
++	if (msk->kcov_coverage_area && msk->kcov_owner == msk)
 +		vfree(msk->kcov_coverage_area);
 +	msk->kcov_coverage_area = area;
 +	msk->kcov_area_size = area ? MPTCP_KCOV_AREA_SIZE : 0;
++	msk->kcov_owner = area ? msk : NULL;
 +	WRITE_ONCE(msk->kcov_remote_handle, handle);
 +	release_sock((struct sock *)msk);
 +	return 0;
@@ -194,7 +212,7 @@ index 87b5796d01353..e5f48b5a886d1 100644
  int mptcp_setsockopt(struct sock *sk, int level, int optname,
  		     sockptr_t optval, unsigned int optlen)
  {
-@@ -910,6 +966,9 @@ int mptcp_setsockopt(struct sock *sk, int level, int optname,
+@@ -910,6 +970,9 @@ int mptcp_setsockopt(struct sock *sk, int level, int optname,
  	if (level == SOL_SOCKET)
  		return mptcp_setsockopt_sol_socket(msk, optname, optval, optlen);
  
