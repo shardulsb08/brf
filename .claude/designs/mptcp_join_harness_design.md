@@ -341,6 +341,24 @@ honest-handshake path and capture-only operation (no mutations);
 that proves the state-carrier works and exposes some bugs but
 loses the mutation surface.
 
+## 6.bis Kernel base for this harness
+
+The kernel base is a tracking branch, not a frozen tag.  See
+`.claude/designs/kernel_base_management.md` for the full workflow
+(why tracking-not-pinning, update procedure, patch application,
+reproducibility-footer convention for bug reports).
+
+Specifically for MPTCP work:
+
+- Local branch: `mptcp_brf_fuzz_base` in the kernel tree at
+  `/mnt/work_4gb/Dev/mpiric_kernel_dev_env/open/src/kernel/linux/`.
+- Upstream source: `mptcp/export` (riches surface; net-next based).
+  Bug findings get routed at report time (Fixes -> mptcp/export-net;
+  feature -> mptcp/export).
+- Current snapshot (2026-05-15): `export/20260515T083717`.
+- Update cadence: weekly between campaigns; freeze during a
+  campaign; bump before any publishable run.
+
 ## 7. Kernel-side kcov instrumentation
 
 Per `brf_architecture.md` Section 7 Step 6, reuse patch 0001 from

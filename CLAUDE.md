@@ -90,6 +90,9 @@ Session contract:
 | (MPTCP, QUIC, tlshd, or any new protocol substrate)                  |                                                         |
 | Implementing, debugging, or extending the MPTCP MP_JOIN harness      | `.claude/designs/mptcp_join_harness_design.md`          |
 | (sys/linux/socket_mptcp_crypto.txt, executor/common_brf_linux_mptcp.h, or kernel-side kcov patches for net/mptcp/) |                                                         |
+| Picking or updating a kernel base for any harness, applying our      | `.claude/designs/kernel_base_management.md`             |
+| kernel-side patches, or recording reproducibility footers for bug    |                                                         |
+| reports                                                              |                                                         |
 
 ## Design principles (binding on all work in this tree)
 
