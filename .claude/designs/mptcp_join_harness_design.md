@@ -688,6 +688,183 @@ infrastructure is incomplete without them.
    start subflow-only if patch complexity is an issue.  The
    gates we care about (HMAC, token, DSS) fire at subflow level.
 
+## 11.bis v02 wire-level mutation modes -- roadmap (drafted 2026-05-16)
+
+v01 NORMAL mode is committed at `86dc64756`.  Next is implementing
+the nonce/HMAC mutation enum values so the corpus actually trips
+the cryptographic gates the harness was built for.  This section
+captures the decision matrix + work breakdown so the next session
+lands in the right shape rather than re-litigating the design.
+
+### Pick: NFQUEUE rewrite, not raw-socket inject
+
+Three plausible mechanisms for getting mutated bytes onto the wire:
+
+| Mechanism | What the kernel does | What we do | Cost |
+|-----------|----------------------|------------|------|
+| NFQUEUE rewrite (recommended) | Builds the entire MP_JOIN handshake (SYN, ACK) including correct nonce and HMAC; the bytes go through the netfilter OUTPUT hook before egress | Intercept the egress packet, optionally rewrite a specific byte range (nonce, HMAC), give NF_ACCEPT verdict | One libnetfilter_queue (or raw NFQUEUE genl) + one iptables/nftables rule + ~150 LOC of TCP-option parsing |
+| Raw-socket inject (alternative) | Nothing for the new subflow's wire traffic | Build the SYN ourselves with our chosen nonce, parse the kernel's SYN-ACK off `lo` (the kernel's listener still processes it), compute HMAC ourselves (OpenSSL `HMAC_SHA256`), send ACK with our chosen HMAC | OpenSSL dependency + ~250 LOC for handshake + race against kernel TCP receiving the SYN-ACK to a port we never bound (kernel sends RST unless we suppress) |
+| Kernel hook (out of scope) | Accepts an override-HMAC sockopt and uses it instead of computing | Just call the sockopt before SUBFLOW_CREATE | Invasive kernel patch.  Rejected per the task brief's "don't replace BRF's existing methodology" anti-scope. |
+
+**NFQUEUE wins because:**
+
+- The kernel does all the heavy lifting (TCP state machine, MPTCP
+  option building, correct nonce/HMAC computation).  We only edit
+  bytes.  Mutation logic is small and self-contained.
+- We can READ the kernel-emitted nonce and HMAC from the packet
+  before deciding to mutate -- no need for the per-subflow debug
+  sockopt we'd otherwise need (a separate kernel patch).
+- Single mechanism handles every mutation enum (nonce_mut,
+  hmac_mut, map_mut for drive_traffic, control_subopt for
+  send_control).  Raw inject would need per-call wire crafting.
+- No RST race: client-side msk and TCP state still belong to the
+  kernel; the kernel handles incoming SYN-ACK normally.
+
+**Cost the recommendation pays:**
+
+- `libnetfilter_queue` is not installed by default in the dev_env
+  VM (verified 2026-05-16, `ldconfig -p` shows libnetfilter_conntrack
+  but not libnetfilter_queue).  Need `apt install libnetfilter-queue-dev`
+  or equivalent.  Alternatively: implement NFQUEUE via raw netlink
+  (NETLINK_NETFILTER family + NFNETLINK_NFQUEUE messages) -- ~150
+  more LOC but zero new deps.  Recommend the raw-netlink route for
+  the executor (no new build dep on the executor side) and
+  libnetfilter_queue for the smoke test (smaller code while we're
+  proving the mechanism).
+- iptables setup: requires CAP_NET_ADMIN (VM grants).  One rule per
+  direction we want to filter.
+
+### What to mutate first, and what success looks like
+
+Start with `MPTCP_HMAC_BIT_FLIP` on the client's MP_JOIN ACK.  Why
+first:
+
+- Crypto gate this trips: `subflow_hmac_valid` (server side,
+  net/mptcp/subflow.c:753-ish).  This is the LOAD-BEARING gate that
+  the kcov instrumentation in patch 0002 was authored to cover.
+- Failure signal is loud: server emits RST with reason
+  `MPTCP_RST_EPROHIBIT`, server-side
+  `MPJoinAckHMacFailure` MIB counter increments, no subflow appears
+  on server msk.  All three are readable from our existing test
+  scaffolding.
+- The mutation is exactly one bit flip in a 20-byte field at a
+  fixed offset in the MP_JOIN ACK option -- minimum byte
+  fiddling.
+
+Success criterion (mirrors test_mp_join_normal):
+
+```
+MIB delta on the server msk:
+    MPJoinSynRx           +1  (client sent SYN -- ok)
+    MPJoinAckRx           0   (server saw bad ACK, dropped it)
+    MPJoinAckHMacFailure  +1  (HMAC validation gate tripped)
+
+MPTCP_INFO on server msk: mptcpi_subflows stays 0 (no subflow joined).
+dmesg: with dynamic_debug on net/mptcp/, expect to see
+       "subflow_hmac_valid: ..." rejection chain.
+```
+
+After HMAC_BIT_FLIP, add the rest in order of expected MIB-counter
+visibility:
+
+- `MPTCP_HMAC_ZERO`     -- same gate, full zero HMAC.
+- `MPTCP_HMAC_TRUNCATE` -- shorten the option (length validation
+                            path before HMAC).
+- `MPTCP_NONCE_ZERO`    -- different gate: server's thmac becomes
+                            predictable; client thinks its own
+                            HMAC is correct but server's RNG-based
+                            thmac will mismatch the client's
+                            expectation, so RST originates from
+                            CLIENT side -- different code path
+                            (subflow_thmac_valid, MPJoinSynAck-
+                            HMacFailure).
+- `MPTCP_NONCE_FLIP_HIGH/LOW`, `MPTCP_NONCE_REPLAY` -- variations
+                            that don't change the gate but stress
+                            the nonce-storage / lookup paths.
+
+### Sub-step breakdown
+
+**SS1.** Raw-netlink NFQUEUE plumbing in
+`brf_mptcp_ensure_executor_setup`.  Open `NETLINK_NETFILTER`
+socket, send `NFQNL_CFG_CMD_BIND` to claim queue 0, send
+`NFQNL_CFG_CMD_PF_BIND` for AF_INET, set copy mode to
+`NFQNL_COPY_PACKET`.  Set up the iptables rule via rtnetlink
+(or `system("iptables ...")` -- simpler, acceptable in
+the executor since CAP_NET_ADMIN is granted).  ~150 LOC executor.
+
+**SS2.** Packet-handler loop.  After issuing SUBFLOW_CREATE, read
+queued packets from the NFQUEUE fd.  For each:
+
+- Parse TCP options to find MPTCP option (type 30).
+- Identify subtype: MP_JOIN SYN (len=12, subtype=1), MP_JOIN
+  SYN-ACK won't appear here (incoming, no filter), MP_JOIN ACK
+  (len=24, subtype=1).
+- For MP_JOIN ACK: at offset 4 in the option is the 20-byte HMAC.
+- If `hmac_mut != NORMAL`: rewrite bytes per the enum value,
+  recompute TCP/IP checksum (kernel offload may or may not be on
+  for loopback -- safest to recompute).
+- Send `NFQNL_MSG_VERDICT` with verdict NF_ACCEPT (mod 0 or
+  modified payload).
+
+~200 LOC of TCP-option parsing + checksum recompute.
+
+**SS3.** Smoke test
+`kernel_patches/mptcp_kcov/test_mp_join_hmac_mutate.c`.  Mirror
+`test_mp_join_normal` flow but:
+
+- Set up libnetfilter_queue (host has it; VM needs `apt install`).
+- Before SUBFLOW_CREATE, install iptables rule:
+  `iptables -I OUTPUT -p tcp -s 127.0.0.2 -d 127.0.0.1
+   --tcp-flags PSH,SYN,RST,FIN ACK -j NFQUEUE --queue-num 0`
+  (matches plain ACKs, where MP_JOIN ACK lives).
+- Run handler thread that flips a bit in the HMAC.
+- Verify MIB delta as described above.
+
+**SS4.** Wire up in executor (the same code path as SS1/SS2,
+exercised by the `hmac_mut != NORMAL` branch in
+`syz_mptcp_join_subflow` that currently returns -1).  Add the
+remaining mutation enum values (HMAC_ZERO, HMAC_TRUNCATE).
+
+**SS5.** Add nonce mutations.  These mutate the SYN, not the ACK
+-- different filter direction (still egress from client) and
+slightly different option layout (12-byte MP_JOIN SYN option vs
+24-byte MP_JOIN ACK option).
+
+**Estimated commit boundaries:**
+
+- C1: NFQUEUE setup + smoke test (SS1+SS3 with libnetfilter_queue).
+  Prove the mechanism on the wire.  Skip executor wiring until VM-
+  verified.
+- C2: Executor wiring (SS2+SS4 raw-netlink in executor).
+  HMAC_BIT_FLIP path live.  Other HMAC mutations may piggyback
+  if straightforward.
+- C3: Nonce mutations (SS5).
+
+### Things we don't need yet
+
+- The per-subflow debug sockopt for nonce/thmac readback.  NFQUEUE
+  lets us read those off the wire.  Sockopt becomes useful only if
+  we need to verify INTERNAL kernel state vs WIRE state (a v03
+  concern).
+- Two-netns + veth + AF_PACKET.  v01 settled on loopback;
+  NFQUEUE works on loopback the same as veth.
+- An NFQUEUE-on-incoming filter.  Only egress is needed for
+  mutating what the kernel emits.
+
+### Decisions to surface to Shardul at v02 start
+
+- libnetfilter_queue in smoke test, raw netlink in executor: agree?
+  (Mainly a build-dependency hygiene question.)
+- iptables vs nftables: iptables is simpler since the rule is
+  trivial; nftables is the modern default.  Either works.
+  Recommend iptables for v02, switch to nftables if dev_env VM
+  ever drops iptables.
+- Mutation rejection telemetry: when the corpus generates a
+  mutation that we can't currently execute (e.g., MAP_HOLE before
+  drive_traffic is wired), do we return a distinct errno so
+  syz-manager can deprioritise vs returning generic -1?  Probably
+  yes -- propose -ENOSYS.
+
 ## 12. Implementation order (when work starts)
 
 1. Write the syzlang descriptions (Section 3) and run syz-sysgen

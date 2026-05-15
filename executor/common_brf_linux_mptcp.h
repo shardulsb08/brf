@@ -70,6 +70,18 @@ struct mptcp_debug_keys {
 };
 #endif
 
+// MPTCP_PM_ADDR_FLAG_* are defined in <linux/mptcp.h> which we deliberately
+// don't include (see comment on struct brf_mptcp_info_short for why).  Mirror
+// the bit values explicitly; these are uapi and won't change without breaking
+// existing userspace.
+#ifndef MPTCP_PM_ADDR_FLAG_SIGNAL
+#define MPTCP_PM_ADDR_FLAG_SIGNAL	(1U << 0)
+#define MPTCP_PM_ADDR_FLAG_SUBFLOW	(1U << 1)
+#define MPTCP_PM_ADDR_FLAG_BACKUP	(1U << 2)
+#define MPTCP_PM_ADDR_FLAG_FULLMESH	(1U << 3)
+#define MPTCP_PM_ADDR_FLAG_IMPLICIT	(1U << 4)
+#endif
+
 // Pull in mptcp_pm.h for MPTCP_PM_CMD_SUBFLOW_CREATE + attr enums.  Distro
 // headers usually carry this since iproute2 ships against it; the fallback
 // below mirrors include/uapi/linux/mptcp_pm.h at the kernel base commit
@@ -670,6 +682,7 @@ fail:
  *   failure with no debug, no SS entry, no MIB increment.
  */
 static int brf_mptcp_genl_subflow_create(uint32_t token, uint8_t addr_id,
+					 uint32_t addr_flags,
 					 uint32_t local_addr_be,
 					 uint16_t local_port_h,
 					 uint32_t remote_addr_be,
@@ -702,7 +715,10 @@ static int brf_mptcp_genl_subflow_create(uint32_t token, uint8_t addr_id,
 
 	BRF_PUT_ATTR(MPTCP_PM_ATTR_TOKEN, &token, sizeof(token));
 
-	/* MPTCP_PM_ATTR_ADDR: nested local-address entry. */
+	/* MPTCP_PM_ATTR_ADDR: nested local-address entry.  FLAGS is
+	 * optional in the kernel parser; only included when non-zero
+	 * to keep the SUBFLOW_CREATE call shape identical for the
+	 * NORMAL/backup=0 path. */
 	{
 		uint16_t fam_v = AF_INET;
 		nest = (struct nlattr *)p;
@@ -716,6 +732,9 @@ static int brf_mptcp_genl_subflow_create(uint32_t token, uint8_t addr_id,
 			     sizeof(local_addr_be));
 		BRF_PUT_ATTR(MPTCP_PM_ADDR_ATTR_PORT, &local_port_h,
 			     sizeof(local_port_h));
+		if (addr_flags)
+			BRF_PUT_ATTR(MPTCP_PM_ADDR_ATTR_FLAGS, &addr_flags,
+				     sizeof(addr_flags));
 		nest->nla_len = p - (char *)nest;
 	}
 
@@ -773,14 +792,13 @@ static long syz_mptcp_join_subflow(volatile long a0, volatile long a1,
 	struct brf_mptcp_pair_state *pair;
 	long slot = a0;
 	uint8_t addr_id   = (uint8_t)a1;
+	uint8_t backup    = (uint8_t)a2;	/* syzlang clamps to [0:1] */
 	uint8_t nonce_mut = (uint8_t)a3;
 	uint8_t hmac_mut  = (uint8_t)a4;
 	int sub_slot;
 	int retries;
 	const uint32_t local_addr_be  = htonl(0x7f000002);
 	const uint32_t remote_addr_be = htonl(0x7f000001);
-
-	(void)a2;	/* backup flag -- not exercised in NORMAL v01 */
 
 	/* v01: only NORMAL mode.  Mutation enum values are part of the
 	 * syzlang surface so the corpus generator emits them, but the
@@ -822,8 +840,16 @@ static long syz_mptcp_join_subflow(volatile long a0, volatile long a1,
 
 	/* server_listen_port is stored in NBO (sin_port form); the genl
 	 * port attribute wants host-byte order -- see byte-order comment
-	 * on brf_mptcp_genl_subflow_create. */
-	if (brf_mptcp_genl_subflow_create(pair->token, addr_id,
+	 * on brf_mptcp_genl_subflow_create.
+	 *
+	 * addr_flags: SUBFLOW is set unconditionally by the kernel handler
+	 * (mptcp_pm_nl_subflow_create_doit, pm_userspace.c).  SIGNAL is
+	 * rejected by the same handler.  BACKUP is the only flag we set
+	 * here, when the syzlang backup parameter is 1 -- this puts the
+	 * new subflow on the backup-priority code path
+	 * (mptcp_subflow_set_active / MP_PRIO handling). */
+	uint32_t addr_flags = backup ? MPTCP_PM_ADDR_FLAG_BACKUP : 0;
+	if (brf_mptcp_genl_subflow_create(pair->token, addr_id, addr_flags,
 					  local_addr_be,  0,
 					  remote_addr_be,
 					  ntohs(pair->server_listen_port)) < 0)
