@@ -41,9 +41,12 @@ this pattern" section there.
   SESSION_SETUP_PATTERN.md        canonical methodology (copy of microkernel's)
   settings.local.json             Claude Code local settings (gitignored)
   principles/                     short design-principle files (read on trigger)
-    <aspect>.md                   e.g., fuzzer_grammar_discipline.md,
-                                  syzkaller_descriptor_conventions.md,
-                                  kernel_patch_authoring.md
+    <aspect>.md                   judgment-shaping: how to think about X
+                                  e.g., kernel_patch_authoring.md
+  designs/                        technical architecture / recipe docs (read on trigger)
+    <subject>.md                  fact-shaping: how a thing actually works
+                                  e.g., brf_architecture.md (the BRF pseudo-syscall
+                                  pattern and its lift to protocol fuzzing)
   tasks/                          per-task working dirs (gitignored)
     index.md                      registry: name, status, keywords, brief path
     <task_slug>/
@@ -52,6 +55,14 @@ this pattern" section there.
   archive/                        retired memories with index
     README.md                     index: what was moved and why
 ```
+
+**`principles/` vs `designs/` distinction:** `principles/` files are
+judgment-shaping ("when working on X, think this way"); `designs/`
+files are fact-shaping ("here is how X actually works, and the
+recipe for extending it").  Both are tracked, both are short, both
+load on trigger from the CLAUDE.md table.  When a doc straddles the
+two -- a recipe that also encodes opinions -- pick the directory
+whose centre of gravity dominates and cross-link from the other.
 
 Only the README + SESSION_SETUP_PATTERN files exist today. Everything
 else is added when the corresponding work appears -- creating empty

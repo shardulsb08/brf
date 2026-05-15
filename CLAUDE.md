@@ -77,8 +77,17 @@ Session contract:
 2. Claude reads `.claude/tasks/index.md` (small, always read).
 3. When user requests match a task's keywords, Claude asks before
    loading the brief.
-4. Principle files under `.claude/principles/` (none yet) load
-   automatically on trigger conditions documented per-file.
+4. Principle files under `.claude/principles/` (none yet) and design
+   files under `.claude/designs/` load automatically on the trigger
+   conditions in the table below.
+
+### Auto-loaded references (read without asking, when triggered)
+
+| When the work involves...                                            | Read this without asking                                |
+|----------------------------------------------------------------------|---------------------------------------------------------|
+| Touching `prog/brf*.go`, `executor/common_brf*.h`, BRF pseudo-       | `.claude/designs/brf_architecture.md`                   |
+| syscall lifecycle, or designing a new BRF-style harness extension    |                                                         |
+| (MPTCP, QUIC, tlshd, or any new protocol substrate)                  |                                                         |
 
 ## Design principles (binding on all work in this tree)
 
