@@ -543,14 +543,21 @@ infrastructure is incomplete without them.
    uapi exposes the keys).  Sub-choice between (a) two-netns +
    veth + AF_PACKET observer vs (b) loopback + AF_PACKET on lo;
    recommendation (a) for cleanliness.  See Section 5.1.
-2. **netns vs loopback isolation.**  Per-pair fresh netns is
-   cleanest but adds setup latency.  Loopback with careful
-   port allocation is faster.  Benchmark in the dev_env.
-3. **Kcov-handle plumbing path.**  setsockopt vs other.  See 7.3.
-4. **Coverage instrumentation granularity:** msk-level vs
-   subflow-level vs both.  Recommendation: both, but if patch
-   complexity is an issue, start subflow-only since the gates
-   we care about fire there.
+2. **netns vs loopback isolation.**  ~~Per-pair fresh netns is
+   cleanest but adds setup latency.~~  **Settled 2026-05-15.**
+   Persistent two-netns + veth pair set up at executor init
+   time, reused across all `syz_mptcp_pair_init` calls.  Per-
+   pair isolation comes from the state-carrier pool, not from
+   per-pair netns.  Cost: one-time at startup; per-pair zero.
+   Syzlang descriptions don't mention netns, so a future switch
+   to loopback isolation is C-side only -- door stays open.
+3. **Kcov-handle plumbing path.**  ~~setsockopt vs other.~~
+   **Settled 2026-05-15.** New `setsockopt(SOL_MPTCP,
+   MPTCP_KCOV_HANDLE, &handle)` under `CONFIG_KCOV`.  See 7.3.
+4. **Coverage instrumentation granularity:** ~~msk-level vs
+   subflow-level vs both.~~  **Settled 2026-05-15.**  Both, but
+   start subflow-only if patch complexity is an issue.  The
+   gates we care about (HMAC, token, DSS) fire at subflow level.
 
 ## 12. Implementation order (when work starts)
 
