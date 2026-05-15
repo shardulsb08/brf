@@ -216,13 +216,33 @@ Steps in C:
  3. socket(AF_INET, SOCK_STREAM, IPPROTO_MPTCP) for client.  Set
     setsockopt(SOL_MPTCP, MPTCP_INFO_xxx) as needed for csum mode.
  4. connect() client to server.  Wait for ESTABLISHED.
- 5. Capture local_key and remote_key.  Two paths:
-    (a) getsockopt(SOL_MPTCP, MPTCP_INFO) -- kernel exposes the
-        local mptcp_info structure with msk_key (since v5.16) and
-        peer key.  Cleanest.
-    (b) Raw socket peek on the loopback PACKET interface during
-        connect() to extract the MP_CAPABLE option bytes directly.
-        Used as fallback or for cross-verification.
+ 5. Capture local_key and remote_key via wire-peek.
+
+    **Settled, 2026-05-15:**  Verified against `mptcp_brf_fuzz_base`
+    (export/20260515T083717) that `struct mptcp_info`
+    (`include/uapi/linux/mptcp.h`) exposes only `mptcpi_token` (32
+    bits), not the full 64-bit keys.  `MPTCP_FULL_INFO` adds
+    subflow-info but no keys either.  No uapi path exposes
+    `msk->local_key` / `msk->remote_key`.
+
+    Therefore: capture both keys by peeking the wire.  Two sub-
+    options for the peek:
+
+    (a) **Same-host two-netns + veth + AF_PACKET observer.**  Run
+        server in netns A, client (us) in netns B, veth pair
+        between them, AF_PACKET socket on one side to observe.
+        Server is a real IPPROTO_MPTCP socket; client is also a
+        real socket for `pair_init` (no mutation needed yet).
+        Extract local_key from client's MP_CAPABLE SYN; extract
+        remote_key from server's MP_CAPABLE SYN-ACK.  Cleanest;
+        unprivileged for the observer once veth is set up.
+
+    (b) **Loopback + AF_PACKET on `lo`.**  Same idea on a single
+        netns.  Simpler setup but more contention with kernel's
+        loopback TCP behaviour.  Use if (a) turns out to have
+        netns setup latency we don't want.
+
+    Recommendation: (a).
  6. Compute token = upper 32 bits of SHA-256(remote_key).
  7. Compute idsn_local = lower 64 bits of SHA-256(local_key);
     idsn_remote = lower 64 bits of SHA-256(remote_key).
@@ -318,28 +338,31 @@ Three options, with tradeoffs:
 | (b) AF_PACKET raw inject     | Full byte control; can mutate freely      | Must implement TCP state machine in executor |
 | (c) Hybrid: real client side, AF_PACKET peer | Real kernel side for "our" endpoint; raw inject for "peer" packets | Most complex; needs careful path isolation    |
 
-**Recommendation: (c) hybrid.**
+**Recommendation: split by phase.**
 
-Rationale: the *kernel under test* is what we want to fuzz.  In
-option (c), the kernel runs its real MPTCP parser on the bytes we
-inject via AF_PACKET; our side uses real sockets so we don't have
-to implement TCP retransmits, ACK handling, etc.
+- **pair_init (no mutation):**  Use (a).  Both endpoints real
+  kernel sockets in two netns connected by veth.  AF_PACKET
+  observer on the veth to extract keys from the wire.  No
+  injection needed; the kernel does all the work.  Lowest setup
+  cost.
+- **join_subflow + drive_traffic (mutation):**  Use (c) hybrid.
+  Server endpoint stays a real socket (kernel runs the MPTCP
+  parser we want to fuzz).  Client side now switches to
+  AF_PACKET-crafted injection (or `iptables -j NFQUEUE` + libnetfilter_queue
+  to rewrite egress packets from a real client socket).  The
+  mutation knobs in the syscall descriptors decide what to
+  rewrite.
 
-Concretely:
+Rationale: pair_init needs no injection, only observation -- so
+the cheap setup is the right choice there.  join_subflow needs
+to MUTATE specific byte ranges (HMAC, nonce, addr_id) -- so we
+need either full AF_PACKET injection or NFQUEUE-based rewrite.
 
-- The *server* endpoint is a real `IPPROTO_MPTCP` listening socket
-  on the loopback.  Kernel-under-test runs the parser.
-- The *client* endpoint pretends to be a remote peer, crafted via
-  AF_PACKET.  The harness emits SYN+MP_CAPABLE, ACK, SYN+MP_JOIN
-  with mutated bytes, etc.
-- Use a dedicated netns or a non-loopback dummy interface so we
-  don't fight the kernel's own loopback TCP behaviour for the
-  injected packets.
-
-If (c) proves too complex for v1, fall back to (a) for the
-honest-handshake path and capture-only operation (no mutations);
-that proves the state-carrier works and exposes some bugs but
-loses the mutation surface.
+If even the join_subflow mutation path proves too complex for
+v1, fall back to capture-only mode and gain some bugs from
+unmutated traffic + state-machine racing (concurrent joins,
+mistimed closes).  Loses targeted mutation surface but keeps the
+state-carrier and PM-netlink mutation paths.
 
 ## 6.bis Kernel base for this harness
 
@@ -515,8 +538,11 @@ infrastructure is incomplete without them.
 
 ## 11. Open questions to settle before implementation
 
-1. **Pair-init key capture path:** (a) MPTCP_INFO getsockopt vs
-   (b) raw-socket peek.  Settle in first dev_env experiment.
+1. **Pair-init key capture path:** ~~(a) MPTCP_INFO getsockopt vs
+   (b) raw-socket peek.~~  **Settled 2026-05-15.**  Wire-peek (no
+   uapi exposes the keys).  Sub-choice between (a) two-netns +
+   veth + AF_PACKET observer vs (b) loopback + AF_PACKET on lo;
+   recommendation (a) for cleanliness.  See Section 5.1.
 2. **netns vs loopback isolation.**  Per-pair fresh netns is
    cleanest but adds setup latency.  Loopback with careful
    port allocation is faster.  Benchmark in the dev_env.
