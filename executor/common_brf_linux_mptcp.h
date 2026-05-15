@@ -70,6 +70,50 @@ struct mptcp_debug_keys {
 };
 #endif
 
+// Pull in mptcp_pm.h for MPTCP_PM_CMD_SUBFLOW_CREATE + attr enums.  Distro
+// headers usually carry this since iproute2 ships against it; the fallback
+// below mirrors include/uapi/linux/mptcp_pm.h at the kernel base commit
+// 232989ca65248 in case the host headers lag.
+#if __has_include(<linux/mptcp_pm.h>)
+#include <linux/mptcp_pm.h>
+#else
+#define MPTCP_PM_NAME	"mptcp_pm"
+#define MPTCP_PM_VER	1
+enum {
+	MPTCP_PM_ATTR_UNSPEC_FB,
+	MPTCP_PM_ATTR_ADDR,
+	MPTCP_PM_ATTR_RCV_ADD_ADDRS,
+	MPTCP_PM_ATTR_SUBFLOWS,
+	MPTCP_PM_ATTR_TOKEN,
+	MPTCP_PM_ATTR_LOC_ID,
+	MPTCP_PM_ATTR_ADDR_REMOTE,
+};
+enum {
+	MPTCP_PM_ADDR_ATTR_UNSPEC_FB,
+	MPTCP_PM_ADDR_ATTR_FAMILY,
+	MPTCP_PM_ADDR_ATTR_ID,
+	MPTCP_PM_ADDR_ATTR_ADDR4,
+	MPTCP_PM_ADDR_ATTR_ADDR6,
+	MPTCP_PM_ADDR_ATTR_PORT,
+	MPTCP_PM_ADDR_ATTR_FLAGS,
+	MPTCP_PM_ADDR_ATTR_IF_IDX,
+};
+enum {
+	MPTCP_PM_CMD_UNSPEC_FB,
+	MPTCP_PM_CMD_ADD_ADDR,
+	MPTCP_PM_CMD_DEL_ADDR,
+	MPTCP_PM_CMD_GET_ADDR,
+	MPTCP_PM_CMD_FLUSH_ADDRS,
+	MPTCP_PM_CMD_SET_LIMITS,
+	MPTCP_PM_CMD_GET_LIMITS,
+	MPTCP_PM_CMD_SET_FLAGS,
+	MPTCP_PM_CMD_ANNOUNCE,
+	MPTCP_PM_CMD_REMOVE,
+	MPTCP_PM_CMD_SUBFLOW_CREATE,
+	MPTCP_PM_CMD_SUBFLOW_DESTROY,
+};
+#endif
+
 // Subset of struct mptcp_info we need (mptcpi_token + mptcpi_csum_enabled).
 // We declare our own packed view to avoid pulling in linux/mptcp.h with a
 // definition that may have grown additional trailing fields upstream.
@@ -110,6 +154,11 @@ struct brf_mptcp_pair_state {
 	int      server_listen_fd;
 	int      server_msk_fd;
 	int      client_msk_fd;
+
+	// Server's bound port in network byte order.  Captured at pair_init
+	// time so MP_JOIN's MPTCP_PM_CMD_SUBFLOW_CREATE knows where to point
+	// the new subflow without having to call getsockname() again.
+	uint16_t server_listen_port;
 
 	// MP_CAPABLE-captured cryptographic material.  See
 	// net/mptcp/crypto.c (mptcp_crypto_key_sha / _hmac_sha) for the
@@ -153,6 +202,13 @@ static bool brf_mptcp_netns_initialized __attribute__((unused)) = false;
 
 // ---------- Pseudo-syscall implementations (v0 skeletons) ----------
 
+/* Forward declaration: defined alongside syz_mptcp_join_subflow below.  Needed
+ * here because syz_mptcp_pair_init must flip net.mptcp.pm_type=1 BEFORE
+ * creating any msk (the pm_type is captured at msk-construction time). */
+#if SYZ_EXECUTOR || __NR_syz_mptcp_join_subflow
+static int brf_mptcp_ensure_executor_setup(void);
+#endif
+
 #if SYZ_EXECUTOR || __NR_syz_mptcp_pair_init
 /*
  * Create an MP_CAPABLE-established pair on loopback, capture the
@@ -190,6 +246,17 @@ static long syz_mptcp_pair_init(volatile long a0, volatile long a1,
 	(void)a1;	/* client_addr (sockaddr_storage)  -- ignored in v01 */
 	(void)a2;	/* init_flags                      -- ignored in v01 */
 
+	/* 0. Flip the netns to userspace PM mode BEFORE creating any msk:
+	 *    msk->pm.pm_type is captured at sock-creation time
+	 *    (mptcp_pm_data_reset). Without this, syz_mptcp_join_subflow's
+	 *    MPTCP_PM_CMD_SUBFLOW_CREATE later returns "userspace PM not
+	 *    selected".  ensure_executor_setup() is idempotent across calls
+	 *    and across pseudo-syscalls. */
+#if SYZ_EXECUTOR || __NR_syz_mptcp_join_subflow
+	if (brf_mptcp_ensure_executor_setup() < 0)
+		return -1;
+#endif
+
 	/* 1. Allocate a free pool slot. */
 	for (slot = 0; slot < MPTCP_PAIR_POOL_SIZE; slot++)
 		if (!brf_mptcp_pair_pool[slot].in_use)
@@ -205,6 +272,10 @@ static long syz_mptcp_pair_init(volatile long a0, volatile long a1,
 	pair->server_listen_fd = -1;
 	pair->server_msk_fd = -1;
 	pair->client_msk_fd = -1;
+	/* memset() left tcp_subflow_fd == 0 across the pool which would later
+	 * make pair_close() call close(0) (stdin); fix to -1 here. */
+	for (int s = 0; s < MPTCP_MAX_SUBFLOWS_PER_PAIR; s++)
+		pair->subflows[s].tcp_subflow_fd = -1;
 
 	/* 2. Server socket: bind to ephemeral on 127.0.0.1, listen. */
 	pair->server_listen_fd = socket(AF_INET, SOCK_STREAM, IPPROTO_MPTCP);
@@ -232,6 +303,7 @@ static long syz_mptcp_pair_init(volatile long a0, volatile long a1,
 		      strerror(errno));
 		goto fail;
 	}
+	pair->server_listen_port = srv_addr.sin_port;
 	if (listen(pair->server_listen_fd, 1) < 0) {
 		debug("syz_mptcp_pair_init: listen: %s\n", strerror(errno));
 		goto fail;
@@ -253,6 +325,47 @@ static long syz_mptcp_pair_init(volatile long a0, volatile long a1,
 	if (pair->server_msk_fd < 0) {
 		debug("syz_mptcp_pair_init: accept: %s\n", strerror(errno));
 		goto fail;
+	}
+
+	/* 3.5. Drive a 1-byte round-trip to force the client-side
+	 *      msk->fully_established transition.  After bare connect() +
+	 *      accept(), the SERVER msk is fully_established (set in
+	 *      mptcp_sock_create_accept on third-ACK reception) but the
+	 *      CLIENT msk is not -- check_fully_established (net/mptcp/
+	 *      options.c) only flips the client's flag when an inbound DSS
+	 *      packet with use_ack arrives.  Without this, the subsequent
+	 *      MPTCP_PM_CMD_SUBFLOW_CREATE from syz_mptcp_join_subflow gets
+	 *      -ENOTCONN at __mptcp_subflow_connect (net/mptcp/subflow.c).
+	 *      The round-trip is intentionally bidirectional so both sides
+	 *      end up fully_established irrespective of which path the
+	 *      kernel takes to detect the transition. */
+	{
+		char b = 'x';
+		ssize_t n;
+		n = send(pair->client_msk_fd, &b, 1, 0);
+		if (n != 1) {
+			debug("syz_mptcp_pair_init: prime send c->s: %s\n",
+			      strerror(errno));
+			goto fail;
+		}
+		n = recv(pair->server_msk_fd, &b, 1, MSG_WAITALL);
+		if (n != 1) {
+			debug("syz_mptcp_pair_init: prime recv on s: %s\n",
+			      strerror(errno));
+			goto fail;
+		}
+		n = send(pair->server_msk_fd, &b, 1, 0);
+		if (n != 1) {
+			debug("syz_mptcp_pair_init: prime send s->c: %s\n",
+			      strerror(errno));
+			goto fail;
+		}
+		n = recv(pair->client_msk_fd, &b, 1, MSG_WAITALL);
+		if (n != 1) {
+			debug("syz_mptcp_pair_init: prime recv on c: %s\n",
+			      strerror(errno));
+			goto fail;
+		}
 	}
 
 	/* 4. Capture both MPTCP keys from the client side via the new
@@ -313,33 +426,434 @@ fail:
 #endif
 
 #if SYZ_EXECUTOR || __NR_syz_mptcp_join_subflow
+
+/*
+ * NORMAL-mode MP_JOIN implementation (v01).  Design doc Section 5.2.
+ *
+ * Mechanism: switch the netns to userspace MPTCP path-manager mode and use
+ * MPTCP_PM_CMD_SUBFLOW_CREATE to explicitly initiate each MP_JOIN.  The
+ * kernel-PM alternative (configure an endpoint with the `subflow` flag and
+ * let the PM auto-fire) only triggers during MP_CAPABLE -> ESTABLISHED, which
+ * has already happened by the time join_subflow is called -- wrong shape for
+ * a stateful pseudo-syscall.
+ *
+ * The server's acceptance gate (mptcp_can_accept_new_subflow,
+ * net/mptcp/subflow.c) in userspace-PM mode requires a multicast listener on
+ * the mptcp_pm_events group: just binding a netlink socket and subscribing is
+ * enough; we never need to read the events.
+ *
+ * v01 deliberate omissions (per task brief Pick-up-here block):
+ *   - No nonce/thmac capture.  Kernel drives crypto end-to-end in NORMAL
+ *     mode; capture only becomes load-bearing once mutation modes land.
+ *   - No mutation paths.  Calls with nonce_mut/hmac_mut != NORMAL return -1.
+ *   - No explicit `ip addr add 127.0.0.2/8 dev lo`.  Linux treats all of
+ *     127/8 as local on lo via the auto-installed connected route, so
+ *     kernel_bind() inside __mptcp_subflow_connect accepts 127.0.0.2 as a
+ *     source address without explicit assignment.  Revisit if VM smoke
+ *     surfaces EADDRNOTAVAIL.
+ */
+
+/* One-time-per-process state.  Lazy-initialised on first syz_mptcp_pair_init
+ * (so MP_CAPABLE msks inherit the userspace PM type) or first
+ * syz_mptcp_join_subflow (so direct re-entry from a repro still works). */
+static int      brf_mptcp_setup_done = 0;
+static int      brf_mptcp_genl_sock = -1;
+static int      brf_mptcp_event_sock = -1;
+static uint16_t brf_mptcp_pm_family_id = 0;
+
+/* Parse a CTRL_CMD_GETFAMILY reply for both the family id and the id of the
+ * "mptcp_pm_events" multicast group.  common_linux.h's
+ * netlink_query_family_id only returns family id; we need both, hence a
+ * dedicated implementation. */
+static int brf_mptcp_resolve_pm_family(int sock,
+				       uint16_t *family_id_out,
+				       uint32_t *event_grp_id_out)
+{
+	char buf[1024];
+	struct nlmsghdr *nlh = (struct nlmsghdr *)buf;
+	struct genlmsghdr *ghdr;
+	struct nlattr *attr;
+	const char fname[] = "mptcp_pm";
+	const size_t fname_sz = sizeof(fname);
+	ssize_t n;
+	uint16_t fid = 0;
+	uint32_t egid = 0;
+
+	memset(buf, 0, sizeof(buf));
+	nlh->nlmsg_type  = GENL_ID_CTRL;
+	nlh->nlmsg_flags = NLM_F_REQUEST;
+	nlh->nlmsg_seq   = 1;
+	nlh->nlmsg_pid   = 0;
+	ghdr = (struct genlmsghdr *)NLMSG_DATA(nlh);
+	ghdr->cmd     = CTRL_CMD_GETFAMILY;
+	ghdr->version = 1;
+	attr = (struct nlattr *)((char *)NLMSG_DATA(nlh) +
+				 NLMSG_ALIGN(sizeof(*ghdr)));
+	attr->nla_type = CTRL_ATTR_FAMILY_NAME;
+	attr->nla_len  = NLA_HDRLEN + fname_sz;
+	memcpy((char *)attr + NLA_HDRLEN, fname, fname_sz);
+	nlh->nlmsg_len = NLMSG_HDRLEN + NLMSG_ALIGN(sizeof(*ghdr)) +
+			 NLA_ALIGN(attr->nla_len);
+
+	if (send(sock, buf, nlh->nlmsg_len, 0) < 0) {
+		debug("mptcp_setup: send GETFAMILY: %s\n", strerror(errno));
+		return -1;
+	}
+	n = recv(sock, buf, sizeof(buf), 0);
+	if (n < 0) {
+		debug("mptcp_setup: recv GETFAMILY: %s\n", strerror(errno));
+		return -1;
+	}
+
+	nlh = (struct nlmsghdr *)buf;
+	if (nlh->nlmsg_type == NLMSG_ERROR) {
+		struct nlmsgerr *ne = (struct nlmsgerr *)NLMSG_DATA(nlh);
+		debug("mptcp_setup: GETFAMILY err=%d (%s)\n",
+		      ne->error, strerror(-ne->error));
+		errno = -ne->error;
+		return -1;
+	}
+	ghdr = (struct genlmsghdr *)NLMSG_DATA(nlh);
+	attr = (struct nlattr *)((char *)NLMSG_DATA(nlh) +
+				 NLMSG_ALIGN(sizeof(*ghdr)));
+	ssize_t left = nlh->nlmsg_len - NLMSG_HDRLEN -
+		       NLMSG_ALIGN(sizeof(*ghdr));
+
+	while (left >= (ssize_t)NLA_HDRLEN &&
+	       attr->nla_len >= NLA_HDRLEN &&
+	       (ssize_t)NLA_ALIGN(attr->nla_len) <= left) {
+		switch (attr->nla_type & NLA_TYPE_MASK) {
+		case CTRL_ATTR_FAMILY_ID:
+			if (attr->nla_len >= NLA_HDRLEN + sizeof(uint16_t))
+				fid = *(uint16_t *)((char *)attr + NLA_HDRLEN);
+			break;
+		case CTRL_ATTR_MCAST_GROUPS: {
+			/* nested array of unnamed nested attributes, each
+			 * holding {CTRL_ATTR_MCAST_GRP_NAME,
+			 *          CTRL_ATTR_MCAST_GRP_ID} */
+			char *gpos = (char *)attr + NLA_HDRLEN;
+			char *gend = (char *)attr + attr->nla_len;
+			while (gpos + NLA_HDRLEN <= gend) {
+				struct nlattr *grp = (struct nlattr *)gpos;
+				if (grp->nla_len < NLA_HDRLEN ||
+				    gpos + grp->nla_len > gend)
+					break;
+				char *ipos = (char *)grp + NLA_HDRLEN;
+				char *iend = (char *)grp + grp->nla_len;
+				const char *gname = NULL;
+				uint32_t gid = 0;
+				while (ipos + NLA_HDRLEN <= iend) {
+					struct nlattr *inner =
+						(struct nlattr *)ipos;
+					if (inner->nla_len < NLA_HDRLEN ||
+					    ipos + inner->nla_len > iend)
+						break;
+					if ((inner->nla_type & NLA_TYPE_MASK) ==
+					    CTRL_ATTR_MCAST_GRP_NAME)
+						gname = (const char *)inner +
+							NLA_HDRLEN;
+					else if ((inner->nla_type & NLA_TYPE_MASK) ==
+						 CTRL_ATTR_MCAST_GRP_ID &&
+						 inner->nla_len >=
+							 NLA_HDRLEN +
+								 sizeof(uint32_t))
+						gid = *(uint32_t *)((char *)inner +
+								    NLA_HDRLEN);
+					ipos += NLA_ALIGN(inner->nla_len);
+				}
+				if (gname && strcmp(gname,
+						    "mptcp_pm_events") == 0)
+					egid = gid;
+				gpos += NLA_ALIGN(grp->nla_len);
+			}
+			break;
+		}
+		}
+		left -= NLA_ALIGN(attr->nla_len);
+		attr = (struct nlattr *)((char *)attr +
+					 NLA_ALIGN(attr->nla_len));
+	}
+	if (fid == 0 || egid == 0) {
+		debug("mptcp_setup: GETFAMILY parse incomplete: "
+		      "fid=%u egid=%u\n", fid, egid);
+		errno = ENOENT;
+		return -1;
+	}
+	*family_id_out    = fid;
+	*event_grp_id_out = egid;
+	return 0;
+}
+
+/* Idempotent.  Sets net.mptcp.pm_type=1, opens a genl socket for sending PM
+ * commands, opens a second genl socket subscribed to mptcp_pm_events so the
+ * server-side acceptance gate (mptcp_userspace_pm_active) returns true.
+ * Stashes state in the brf_mptcp_* statics above. */
+static int brf_mptcp_ensure_executor_setup(void)
+{
+	struct sockaddr_nl sa;
+	uint32_t event_grp_id = 0;
+
+	if (brf_mptcp_setup_done)
+		return 0;
+
+	if (!write_file("/proc/sys/net/mptcp/pm_type", "1")) {
+		debug("mptcp_setup: write pm_type=1 failed: %s\n",
+		      strerror(errno));
+		return -1;
+	}
+
+	brf_mptcp_genl_sock = socket(AF_NETLINK, SOCK_RAW, NETLINK_GENERIC);
+	if (brf_mptcp_genl_sock < 0) {
+		debug("mptcp_setup: socket(genl): %s\n", strerror(errno));
+		return -1;
+	}
+	memset(&sa, 0, sizeof(sa));
+	sa.nl_family = AF_NETLINK;
+	if (bind(brf_mptcp_genl_sock, (struct sockaddr *)&sa,
+		 sizeof(sa)) < 0) {
+		debug("mptcp_setup: bind(genl): %s\n", strerror(errno));
+		goto fail;
+	}
+
+	if (brf_mptcp_resolve_pm_family(brf_mptcp_genl_sock,
+					&brf_mptcp_pm_family_id,
+					&event_grp_id) < 0)
+		goto fail;
+
+	brf_mptcp_event_sock = socket(AF_NETLINK, SOCK_RAW, NETLINK_GENERIC);
+	if (brf_mptcp_event_sock < 0) {
+		debug("mptcp_setup: socket(event): %s\n", strerror(errno));
+		goto fail;
+	}
+	memset(&sa, 0, sizeof(sa));
+	sa.nl_family = AF_NETLINK;
+	if (bind(brf_mptcp_event_sock, (struct sockaddr *)&sa,
+		 sizeof(sa)) < 0) {
+		debug("mptcp_setup: bind(event): %s\n", strerror(errno));
+		goto fail;
+	}
+	if (setsockopt(brf_mptcp_event_sock, SOL_NETLINK,
+		       NETLINK_ADD_MEMBERSHIP, &event_grp_id,
+		       sizeof(event_grp_id)) < 0) {
+		debug("mptcp_setup: NETLINK_ADD_MEMBERSHIP "
+		      "mptcp_pm_events: %s\n", strerror(errno));
+		goto fail;
+	}
+
+	brf_mptcp_setup_done = 1;
+	debug("mptcp_setup: pm_type=1, family_id=%u event_grp_id=%u, "
+	      "listener active\n", brf_mptcp_pm_family_id, event_grp_id);
+	return 0;
+
+fail:
+	if (brf_mptcp_event_sock >= 0) {
+		close(brf_mptcp_event_sock);
+		brf_mptcp_event_sock = -1;
+	}
+	if (brf_mptcp_genl_sock >= 0) {
+		close(brf_mptcp_genl_sock);
+		brf_mptcp_genl_sock = -1;
+	}
+	return -1;
+}
+
+/* Send one MPTCP_PM_CMD_SUBFLOW_CREATE and wait for its NLMSG_ERROR ack.
+ *
+ * Byte-order gotcha (kernel uapi quirk):
+ *   - Addresses (MPTCP_PM_ADDR_ATTR_ADDR4) are network-byte-order in the
+ *     attribute; the kernel reads them raw via nla_get_in_addr.
+ *   - Ports (MPTCP_PM_ADDR_ATTR_PORT) are HOST-byte-order in the attribute;
+ *     the kernel applies htons() on the way in (net/mptcp/pm_netlink.c:86,
+ *     `addr->port = htons(nla_get_u16(...))`).
+ *   Passing the port in network order makes the kernel byteswap a second
+ *   time and aim the MP_JOIN SYN at a wrong port -- looks like a silent
+ *   failure with no debug, no SS entry, no MIB increment.
+ */
+static int brf_mptcp_genl_subflow_create(uint32_t token, uint8_t addr_id,
+					 uint32_t local_addr_be,
+					 uint16_t local_port_h,
+					 uint32_t remote_addr_be,
+					 uint16_t remote_port_h)
+{
+	char buf[256];
+	struct nlmsghdr *nlh = (struct nlmsghdr *)buf;
+	struct genlmsghdr *ghdr;
+	struct nlattr *attr, *nest;
+	char *p;
+	ssize_t n;
+#define BRF_PUT_ATTR(typ, src, sz) do {				\
+		attr = (struct nlattr *)p;			\
+		attr->nla_type = (typ);				\
+		attr->nla_len  = NLA_HDRLEN + (sz);		\
+		memcpy((char *)attr + NLA_HDRLEN, (src), (sz));	\
+		p += NLA_ALIGN(attr->nla_len);			\
+	} while (0)
+
+	memset(buf, 0, sizeof(buf));
+	nlh->nlmsg_type  = brf_mptcp_pm_family_id;
+	nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
+	nlh->nlmsg_seq   = 2;
+	nlh->nlmsg_pid   = 0;
+	ghdr = (struct genlmsghdr *)NLMSG_DATA(nlh);
+	ghdr->cmd     = MPTCP_PM_CMD_SUBFLOW_CREATE;
+	ghdr->version = MPTCP_PM_VER;
+
+	p = (char *)NLMSG_DATA(nlh) + NLMSG_ALIGN(sizeof(*ghdr));
+
+	BRF_PUT_ATTR(MPTCP_PM_ATTR_TOKEN, &token, sizeof(token));
+
+	/* MPTCP_PM_ATTR_ADDR: nested local-address entry. */
+	{
+		uint16_t fam_v = AF_INET;
+		nest = (struct nlattr *)p;
+		nest->nla_type = MPTCP_PM_ATTR_ADDR | NLA_F_NESTED;
+		p += NLA_HDRLEN;
+		BRF_PUT_ATTR(MPTCP_PM_ADDR_ATTR_FAMILY, &fam_v,
+			     sizeof(fam_v));
+		BRF_PUT_ATTR(MPTCP_PM_ADDR_ATTR_ID, &addr_id,
+			     sizeof(addr_id));
+		BRF_PUT_ATTR(MPTCP_PM_ADDR_ATTR_ADDR4, &local_addr_be,
+			     sizeof(local_addr_be));
+		BRF_PUT_ATTR(MPTCP_PM_ADDR_ATTR_PORT, &local_port_h,
+			     sizeof(local_port_h));
+		nest->nla_len = p - (char *)nest;
+	}
+
+	/* MPTCP_PM_ATTR_ADDR_REMOTE: nested remote-address entry. */
+	{
+		uint16_t fam_v = AF_INET;
+		nest = (struct nlattr *)p;
+		nest->nla_type = MPTCP_PM_ATTR_ADDR_REMOTE | NLA_F_NESTED;
+		p += NLA_HDRLEN;
+		BRF_PUT_ATTR(MPTCP_PM_ADDR_ATTR_FAMILY, &fam_v,
+			     sizeof(fam_v));
+		BRF_PUT_ATTR(MPTCP_PM_ADDR_ATTR_ADDR4, &remote_addr_be,
+			     sizeof(remote_addr_be));
+		BRF_PUT_ATTR(MPTCP_PM_ADDR_ATTR_PORT, &remote_port_h,
+			     sizeof(remote_port_h));
+		nest->nla_len = p - (char *)nest;
+	}
+
+	nlh->nlmsg_len = p - buf;
+
+	if (send(brf_mptcp_genl_sock, buf, nlh->nlmsg_len, 0) < 0) {
+		debug("subflow_create: send: %s\n", strerror(errno));
+		return -1;
+	}
+
+	n = recv(brf_mptcp_genl_sock, buf, sizeof(buf), 0);
+	if (n < 0) {
+		debug("subflow_create: recv: %s\n", strerror(errno));
+		return -1;
+	}
+	nlh = (struct nlmsghdr *)buf;
+	if (nlh->nlmsg_type != NLMSG_ERROR) {
+		debug("subflow_create: unexpected ack type %u\n",
+		      nlh->nlmsg_type);
+		errno = EPROTO;
+		return -1;
+	}
+	{
+		struct nlmsgerr *ne = (struct nlmsgerr *)NLMSG_DATA(nlh);
+		if (ne->error) {
+			debug("subflow_create: kernel err=%d (%s)\n",
+			      ne->error, strerror(-ne->error));
+			errno = -ne->error;
+			return -1;
+		}
+	}
+	return 0;
+#undef BRF_PUT_ATTR
+}
+
 static long syz_mptcp_join_subflow(volatile long a0, volatile long a1,
 				   volatile long a2, volatile long a3,
 				   volatile long a4)
 {
-	// a0: pair (pool index)
-	// a1: addr_id
-	// a2: backup (0/1)
-	// a3: nonce_mut
-	// a4: hmac_mut
-	//
-	// v0 skeleton.  Real implementation: design doc Section 5.2.
-	// Sketch:
-	//   1. Look up pool slot; allocate a subflow slot.
-	//   2. Generate local_nonce; apply nonce_mut to the wire copy.
-	//   3. Craft MP_JOIN SYN bytes; inject via AF_PACKET.
-	//   4. Wait for SYN-ACK; extract remote_nonce + server thmac.
-	//   5. Verify server thmac equals first 8 bytes of
-	//        HMAC-SHA256(K = remote_key||local_key BE,
-	//                    M = remote_nonce||local_nonce BE).
-	//      Discrepancy is logged (kernel-emitted thmac is whatever
-	//      the kernel emitted; verification is for our own sanity).
-	//   6. Compute our ACK HMAC:
-	//        HMAC-SHA256(K = local_key||remote_key BE,
-	//                    M = local_nonce||remote_nonce BE)
-	//      Apply hmac_mut to the wire copy.
-	//   7. Inject MP_JOIN ACK with the (possibly mutated) HMAC.
-	debug("syz_mptcp_join_subflow: not implemented (v0 skeleton)\n");
+	struct brf_mptcp_pair_state *pair;
+	long slot = a0;
+	uint8_t addr_id   = (uint8_t)a1;
+	uint8_t nonce_mut = (uint8_t)a3;
+	uint8_t hmac_mut  = (uint8_t)a4;
+	int sub_slot;
+	int retries;
+	const uint32_t local_addr_be  = htonl(0x7f000002);
+	const uint32_t remote_addr_be = htonl(0x7f000001);
+
+	(void)a2;	/* backup flag -- not exercised in NORMAL v01 */
+
+	/* v01: only NORMAL mode.  Mutation enum values are part of the
+	 * syzlang surface so the corpus generator emits them, but the
+	 * executor C side rejects them rather than half-implementing. */
+	if (nonce_mut != MPTCP_NONCE_NORMAL ||
+	    hmac_mut  != MPTCP_HMAC_NORMAL) {
+		debug("syz_mptcp_join_subflow: mutation modes not "
+		      "implemented in v01 (nonce_mut=%u hmac_mut=%u)\n",
+		      nonce_mut, hmac_mut);
+		return -1;
+	}
+
+	if (brf_mptcp_ensure_executor_setup() < 0)
+		return -1;
+
+	if (slot < 0 || slot >= MPTCP_PAIR_POOL_SIZE) {
+		debug("syz_mptcp_join_subflow: slot %ld out of range\n", slot);
+		return -1;
+	}
+	pair = &brf_mptcp_pair_pool[slot];
+	if (!pair->in_use) {
+		debug("syz_mptcp_join_subflow: slot %ld not in use\n", slot);
+		return -1;
+	}
+	if (pair->subflow_count >= MPTCP_MAX_SUBFLOWS_PER_PAIR) {
+		debug("syz_mptcp_join_subflow: pair %ld subflow pool full "
+		      "(%d/%d)\n", slot, pair->subflow_count,
+		      MPTCP_MAX_SUBFLOWS_PER_PAIR);
+		return -1;
+	}
+	sub_slot = pair->subflow_count;
+
+	/* The kernel rejects MPTCP address id 0 ("invalid addr id" in
+	 * mptcp_userspace_pm_append_new_local_addr).  syzlang's addr_id
+	 * is signed int8, so we coerce zero to 1; non-zero values pass
+	 * through. */
+	if (addr_id == 0)
+		addr_id = 1;
+
+	/* server_listen_port is stored in NBO (sin_port form); the genl
+	 * port attribute wants host-byte order -- see byte-order comment
+	 * on brf_mptcp_genl_subflow_create. */
+	if (brf_mptcp_genl_subflow_create(pair->token, addr_id,
+					  local_addr_be,  0,
+					  remote_addr_be,
+					  ntohs(pair->server_listen_port)) < 0)
+		return -1;
+
+	/* SUBFLOW_CREATE returns after __mptcp_subflow_connect() initiated
+	 * the SYN; the server-side msk's pm.extra_subflows then increments
+	 * as soon as the kernel's MPTCP option parser accepts the incoming
+	 * MP_JOIN (mptcp_pm_allow_new_subflow path).  Poll MPTCP_INFO until
+	 * the count goes up, with a ~1s ceiling -- a loopback handshake
+	 * should complete in well under a millisecond. */
+	for (retries = 0; retries < 20; retries++) {
+		struct brf_mptcp_info_short info;
+		socklen_t ilen = sizeof(info);
+		memset(&info, 0, sizeof(info));
+		if (getsockopt(pair->server_msk_fd, SOL_MPTCP, MPTCP_INFO,
+			       &info, &ilen) == 0 &&
+		    info.mptcpi_subflows >= 1) {
+			pair->subflows[sub_slot].established = true;
+			pair->subflow_count++;
+			debug("syz_mptcp_join_subflow: pair=%ld subflow=%d "
+			      "established (server mptcpi_subflows=%u, "
+			      "polls=%d)\n", slot, sub_slot,
+			      info.mptcpi_subflows, retries + 1);
+			return 0;
+		}
+		usleep(50000);	/* 50 ms */
+	}
+	debug("syz_mptcp_join_subflow: pair=%ld subflow=%d not established "
+	      "within ~1s\n", slot, sub_slot);
 	return -1;
 }
 #endif

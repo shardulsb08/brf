@@ -270,7 +270,85 @@ Notes:
 
 ### 5.2 syz_mptcp_join_subflow
 
-Steps in C:
+**v01 NORMAL-mode path (settled 2026-05-16; implemented).**  No wire
+injection.  The harness flips `net.mptcp.pm_type=1` (userspace PM)
+once per executor, opens a netlink genl socket subscribed to the
+`mptcp_pm_events` multicast group (making
+`mptcp_userspace_pm_active(msk)` return true netns-wide, which
+satisfies the server-side acceptance gate
+`mptcp_can_accept_new_subflow` in `net/mptcp/subflow.c`), and then
+for each call issues:
+
+```
+MPTCP_PM_CMD_SUBFLOW_CREATE (mptcp_pm genl family) {
+    MPTCP_PM_ATTR_TOKEN       = pair->token,                  /* u32 */
+    MPTCP_PM_ATTR_ADDR        = { FAMILY=AF_INET,
+                                  ID=addr_id (1..255),
+                                  ADDR4=127.0.0.2,
+                                  PORT=0 (kernel picks) },
+    MPTCP_PM_ATTR_ADDR_REMOTE = { FAMILY=AF_INET,
+                                  ADDR4=127.0.0.1,
+                                  PORT=pair->server_listen_port }
+}
+```
+
+The handler is `mptcp_pm_nl_subflow_create_doit` in
+`net/mptcp/pm_userspace.c`.  It calls `__mptcp_subflow_connect`
+synchronously and returns its result as the genl ack -- success
+means the SYN was emitted, not that the handshake completed.  The
+harness then polls `MPTCP_INFO.mptcpi_subflows` on the server-side
+msk (alias of `pm.extra_subflows`) with a ~1 s ceiling.
+
+Why userspace PM rather than the in-kernel PM:
+
+- Kernel PM endpoint configuration only auto-fires during
+  MP_CAPABLE -> ESTABLISHED; by the time `syz_mptcp_join_subflow` is
+  called, that transition has already happened, so the kernel-PM
+  path would not generate the subflow.  Pre-pair_init configuration
+  would also conflate `pair_init` with `join_subflow` semantically.
+- Userspace PM `SUBFLOW_CREATE` gives per-call explicit "kick off
+  this MP_JOIN now" control, which is the correct shape for a
+  pseudo-syscall.
+
+Why a multicast listener satisfies the server-side gate:
+`mptcp_userspace_pm_active` is literally
+`genl_has_listeners(&mptcp_genl_family, sock_net(msk),
+MPTCP_PM_EV_GRP_OFFSET)` -- subscribing once is enough; the harness
+never has to read the events.
+
+**Critical:** `pair_init` must call the setup helper BEFORE creating
+any MPTCP socket.  `msk->pm.pm_type` is captured at msk-construction
+time in `mptcp_pm_data_reset`; flipping the netns sysctl after the
+fact does not retroactively switch existing msks to userspace mode,
+and `mptcp_userspace_pm_get_sock` would then reject SUBFLOW_CREATE
+with "userspace PM not selected".
+
+**Critical (gotcha learned 2026-05-16):** after bare
+`connect()`/`accept()` the server-side msk is `fully_established`
+but the **client-side** msk is not.  `check_fully_established`
+(`net/mptcp/options.c`) only flips the client's flag on receipt of
+a DSS+use_ack-bearing packet from the server.
+`__mptcp_subflow_connect` then rejects with `-ENOTCONN`
+(subflow.c:1633, "userspace PM sent the request too early").
+`pair_init` therefore drives a 1-byte send+recv in BOTH directions
+after `accept()` so both ends transition to fully_established
+before the slot index is handed back.
+
+**Capture stance for v01 (settled 2026-05-16):** skip remote_nonce
+/ thmac capture.  In NORMAL mode the kernel drives all crypto, so
+capture isn't load-bearing for "is the gate reachable" verification;
+the SNMP success counter (`MPJoinAckRx`) and `mptcpi_subflows`
+delta are sufficient.  Capture becomes load-bearing when mutation
+modes land (a per-subflow debug sockopt mirroring
+`MPTCP_DEBUG_KEYS`, or an AF_PACKET observer on `lo`, are the two
+candidates; see Section 5.1 rationale for why we prefer the
+sockopt route).
+
+----
+
+**Future mutation-mode path (v02; original Section 5.2 plan).**
+Wire injection becomes load-bearing once we start mutating the
+MP_JOIN bytes:
 
 ```
  1. Look up pair from the resource handle.
@@ -498,14 +576,26 @@ harness works):
    mutation flags set to NORMAL, kcov shows entry into
    `subflow_hmac_valid` (server side) AND `subflow_thmac_valid`
    (client side) AND `mptcp_can_accept_new_subflow` returning
-   true.  Counter `MPTCP_MIB_JOINACKMAC` increments.
+   true.  The /proc/net/netstat counter `MPJoinAckRx`
+   (`MPTCP_MIB_JOINACKRX`, mib.c:29) increments.
+
+   **Naming caveat (recorded 2026-05-16):** the kernel symbol
+   `MPTCP_MIB_JOINACKMAC` is *not* a success counter despite its
+   suggestive name -- it maps to `"MPJoinAckHMacFailure"` in
+   /proc/net/netstat (mib.c:30) and counts HMAC validation
+   failures on the server side.  The success counter we want is
+   `MPJoinAckRx`.  Earlier revisions of this design doc referred
+   to `MPTCP_MIB_JOINACKMAC` as the success criterion; that was
+   a misnomer and has been corrected.
 2. **Mutation reachability:**  Running 100 inputs with each
    mutation enum value at least once, the relevant counter
    increments AND the corresponding RST reason fires when
    expected.  Specifically:
-   - HMAC mutations -> `MPTCP_RST_EPROHIBIT` increments.
+   - HMAC mutations -> `MPTCP_RST_EPROHIBIT` increments AND
+     `MPJoinAckHMacFailure` (the real `MPTCP_MIB_JOINACKMAC`)
+     increments on the server.
    - Token unknown (e.g., closing a pair mid-test) ->
-     `MPTCP_MIB_JOINNOTOKEN` increments.
+     `MPJoinNoTokenFound` (`MPTCP_MIB_JOINNOTOKEN`) increments.
 3. **Coverage growth:**  Over a 5-minute run, new basic blocks
    in `net/mptcp/subflow.c` and `net/mptcp/options.c` are
    discovered.  Plateau within 5 minutes is OK; zero growth
@@ -528,9 +618,38 @@ infrastructure is incomplete without them.
 
 ## 10. What can go wrong (anti-scope and risks)
 
-- **MPTCP info getsockopt may not expose keys.**  If it doesn't,
-  fall back to raw-socket capture during connect().  Test in the
-  dev_env VM before committing to one path.
+- **Client-side fully_established is not set by connect() alone.**
+  *Observed 2026-05-16 during first smoke run.*  After bare
+  `connect()`/`accept()` the server msk is `fully_established`
+  (set by the server's third-ACK processing in
+  `mptcp_sock_create_accept`, protocol.c:3619) but the client msk
+  is not -- the client's flag only flips inside
+  `check_fully_established` (options.c:942) on receipt of a
+  packet from the server carrying DSS with `use_ack`.
+  `__mptcp_subflow_connect` returns `-ENOTCONN` (subflow.c:1633)
+  if the userspace PM issues `SUBFLOW_CREATE` on a not-yet-
+  fully_established client msk.  Mitigation in `pair_init`: drive
+  a 1-byte send+recv in both directions after `accept()` before
+  handing the slot index back.
+- **`MPTCP_PM_ADDR_ATTR_PORT` is host-byte order, not network.**
+  *Observed 2026-05-16 during second smoke run.*  Kernel uapi
+  quirk: `mptcp_pm_parse_pm_addr_attr` (pm_netlink.c:86) reads
+  the port via `htons(nla_get_u16(...))`, so the attribute value
+  must be in HOST byte order.  This is asymmetric with
+  `MPTCP_PM_ADDR_ATTR_ADDR4`, which is the natural
+  network-byte-order address that `nla_get_in_addr` returns
+  raw.  Passing `sin_port` (NBO) directly here causes the
+  kernel to byteswap a second time and aim the MP_JOIN SYN at
+  a random port -- the failure mode is completely silent (no
+  RST visible to userspace, no MPTCP debug, no SS entry, no
+  MIB delta, no dmesg) because the SYN goes out on the wire
+  to a non-listening port and gets RST'd on the way in,
+  before any MPTCP code path sees it.  Pass `ntohs(sin_port)`.
+  Reference for the right pattern: iproute2's `ip mptcp` does
+  it correctly.
+- **MPTCP info getsockopt may not expose keys.**  Resolved by the
+  `MPTCP_DEBUG_KEYS` patch (0003 of the mptcp_kcov series).
+  Original concern preserved here for the historical record.
 - **AF_PACKET raw inject on loopback may race with kernel's own
   TCP.**  Use a dummy netdev or netns to isolate, or run in a
   fresh netns per pair.
