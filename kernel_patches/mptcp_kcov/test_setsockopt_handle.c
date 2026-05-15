@@ -51,12 +51,25 @@
 #endif
 
 /* kcov uapi (subset).  Don't pull in <linux/kcov.h> to keep the
- * dependency surface small. */
+ * dependency surface small.
+ *
+ * Handle encoding (per include/uapi/linux/kcov.h):
+ *   bits 56-63: subsystem ID (KCOV_SUBSYSTEM_COMMON = 0x00,
+ *                              KCOV_SUBSYSTEM_USB    = 0x01)
+ *   bits 32-55: must be zero
+ *   bits  0-31: instance ID
+ * kcov_check_handle() in kernel/kcov.c rejects anything else with
+ * EINVAL.  Picking 0x4242... or other random values is therefore
+ * always rejected.
+ */
 #define KCOV_INIT_TRACE		_IOR('c', 1, unsigned long)
 #define KCOV_ENABLE		_IO('c', 100)
 #define KCOV_DISABLE		_IO('c', 101)
 #define KCOV_REMOTE_ENABLE	_IOW('c', 102, struct kcov_remote_arg)
 #define KCOV_TRACE_PC		0
+
+#define KCOV_SUBSYSTEM_COMMON	(0x00ULL << 56)
+#define KCOV_SUBSYSTEM_USB	(0x01ULL << 56)
 
 struct kcov_remote_arg {
 	uint32_t	trace_mode;
@@ -93,7 +106,7 @@ static int set_up_kcov(uint64_t handle, unsigned long **cover_out)
 		return -1;
 	}
 
-	arg = calloc(1, sizeof(*arg) + sizeof(uint64_t));
+	arg = calloc(1, sizeof(*arg));
 	if (!arg) {
 		perror("calloc kcov_remote_arg");
 		munmap(cover, COVER_SIZE * sizeof(unsigned long));
@@ -102,8 +115,8 @@ static int set_up_kcov(uint64_t handle, unsigned long **cover_out)
 	}
 	arg->trace_mode = KCOV_TRACE_PC;
 	arg->area_size = COVER_SIZE;
-	arg->num_handles = 1;
-	arg->handles[0] = handle;
+	arg->num_handles = 0;		/* no "remote" handles; use common */
+	arg->common_handle = handle;	/* registers + sets current->kcov_handle */
 
 	if (ioctl(kcov_fd, KCOV_REMOTE_ENABLE, arg)) {
 		perror("ioctl KCOV_REMOTE_ENABLE");
@@ -120,7 +133,12 @@ static int set_up_kcov(uint64_t handle, unsigned long **cover_out)
 
 int main(void)
 {
-	uint64_t handle = 0x4242424242424242ULL;
+	/* Common-subsystem handle keyed on our pid.  Valid encoding per
+	 * kcov_check_handle() rules.  KCOV_REMOTE_ENABLE with this as
+	 * common_handle both (a) registers the handle in kcov's table
+	 * and (b) sets current->kcov_handle so kcov_common_handle()
+	 * returns the same value to in-task code in the kernel. */
+	uint64_t handle = KCOV_SUBSYSTEM_COMMON | (uint64_t)getpid();
 	struct sockaddr_in addr = { .sin_family = AF_INET };
 	unsigned long *cover = NULL;
 	socklen_t alen = sizeof(addr);
