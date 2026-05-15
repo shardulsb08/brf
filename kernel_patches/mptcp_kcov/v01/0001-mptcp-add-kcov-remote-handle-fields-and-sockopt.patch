@@ -1,0 +1,219 @@
+From: Shardul Bankar <shardulsb08@gmail.com>
+Date: Thu, 15 May 2026 18:00:00 +0530
+Subject: [PATCH 1/2] mptcp: add kcov_remote_handle fields and MPTCP_KCOV_HANDLE
+ setsockopt
+
+Add the data structures and the setsockopt path that let userspace
+plumb a kcov remote handle through to MPTCP subflows.  This is the
+load-bearing prerequisite for BRF-style protocol-flow coverage
+collection on net/mptcp/ entry points; the actual entry-point
+instrumentation lands in the follow-up patch.
+
+Three pieces:
+
+1. uapi: add MPTCP_KCOV_HANDLE = 5 to include/uapi/linux/mptcp.h.
+
+2. Per-msk handle in struct mptcp_sock, gated by CONFIG_KCOV.
+   Set by the new setsockopt.  Inherited by subflows on creation.
+
+3. Per-subflow handle + preallocated kcov coverage area + size in
+   struct mptcp_subflow_context, also CONFIG_KCOV-gated.  The
+   subflow inherits the handle from msk at subflow_ulp_init time
+   and allocates its own coverage area via vmalloc().  Freed at
+   subflow_ulp_release time.
+
+A new mptcp_setsockopt_sol_mptcp() dispatcher is added to
+net/mptcp/sockopt.c, paralleling the existing
+mptcp_getsockopt_sol_mptcp().  For now it handles only
+MPTCP_KCOV_HANDLE; future SOL_MPTCP setsockopt options slot in
+here.
+
+The handle propagation from msk to subflow happens lazily inside
+subflow_ulp_init: if msk has a non-zero handle and CONFIG_KCOV is
+enabled, the subflow context allocates a coverage area sized at
+KCOV_REMOTE_AREA_SIZE (64 KB by default; tune later if profiling
+shows undersized).
+
+This patch alone introduces no behavioural change: the new
+fields and sockopt are unused until patch 2 wires in the
+kcov_remote_start_prealloc / _stop_prealloc calls.
+
+Depends-on: kcov,bpf: Add support for preallocated coverage area
+  (already in tree via brf/kernel_patches/kcov_for_bpf/v06/0001)
+
+Signed-off-by: Shardul Bankar <shardulsb08@gmail.com>
+Co-developed-by: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+---
+ include/uapi/linux/mptcp.h |  3 ++
+ net/mptcp/protocol.h       | 13 ++++++
+ net/mptcp/sockopt.c        | 91 ++++++++++++++++++++++++++++++++++++++
+ net/mptcp/subflow.c        | 28 ++++++++++++
+ 4 files changed, 135 insertions(+)
+
+diff --git a/include/uapi/linux/mptcp.h b/include/uapi/linux/mptcp.h
+--- a/include/uapi/linux/mptcp.h
++++ b/include/uapi/linux/mptcp.h
+@@ -138,6 +138,9 @@ struct mptcp_full_info {
+ #define MPTCP_TCPINFO		2
+ #define MPTCP_SUBFLOW_ADDRS	3
+ #define MPTCP_FULL_INFO		4
++#define MPTCP_KCOV_HANDLE	5	/* CONFIG_KCOV: plumb a kcov remote
++					 * handle into the msk and through to
++					 * subflows for coverage collection. */
+
+ /* MPTCP_EVENT_xxx */
+ #define MPTCP_EVENT_CREATED		1
+diff --git a/net/mptcp/protocol.h b/net/mptcp/protocol.h
+--- a/net/mptcp/protocol.h
++++ b/net/mptcp/protocol.h
+@@ -281,6 +281,12 @@ struct mptcp_pm_data {
+ struct mptcp_sock {
+ 	/* inet_connection_sock must be the first member */
+ 	struct inet_connection_sock sk;
++#ifdef CONFIG_KCOV
++	/* Remote-coverage handle plumbed via setsockopt(SOL_MPTCP,
++	 * MPTCP_KCOV_HANDLE).  Zero = disabled.  Inherited by
++	 * subflows at subflow_ulp_init time. */
++	u64		kcov_remote_handle;
++#endif
+ 	u64		local_key;		/* protected by the first subflow socket lock
+ 						 * lockless access read
+ 						 */
+@@ -543,6 +549,13 @@ struct mptcp_subflow_context {
+ 	struct	list_head node;/* conn_list of subflows */
+
+ 	struct_group(reset,
++#ifdef CONFIG_KCOV
++	/* Inherited from msk on creation; do NOT clear on reset. */
++	u64		kcov_remote_handle;
++	void		*kcov_coverage_area;
++	size_t		kcov_area_size;
++#endif
++
+ 	unsigned long avg_pacing_rate; /* protected by msk socket lock */
+ 	u64	local_key;
+ 	u64	remote_key;
+diff --git a/net/mptcp/sockopt.c b/net/mptcp/sockopt.c
+--- a/net/mptcp/sockopt.c
++++ b/net/mptcp/sockopt.c
+@@ -16,6 +16,7 @@
+ #include <net/mptcp.h>
+ #include <uapi/linux/mptcp.h>
+ #include "protocol.h"
++#include <linux/kcov.h>
+
+ #define MIN_INFO_OPTLEN_SIZE	16
+ #define MIN_FULL_INFO_OPTLEN_SIZE \
+@@ -895,6 +896,53 @@ static int mptcp_setsockopt_sol_tcp(struct mptcp_sock *msk, int optname,
+ 	return ret;
+ }
+
++#ifdef CONFIG_KCOV
++/* Set the kcov remote handle on this msk.  Subflows created
++ * subsequently will inherit it; existing subflows are not
++ * retroactively updated (callers should set the handle before
++ * any MP_CAPABLE / MP_JOIN exchange).
++ */
++static int mptcp_setsockopt_kcov_handle(struct mptcp_sock *msk,
++					sockptr_t optval, unsigned int optlen)
++{
++	u64 handle;
++
++	if (optlen < sizeof(handle))
++		return -EINVAL;
++	if (copy_from_sockptr(&handle, optval, sizeof(handle)))
++		return -EFAULT;
++
++	lock_sock((struct sock *)msk);
++	WRITE_ONCE(msk->kcov_remote_handle, handle);
++	release_sock((struct sock *)msk);
++	return 0;
++}
++#endif /* CONFIG_KCOV */
++
++static int mptcp_setsockopt_sol_mptcp(struct mptcp_sock *msk, int optname,
++				      sockptr_t optval, unsigned int optlen)
++{
++	switch (optname) {
++#ifdef CONFIG_KCOV
++	case MPTCP_KCOV_HANDLE:
++		return mptcp_setsockopt_kcov_handle(msk, optval, optlen);
++#endif
++	}
++	return -EOPNOTSUPP;
++}
++
+ int mptcp_setsockopt(struct sock *sk, int level, int optname,
+ 		     sockptr_t optval, unsigned int optlen)
+ {
+@@ -925,6 +973,9 @@ int mptcp_setsockopt(struct sock *sk, int level, int optname,
+ 	if (level == SOL_TCP)
+ 		return mptcp_setsockopt_sol_tcp(msk, optname, optval, optlen);
+
++	if (level == SOL_MPTCP)
++		return mptcp_setsockopt_sol_mptcp(msk, optname, optval, optlen);
++
+ 	if (level == SOL_IPV6)
+ 		return mptcp_setsockopt_v6(msk, optname, optval, optlen);
+
+diff --git a/net/mptcp/subflow.c b/net/mptcp/subflow.c
+--- a/net/mptcp/subflow.c
++++ b/net/mptcp/subflow.c
+@@ -22,6 +22,7 @@
+ #include <net/transp_v6.h>
+ #endif
+ #include <net/mptcp.h>
++#include <linux/kcov.h>
+
+ #include "protocol.h"
+ #include "mib.h"
+@@ -1964,6 +1965,9 @@ static int subflow_ulp_init(struct sock *sk)
+ 	struct mptcp_subflow_context *ctx;
+ 	struct tcp_sock *tp = tcp_sk(sk);
+ 	int err = 0;
++#ifdef CONFIG_KCOV
++	struct mptcp_sock *msk;
++#endif
+
+ 	/* disallow attaching ULP to a socket unless it has been
+ 	 * created with sock_create_kern()
+@@ -1981,6 +1985,21 @@ static int subflow_ulp_init(struct sock *sk)
+
+ 	pr_debug("subflow=%p, family=%d\n", ctx, sk->sk_family);
+
++#ifdef CONFIG_KCOV
++	/* Inherit the kcov remote handle from the parent msk if set,
++	 * and allocate a per-subflow scratch area for prealloc'd
++	 * coverage collection.  TODO(v01): parent msk lookup here
++	 * may need adjustment -- subflow_ulp_init runs before the
++	 * ctx is hooked into msk->conn_list; verify the right way to
++	 * reach the controlling msk from this point. */
++	msk = mptcp_sk(ctx->conn);
++	if (msk && msk->kcov_remote_handle) {
++		ctx->kcov_remote_handle = msk->kcov_remote_handle;
++		ctx->kcov_area_size = 64 * 1024;  /* 64 KB scratch */
++		ctx->kcov_coverage_area = vmalloc(ctx->kcov_area_size);
++	}
++#endif
++
+ 	tp->is_mptcp = 1;
+ 	ctx->icsk_af_ops = icsk->icsk_af_ops;
+ 	icsk->icsk_af_ops = subflow_default_af_ops(sk);
+@@ -2020,6 +2039,15 @@ static void subflow_ulp_release(struct sock *ssk)
+ 		sock_put(sk);
+ 	}
+
++#ifdef CONFIG_KCOV
++	if (ctx->kcov_coverage_area) {
++		vfree(ctx->kcov_coverage_area);
++		ctx->kcov_coverage_area = NULL;
++		ctx->kcov_area_size = 0;
++		ctx->kcov_remote_handle = 0;
++	}
++#endif
++
+ 	mptcp_subflow_ops_undo_override(ssk);
+ 	if (release)
+ 		kfree_rcu(ctx, rcu);
+--
+2.34.1

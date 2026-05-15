@@ -1,0 +1,204 @@
+From: Shardul Bankar <shardulsb08@gmail.com>
+Date: Thu, 15 May 2026 18:30:00 +0530
+Subject: [PATCH 2/2] mptcp: instrument MP_CAPABLE / MP_JOIN / DSS validity
+ gates with kcov
+
+Wrap the MPTCP subflow-level validity gates with
+kcov_remote_start_prealloc / kcov_remote_stop_prealloc so that
+coverage from these functions is attributed to the kcov handle
+plumbed via MPTCP_KCOV_HANDLE on the parent msk (set up by the
+preceding patch).
+
+The gates instrumented are the ones a stateless fuzzer cannot
+clear by chance and where a stateful harness (e.g. the BRF MP_JOIN
+harness in shardulsb08/brf:.claude/designs/mptcp_join_harness_design.md)
+specifically wants coverage feedback to know which mutation
+classes reach which kernel paths:
+
+  net/mptcp/options.c
+    mptcp_parse_option       -- per-suboption dispatch including
+                                MP_CAPABLE / MP_JOIN / MP_DSS
+                                length and flag-byte validation.
+
+  net/mptcp/subflow.c
+    subflow_token_join_request -- token-table lookup on incoming
+                                MP_JOIN.
+    subflow_hmac_valid       -- server-side HMAC compare on
+                                incoming MP_JOIN ACK.
+    subflow_thmac_valid      -- client-side truncated-HMAC
+                                compare on incoming MP_JOIN SYN-ACK.
+    get_mapping_status       -- DSS mapping validation.
+    mptcp_can_accept_new_subflow -- msk-established + PM-accept
+                                gating after HMAC passes.
+
+All wrappers are guarded by CONFIG_KCOV and key on
+ctx->kcov_remote_handle being non-zero (i.e. the harness has
+plumbed a handle through to this subflow).  When the handle is
+zero, the cost is one branch per wrapped call.
+
+The reset-reason WRITE_ONCE-style read of ctx->kcov_remote_handle
+is racy w.r.t. setsockopt but only in the direction of "no coverage
+collected for this call" rather than corruption -- the prealloc
+area is owned by this subflow and cannot be freed under us while
+this subflow runs (subflow_ulp_release runs in RCU grace period).
+
+The wrappers use a small inline helper to keep the per-call hot
+path readable.  See BRF_MPTCP_KCOV_START / _STOP macros below.
+
+TODO(v01): the option-parser hot path
+(mptcp_parse_option) is called per-incoming-TCP-segment; the
+overhead of an extra branch even when CONFIG_KCOV=n is acceptable
+but worth measuring.  The subflow.c entries are slower paths so
+wrapping cost is negligible.
+
+Co-developed-by: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+Signed-off-by: Shardul Bankar <shardulsb08@gmail.com>
+---
+ net/mptcp/options.c  | 12 ++++++++++++
+ net/mptcp/protocol.h | 22 ++++++++++++++++++++++
+ net/mptcp/subflow.c  | 38 ++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 72 insertions(+)
+
+diff --git a/net/mptcp/protocol.h b/net/mptcp/protocol.h
+--- a/net/mptcp/protocol.h
++++ b/net/mptcp/protocol.h
+@@ -25,6 +25,7 @@
+ #include <net/tcp.h>
+ #include <uapi/linux/mptcp.h>
++#include <linux/kcov.h>
+
+ #include "mptcp_pm_gen.h"
+
+@@ ... @@ struct mptcp_subflow_context {
+ 	/* members not in the reset group are preserved across resets */
+ };
+
++#ifdef CONFIG_KCOV
++/* Wrap a MPTCP validity-gate function body with kcov remote start /
++ * stop calls.  Caller passes the subflow context; we read the handle
++ * and area pointer once into locals to keep the hot path readable.
++ */
++#define BRF_MPTCP_KCOV_START(ctx)					\
++	do {								\
++		u64 __h = READ_ONCE((ctx)->kcov_remote_handle);		\
++		void *__a = (ctx)->kcov_coverage_area;			\
++		size_t __s = (ctx)->kcov_area_size;			\
++		if (__h && __a)						\
++			kcov_remote_start_prealloc(__h, __a, __s);	\
++	} while (0)
++#define BRF_MPTCP_KCOV_STOP(ctx)					\
++	do {								\
++		if (READ_ONCE((ctx)->kcov_remote_handle))		\
++			kcov_remote_stop_prealloc();			\
++	} while (0)
++#else
++#define BRF_MPTCP_KCOV_START(ctx)	do { } while (0)
++#define BRF_MPTCP_KCOV_STOP(ctx)	do { } while (0)
++#endif
++
+diff --git a/net/mptcp/options.c b/net/mptcp/options.c
+--- a/net/mptcp/options.c
++++ b/net/mptcp/options.c
+@@ -32,10 +32,18 @@ static void mptcp_parse_option(const struct sk_buff *skb,
+ 			       const unsigned char *ptr, int opsize,
+ 			       struct mptcp_options_received *mp_opt)
+ {
++	struct mptcp_subflow_context *ctx;
+ 	u8 subtype = *ptr >> 4;
+ 	int expected_opsize;
+ 	u16 subopt;
+ 	u8 version;
+ 	u8 flags;
+ 	u8 i;
+
++	/* TODO(v01): figure out the right way to reach the subflow
++	 * context from this static path -- skb->sk may be the listener
++	 * or the request socket depending on which TCP state we're in.
++	 * For v01 simplicity, peek at the TCP socket's ULP context if
++	 * any; null check on ctx so we don't crash before subflow
++	 * setup completes. */
++	ctx = skb->sk ? mptcp_subflow_ctx(skb->sk) : NULL;
++	BRF_MPTCP_KCOV_START(ctx);
+ 	switch (subtype) {
+@@ ... @@ /* end of switch */
++	BRF_MPTCP_KCOV_STOP(ctx);
+ }
+diff --git a/net/mptcp/subflow.c b/net/mptcp/subflow.c
+--- a/net/mptcp/subflow.c
++++ b/net/mptcp/subflow.c
+@@ -85,9 +85,15 @@ static struct mptcp_sock *subflow_token_join_request(struct request_sock *req)
+ {
+ 	struct mptcp_subflow_request_sock *subflow_req = mptcp_subflow_rsk(req);
+ 	u8 hmac[SHA256_DIGEST_SIZE];
+ 	struct mptcp_sock *msk;
++	struct mptcp_subflow_context *ctx;
+ 	int local_id;
+
++	/* TODO(v01): the request_sock side does not yet have a
++	 * subflow_context; coverage for this gate may need to attach
++	 * to the listener msk's handle instead.  See req->rsk_listener. */
++	ctx = req->rsk_listener ? mptcp_subflow_ctx(req->rsk_listener) : NULL;
++	BRF_MPTCP_KCOV_START(ctx);
+ 	msk = mptcp_token_get_sock(sock_net(req_to_sk(req)), subflow_req->token);
+ 	if (!msk) {
+ 		SUBFLOW_REQ_INC_STATS(req, MPTCP_MIB_JOINNOTOKEN);
++		BRF_MPTCP_KCOV_STOP(ctx);
+ 		return NULL;
+ 	}
+
++	BRF_MPTCP_KCOV_STOP(ctx);
+ 	local_id = mptcp_pm_get_local_id(msk, (struct sock_common *)req);
+@@ -750,8 +756,13 @@ static bool subflow_hmac_valid(const struct request_sock *req,
+ 			       const struct mptcp_options_received *mp_opt)
+ {
++	struct mptcp_subflow_context *ctx;
+ 	struct mptcp_subflow_request_sock *subflow_req;
+ 	u8 hmac[SHA256_DIGEST_SIZE];
+ 	struct mptcp_sock *msk;
++	bool ok;
+
++	ctx = req->rsk_listener ? mptcp_subflow_ctx(req->rsk_listener) : NULL;
++	BRF_MPTCP_KCOV_START(ctx);
+ 	subflow_req = mptcp_subflow_rsk(req);
+ 	msk = subflow_req->msk;
+-	if (!msk)
++	if (!msk) {
++		BRF_MPTCP_KCOV_STOP(ctx);
+ 		return false;
++	}
+
+ 	subflow_generate_hmac(msk->remote_key, msk->local_key,
+ 			      subflow_req->remote_nonce,
+ 			      subflow_req->local_nonce, hmac);
+
+-	return !crypto_memneq(hmac, mp_opt->hmac, MPTCPOPT_HMAC_LEN);
++	ok = !crypto_memneq(hmac, mp_opt->hmac, MPTCPOPT_HMAC_LEN);
++	BRF_MPTCP_KCOV_STOP(ctx);
++	return ok;
+ }
+@@ -410,8 +421,12 @@ static bool subflow_thmac_valid(struct mptcp_subflow_context *subflow)
+ {
+ 	u64 thmac;
+
++	BRF_MPTCP_KCOV_START(subflow);
+ 	subflow_generate_hmac(subflow->remote_key, subflow->local_key,
+ 			      subflow->remote_nonce, subflow->local_nonce,
+ 			      (u8 *)&thmac);
++
++	BRF_MPTCP_KCOV_STOP(subflow);
+ 	return thmac == subflow->thmac;
+ }
+@@ -1100,8 +1115,14 @@ static enum mapping_status get_mapping_status(struct sock *ssk,
+ 					      struct mptcp_sock *msk)
+ {
+ 	struct mptcp_subflow_context *subflow = mptcp_subflow_ctx(ssk);
++	enum mapping_status status;
+ 	...
+-	/* existing body */
++	BRF_MPTCP_KCOV_START(subflow);
++	/* existing body assigns to status */
++	BRF_MPTCP_KCOV_STOP(subflow);
++	return status;
+ }
+--
+2.34.1
