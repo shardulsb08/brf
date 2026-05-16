@@ -631,6 +631,18 @@ infrastructure is incomplete without them.
   fully_established client msk.  Mitigation in `pair_init`: drive
   a 1-byte send+recv in both directions after `accept()` before
   handing the slot index back.
+- **`MPTCP_ATTR_SERVER_SIDE` is only in `MPTCP_EVENT_CREATED`, not
+  `SUB_ESTABLISHED`.**  *Observed 2026-05-16 while writing
+  test_mp_join_backup.c.*  Tempting assumption (the uapi docstring
+  hints at it being a general "which side" marker): server-side
+  events would always carry it.  Actually only `mptcp_event_created`
+  (pm_netlink.c:408+) emits it.  `mptcp_event_sub_established` uses
+  `mptcp_event_put_token_and_ssk` (pm_netlink.c:345), which emits
+  only token+ssk_addrs+backup+if_idx+error -- no `SERVER_SIDE`.  To
+  identify which msk a SUB_ESTABLISHED event is for, compare
+  `MPTCP_ATTR_TOKEN` against your own msk's token (client-side
+  events carry the client msk's token; server-side carry the server
+  msk's independent token from the same MP_CAPABLE exchange).
 - **`MPTCP_PM_ADDR_ATTR_PORT` is host-byte order, not network.**
   *Observed 2026-05-16 during second smoke run.*  Kernel uapi
   quirk: `mptcp_pm_parse_pm_addr_attr` (pm_netlink.c:86) reads
