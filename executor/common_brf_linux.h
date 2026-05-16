@@ -1,6 +1,22 @@
 
 #define OBJ_LIST_SIZE 32
 
+/* Weak stub for bpf_object__add_kcov_handle.  The real implementation
+ * is provided by libbpf when the kernel tree has the kcov-for-BPF
+ * series (brf/kernel_patches/bpf_kcov/0002 + 0003) applied and that
+ * libbpf is installed system-wide.  When only the MPTCP harness side
+ * of BRF is in use (no eBPF runtime fuzzing), the distro libbpf does
+ * not export this symbol, so this weak no-op lets the executor link
+ * cleanly.  Result: bpf-kcov collection from eBPF programs becomes a
+ * no-op; the MPTCP harness path is unaffected.  Restore the real
+ * behaviour by applying kernel_patches/bpf_kcov/0002 and 0003 and
+ * rebuilding libbpf from kernel/tools/lib/bpf/. */
+__attribute__((weak))
+void bpf_object__add_kcov_handle(struct bpf_object *obj __attribute__((unused)),
+				 __u64 kcov_remote_handle __attribute__((unused)))
+{
+}
+
 static struct bpf_object *bpf_object_list[OBJ_LIST_SIZE];
 
 struct bpf_res {
