@@ -83,6 +83,7 @@
 #include <linux/netfilter.h>
 #include <linux/netlink.h>
 #include <libnetfilter_queue/libnetfilter_queue.h>
+#include <libnetfilter_queue/libnetfilter_queue_tcp.h>
 
 #ifndef SOL_MPTCP
 #define SOL_MPTCP		284
@@ -157,51 +158,6 @@ static struct nfq_q_handle *g_nfq_qh = NULL;
 
 /* iptables rule cleanup: best-effort -D on exit. */
 static int g_iptables_inserted = 0;
-
-/* ----- TCP checksum helpers --------------------------------------- */
-
-/* TCP checksum over pseudo-header + TCP header + data.  Caller must
- * zero tcp->check before calling.  IPv4 only. */
-static uint16_t tcp_csum_ipv4(const struct iphdr *ip,
-			      const uint8_t *tcp_seg,
-			      int tcp_total_len)
-{
-	struct {
-		uint32_t saddr;
-		uint32_t daddr;
-		uint8_t  zero;
-		uint8_t  proto;
-		uint16_t tcp_len;
-	} __attribute__((packed)) pseudo;
-
-	pseudo.saddr   = ip->saddr;
-	pseudo.daddr   = ip->daddr;
-	pseudo.zero    = 0;
-	pseudo.proto   = ip->protocol;
-	pseudo.tcp_len = htons(tcp_total_len);
-
-	uint32_t sum = 0;
-	const uint16_t *w;
-
-	/* Pseudo-header. */
-	w = (const uint16_t *)&pseudo;
-	for (unsigned i = 0; i < sizeof(pseudo) / 2; i++)
-		sum += w[i];
-
-	/* TCP segment.  tcp->check assumed already zeroed by caller. */
-	w = (const uint16_t *)tcp_seg;
-	int remaining = tcp_total_len;
-	while (remaining > 1) {
-		sum += *w++;
-		remaining -= 2;
-	}
-	if (remaining)
-		sum += *(const uint8_t *)w;
-
-	while (sum >> 16)
-		sum = (sum & 0xffff) + (sum >> 16);
-	return (uint16_t)(~sum);
-}
 
 /* Walk TCP options looking for an MP_JOIN ACK option (kind=30,
  * len=24, subtype=1).  Returns pointer to the kind byte if found,
@@ -299,10 +255,12 @@ static int brf_nfq_callback(struct nfq_q_handle *qh, struct nfgenmsg *nfmsg,
 		"NFQUEUE: MP_JOIN ACK intercepted -- HMAC[0]=0x%02x -> 0x%02x\n",
 		before, opt[4]);
 
-	/* Recompute TCP checksum.  IP didn't change so IP csum is fine. */
-	tcp->check = 0;
-	int tcp_total_len = (int)ntohs(ip->tot_len) - ip_hlen;
-	tcp->check = tcp_csum_ipv4(ip, (uint8_t *)tcp, tcp_total_len);
+	/* Recompute TCP checksum using libnetfilter_queue's canonical helper.
+	 * A hand-rolled csum_tcpudp was tried first but produced wrong values
+	 * on loopback (the original outgoing packet carries a CHECKSUM_PARTIAL
+	 * pseudo-header sum rather than a full csum, which a naive recompute
+	 * mishandles).  libnfq's helper handles this correctly. */
+	nfq_tcp_compute_checksum_ipv4(tcp, ip);
 
 	atomic_store(&g_mutation_fired, 1);
 	return nfq_set_verdict(qh, id, NF_ACCEPT, payload_len, payload);
