@@ -761,12 +761,12 @@ int main(void)
 		perror("nfq_open");
 		goto out;
 	}
-	/* nfq_unbind/bind_pf is the legacy ritual; safe to call. */
-	nfq_unbind_pf(g_nfq_h, AF_INET);
-	if (nfq_bind_pf(g_nfq_h, AF_INET) < 0) {
-		perror("nfq_bind_pf");
-		goto out;
-	}
+	/* nfq_unbind_pf / nfq_bind_pf are deprecated on modern kernels --
+	 * they return EINVAL because the kernel handles protocol-family
+	 * binding implicitly via nfq_create_queue.  Older examples (and
+	 * the libnetfilter_queue man page from ~2010) show them being
+	 * called; do not.  Verified: skipping them works on 6.x kernels;
+	 * calling nfq_bind_pf(AF_INET) on 7.x fails with EINVAL. */
 	g_nfq_qh = nfq_create_queue(g_nfq_h, NFQUEUE_NUM, &brf_nfq_callback, NULL);
 	if (!g_nfq_qh) {
 		perror("nfq_create_queue");
