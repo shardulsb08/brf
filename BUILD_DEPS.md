@@ -29,6 +29,22 @@ Toolchain:
 | Distro libbpf 1.5.0 | Missing `bpf_object__add_kcov_handle` symbol (provided by `kernel_patches/bpf_kcov/0003-...patch` modifications to `tools/lib/bpf/`, which we have deliberately not applied since eBPF revival is parked). | Weak no-op stub in `executor/common_brf_linux.h`.  eBPF kcov coverage becomes a no-op until v06/0003 is applied + libbpf rebuilt; MPTCP harness path is unaffected. |
 | `go build` hash step | `error: readlink("dashboard/app/static/common.js"): Too many levels of symbolic links` printed by every build. | Cosmetic only -- the build proceeds.  Stale symlink in BRF's dashboard webroot from the upstream Syzkaller fork.  Not worth fixing until/unless we touch dashboard. |
 | `apt-get` package name | Package is `libnetfilter-queue-dev` with a hyphen, not `libnetfilter_queue-dev` with an underscore. | -- |
+| Deprecated libnetfilter_queue ritual | `nfq_bind_pf(handle, AF_INET)` returns `EINVAL` on kernel >=7.x (and probably earlier).  The protocol-family bind it used to do is implicit in `nfq_create_queue()` now.  Old man-page examples still show it. | Don't call `nfq_unbind_pf` / `nfq_bind_pf` at all.  See `kernel_patches/mptcp_kcov/test_mp_join_hmac_bitflip.c` for the modern pattern. |
+
+## Kernel config requirements
+
+These are added to `brf_mptcp_harness.config` (Mpiric's
+`tools/configs/samples/` + `to_load/` for `apply_configs.sh`).  Listed
+here so future contributors who hand-roll a kernel know the surface.
+
+| Config | Why we need it |
+|--------|----------------|
+| `CONFIG_KCOV=y` | coverage feedback (BRF baseline) |
+| `CONFIG_KASAN=y`, `CONFIG_UBSAN=y`, `CONFIG_DEBUG_INFO_DWARF4=y` | sanitizers + symbolisation |
+| `CONFIG_LOCKDEP=y`, `CONFIG_PROVE_LOCKING=y` | catch MPTCP locking bugs (MPTCP has three lock layers) |
+| `CONFIG_MPTCP=y` (from `mptcp.config`) | the protocol under test |
+| `CONFIG_PACKET=y`, `CONFIG_VETH=y` | reserved for future netns + AF_PACKET work, currently unused |
+| `CONFIG_NETFILTER_NETLINK_QUEUE=y`, `CONFIG_NETFILTER_XT_TARGET_NFQUEUE=y` | **v02 mutation** -- `nfq_create_queue` fails with `EINVAL` and `iptables -j NFQUEUE` fails to apply without these.  Required for `test_mp_join_hmac_bitflip` and the executor-side NFQUEUE in `syz_mptcp_join_subflow` mutation modes. |
 
 ## Runtime quirks (running syz-execprog / syz-executor in the dev_env VM)
 
