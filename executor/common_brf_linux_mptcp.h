@@ -533,12 +533,7 @@ static void *brf_nfq_worker_loop(void *arg)
 
 /* Idempotent setup.  Called lazily from syz_mptcp_join_subflow when a
  * mutation mode is requested.  Returns 0 on success; on failure leaves
- * the static state cleaned up so a retry can run.
- *
- * Marked unused for C2a: the call site lands in C2c when the mutation
- * branch in syz_mptcp_join_subflow stops returning -1.  The attribute
- * is a no-op once the function is referenced. */
-static int brf_mptcp_ensure_nfq_setup(void) __attribute__((unused));
+ * the static state cleaned up so a retry can run. */
 static int brf_mptcp_ensure_nfq_setup(void)
 {
 	struct sockaddr_nl sa;
@@ -1287,19 +1282,33 @@ static long syz_mptcp_join_subflow(volatile long a0, volatile long a1,
 	const uint32_t local_addr_be  = htonl(0x7f000002);
 	const uint32_t remote_addr_be = htonl(0x7f000001);
 
-	/* v01: only NORMAL mode.  Mutation enum values are part of the
-	 * syzlang surface so the corpus generator emits them, but the
-	 * executor C side rejects them rather than half-implementing. */
-	if (nonce_mut != MPTCP_NONCE_NORMAL ||
-	    hmac_mut  != MPTCP_HMAC_NORMAL) {
-		debug("syz_mptcp_join_subflow: mutation modes not "
-		      "implemented in v01 (nonce_mut=%u hmac_mut=%u)\n",
-		      nonce_mut, hmac_mut);
+	/* Mutation mode dispatch (v02 C2c):
+	 *   - nonce_mut: still v01-only.  v02 C3 will wire MP_JOIN SYN
+	 *     egress through the same NFQUEUE path.
+	 *   - hmac_mut:  routed via brf_nfq_pending_hmac_mut atomic to
+	 *     the worker spawned by brf_mptcp_ensure_nfq_setup().  The
+	 *     worker rewrites the first matching MP_JOIN ACK before the
+	 *     kernel forwards it.  Whether the subflow ends up rejected
+	 *     by subflow_hmac_valid (HMAC_BIT_FLIP / HMAC_ZERO) or just
+	 *     not-yet-implemented (HMAC_TRUNCATE / HMAC_SWAP) is observed
+	 *     post-hoc; this pseudo-syscall returns 0 either way because
+	 *     the value to the fuzzer is the kcov coverage from the
+	 *     attempted handshake, not a binary success bit. */
+	if (nonce_mut != MPTCP_NONCE_NORMAL) {
+		debug("syz_mptcp_join_subflow: nonce_mut=%u not implemented "
+		      "(planned for v02 C3)\n", nonce_mut);
 		return -1;
 	}
 
 	if (brf_mptcp_ensure_executor_setup() < 0)
 		return -1;
+
+	if (hmac_mut != MPTCP_HMAC_NORMAL) {
+		if (brf_mptcp_ensure_nfq_setup() < 0)
+			return -1;
+		BRF_ATOMIC_STORE(&brf_nfq_mut_fired, 0);
+		BRF_ATOMIC_STORE(&brf_nfq_pending_hmac_mut, hmac_mut);
+	}
 
 	if (slot < 0 || slot >= MPTCP_PAIR_POOL_SIZE) {
 		debug("syz_mptcp_join_subflow: slot %ld out of range\n", slot);
@@ -1347,23 +1356,55 @@ static long syz_mptcp_join_subflow(volatile long a0, volatile long a1,
 	 * as soon as the kernel's MPTCP option parser accepts the incoming
 	 * MP_JOIN (mptcp_pm_allow_new_subflow path).  Poll MPTCP_INFO until
 	 * the count goes up, with a ~1s ceiling -- a loopback handshake
-	 * should complete in well under a millisecond. */
+	 * should complete in well under a millisecond.
+	 *
+	 * Mutation modes (hmac_mut != NORMAL) flip the success condition:
+	 * we expect the subflow to NOT establish because the worker
+	 * mutated the MP_JOIN ACK and the kernel's HMAC gate rejected it.
+	 * Return 0 in either case (subflow joined OR mutation observed)
+	 * since the kcov coverage from the handshake is what the fuzzer
+	 * consumes.  Subflow bookkeeping (subflow_count++) only on actual
+	 * establishment. */
 	for (retries = 0; retries < 20; retries++) {
 		struct brf_mptcp_info_short info;
 		socklen_t ilen = sizeof(info);
 		memset(&info, 0, sizeof(info));
 		if (getsockopt(pair->server_msk_fd, SOL_MPTCP, MPTCP_INFO,
-			       &info, &ilen) == 0 &&
-		    info.mptcpi_subflows >= 1) {
-			pair->subflows[sub_slot].established = true;
-			pair->subflow_count++;
-			debug("syz_mptcp_join_subflow: pair=%ld subflow=%d "
-			      "established (server mptcpi_subflows=%u, "
-			      "polls=%d)\n", slot, sub_slot,
-			      info.mptcpi_subflows, retries + 1);
-			return 0;
+			       &info, &ilen) == 0) {
+			if (info.mptcpi_subflows >= 1) {
+				pair->subflows[sub_slot].established = true;
+				pair->subflow_count++;
+				debug("syz_mptcp_join_subflow: pair=%ld subflow=%d "
+				      "established (server mptcpi_subflows=%u, "
+				      "polls=%d, hmac_mut=%u)\n", slot, sub_slot,
+				      info.mptcpi_subflows, retries + 1,
+				      hmac_mut);
+				if (hmac_mut != MPTCP_HMAC_NORMAL)
+					BRF_ATOMIC_STORE(
+						&brf_nfq_pending_hmac_mut, 0);
+				return 0;
+			}
+			if (hmac_mut != MPTCP_HMAC_NORMAL &&
+			    BRF_ATOMIC_LOAD(&brf_nfq_mut_fired)) {
+				debug("syz_mptcp_join_subflow: pair=%ld "
+				      "hmac_mut=%u applied; subflow rejected "
+				      "as expected (polls=%d)\n",
+				      slot, hmac_mut, retries + 1);
+				BRF_ATOMIC_STORE(
+					&brf_nfq_pending_hmac_mut, 0);
+				return 0;
+			}
 		}
 		usleep(50000);	/* 50 ms */
+	}
+	if (hmac_mut != MPTCP_HMAC_NORMAL) {
+		debug("syz_mptcp_join_subflow: pair=%ld hmac_mut=%u no "
+		      "resolution in 1s (mut_fired=%d) -- returning 0 anyway "
+		      "since kcov coverage from attempted handshake is the "
+		      "useful signal\n", slot, hmac_mut,
+		      BRF_ATOMIC_LOAD(&brf_nfq_mut_fired));
+		BRF_ATOMIC_STORE(&brf_nfq_pending_hmac_mut, 0);
+		return 0;
 	}
 	debug("syz_mptcp_join_subflow: pair=%ld subflow=%d not established "
 	      "within ~1s\n", slot, sub_slot);
