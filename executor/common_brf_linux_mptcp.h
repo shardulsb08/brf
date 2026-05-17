@@ -153,8 +153,83 @@ static int brf_nfq_fd = -1;
 static int brf_nfq_setup_done = 0;
 static int brf_nfq_iptables_inserted = 0;
 
+/* Pending-mutation state, set by syz_mptcp_join_subflow before
+ * SUBFLOW_CREATE and consumed by the worker thread when the next
+ * MP_JOIN ACK appears on egress.  Use GCC __atomic builtins rather
+ * than <stdatomic.h> because the executor compiles as C++ where
+ * atomic_int has different semantics; __atomic_* works in both. */
+static volatile int brf_nfq_pending_hmac_mut = 0;  /* MPTCP_HMAC_NORMAL */
+static volatile int brf_nfq_mut_fired        = 0;
+static volatile int brf_nfq_worker_stop      = 0;
+static pthread_t    brf_nfq_worker_thread;
+static int          brf_nfq_worker_started   = 0;
+
+#define BRF_ATOMIC_LOAD(p)     __atomic_load_n((p), __ATOMIC_SEQ_CST)
+#define BRF_ATOMIC_STORE(p, v) __atomic_store_n((p), (v), __ATOMIC_SEQ_CST)
+
+/* ---- Ported from libnetfilter_queue's checksum.c.  Verified
+ * equivalent to nfq_tcp_compute_checksum_ipv4 (which we use in the
+ * standalone smoke test).  A hand-rolled tcp_csum_ipv4 was tried first
+ * and was off by 0x01f6 -- almost certainly a packed-struct alignment
+ * subtlety I couldn't reproduce in isolation.  This implementation
+ * accesses fields via half-word integer shifts (no packed struct +
+ * 16-bit alias), which sidesteps it. */
+static uint16_t brf_nfq_csum_fold(uint32_t sum)
+{
+	sum = (sum >> 16) + (sum & 0xFFFF);
+	sum += (sum >> 16);
+	return (uint16_t)(~sum);
+}
+
+static uint32_t brf_nfq_pseudoheader_tcpudp_v4(const struct iphdr *iph)
+{
+	uint16_t udptcp_len = ntohs(iph->tot_len) - (iph->ihl * 4);
+	uint32_t sum = 0;
+	sum += (iph->saddr >> 16) & 0xFFFF;
+	sum += iph->saddr & 0xFFFF;
+	sum += (iph->daddr >> 16) & 0xFFFF;
+	sum += iph->daddr & 0xFFFF;
+	sum += htons(iph->protocol);
+	sum += htons(udptcp_len);
+	return sum;
+}
+
+static uint16_t brf_nfq_csum_buf(uint32_t sum, const uint16_t *buf, int size)
+{
+	while (size > 1) {
+		sum += *buf++;
+		size -= 2;
+	}
+	if (size)
+		sum += *(const uint8_t *)buf;
+	return brf_nfq_csum_fold(sum);
+}
+
+static void brf_nfq_tcp_compute_checksum_ipv4(struct tcphdr *tcph,
+					      const struct iphdr *iph)
+{
+	uint16_t iph_len = iph->ihl * 4;
+	uint16_t udptcp_len = ntohs(iph->tot_len) - iph_len;
+	uint32_t sum = brf_nfq_pseudoheader_tcpudp_v4(iph);
+
+	tcph->check = 0;
+	tcph->check = brf_nfq_csum_buf(sum,
+				       (const uint16_t *)tcph,
+				       udptcp_len);
+}
+
 static void brf_nfq_cleanup(void)
 {
+	if (brf_nfq_worker_started) {
+		BRF_ATOMIC_STORE(&brf_nfq_worker_stop, 1);
+		/* Close the fd to unblock the worker's recv(); join, then
+		 * proceed with the rest of cleanup. */
+		if (brf_nfq_fd >= 0) {
+			shutdown(brf_nfq_fd, SHUT_RDWR);
+		}
+		pthread_join(brf_nfq_worker_thread, NULL);
+		brf_nfq_worker_started = 0;
+	}
 	if (brf_nfq_iptables_inserted) {
 		int rc = system("iptables -D OUTPUT -p tcp -j NFQUEUE "
 				"--queue-num 0 2>/dev/null");
@@ -252,6 +327,210 @@ static int brf_nfq_send_config_params(int fd, uint16_t queue_num,
 		queue_num, &payload, sizeof(payload));
 }
 
+/* Send NFQNL_MSG_VERDICT.  If payload != NULL, the packet is rewritten
+ * with the modified bytes; otherwise the kernel uses the original. */
+static int brf_nfq_send_verdict(int fd, uint16_t queue_num,
+				uint32_t packet_id, uint32_t verdict,
+				const uint8_t *payload, uint16_t payload_len)
+{
+	char buf[65536 + 256];
+	struct nlmsghdr *nlh = (struct nlmsghdr *)buf;
+	struct nfgenmsg *nfg = (struct nfgenmsg *)NLMSG_DATA(nlh);
+	struct {
+		struct nlattr nla;
+		struct nfqnl_msg_verdict_hdr vh;
+	} __attribute__((packed)) vhdr;
+	char *cursor;
+
+	if (NLMSG_LENGTH(sizeof(*nfg)) + sizeof(vhdr) + NLA_HDRLEN +
+	    payload_len > sizeof(buf))
+		return -1;
+
+	memset(buf, 0, NLMSG_LENGTH(sizeof(*nfg)));
+	nlh->nlmsg_len = NLMSG_LENGTH(sizeof(*nfg));
+	nlh->nlmsg_type = (NFNL_SUBSYS_QUEUE << 8) | NFQNL_MSG_VERDICT;
+	nlh->nlmsg_flags = NLM_F_REQUEST;
+	nlh->nlmsg_seq = 0;
+	nlh->nlmsg_pid = 0;
+	nfg->nfgen_family = AF_UNSPEC;
+	nfg->version = NFNETLINK_V0;
+	nfg->res_id = htons(queue_num);
+
+	vhdr.nla.nla_len = sizeof(vhdr);
+	vhdr.nla.nla_type = NFQA_VERDICT_HDR;
+	vhdr.vh.verdict = htonl(verdict);
+	vhdr.vh.id = htonl(packet_id);
+	cursor = (char *)nlh + NLMSG_ALIGN(nlh->nlmsg_len);
+	memcpy(cursor, &vhdr, sizeof(vhdr));
+	nlh->nlmsg_len += sizeof(vhdr);
+
+	if (payload && payload_len > 0) {
+		struct nlattr pl_attr;
+		pl_attr.nla_len = NLA_HDRLEN + payload_len;
+		pl_attr.nla_type = NFQA_PAYLOAD;
+		cursor = (char *)nlh + NLMSG_ALIGN(nlh->nlmsg_len);
+		memcpy(cursor, &pl_attr, sizeof(pl_attr));
+		memcpy(cursor + NLA_HDRLEN, payload, payload_len);
+		nlh->nlmsg_len += NLA_HDRLEN + payload_len;
+	}
+
+	return (int)send(fd, buf, nlh->nlmsg_len, 0);
+}
+
+/* Walk TCP options.  Returns pointer to the MP_JOIN ACK option's kind
+ * byte (kind=30, len=24, subtype=1) within tcp_seg, or NULL. */
+static uint8_t *brf_nfq_find_mp_join_ack(uint8_t *tcp_seg, int tcp_hlen)
+{
+	int optlen = tcp_hlen - (int)sizeof(struct tcphdr);
+	uint8_t *opts = tcp_seg + sizeof(struct tcphdr);
+	int i = 0;
+	while (i < optlen) {
+		uint8_t kind = opts[i];
+		if (kind == 0)		/* End-of-options */
+			break;
+		if (kind == 1) {	/* NOP */
+			i++;
+			continue;
+		}
+		if (i + 1 >= optlen)
+			break;
+		uint8_t len = opts[i + 1];
+		if (len < 2 || i + len > optlen)
+			break;
+		/* MP_JOIN ACK: kind=30, len=24, subtype (high nibble of byte 2) = 1 */
+		if (kind == 30 && len == 24 &&
+		    (opts[i + 2] >> 4) == 1)
+			return &opts[i];
+		i += len;
+	}
+	return NULL;
+}
+
+/* Apply HMAC mutation to MP_JOIN ACK option bytes.  Option offset 4
+ * starts the 20-byte HMAC field. */
+static void brf_nfq_apply_hmac_mut(uint8_t *opt, int mut_type)
+{
+	switch (mut_type) {
+	case MPTCP_HMAC_BIT_FLIP:
+		opt[4] ^= 0x01;
+		break;
+	case MPTCP_HMAC_ZERO:
+		memset(&opt[4], 0, 20);
+		break;
+	/* HMAC_TRUNCATE / HMAC_SWAP land in a later commit -- they
+	 * change the option length which requires resizing the TCP
+	 * header, more involved than a same-size byte rewrite. */
+	default:
+		break;
+	}
+}
+
+/* NLA walking helpers (libnetlink-style; not in distro linux/netlink.h). */
+#define BRF_NLA_OK(nla, rem) \
+	((rem) >= (int)sizeof(struct nlattr) && \
+	 (nla)->nla_len >= sizeof(struct nlattr) && \
+	 (int)(nla)->nla_len <= (rem))
+#define BRF_NLA_NEXT(nla, rem) \
+	((rem) -= NLA_ALIGN((nla)->nla_len), \
+	 (struct nlattr *)((char *)(nla) + NLA_ALIGN((nla)->nla_len)))
+#define BRF_NLA_DATA(nla) ((void *)((char *)(nla) + NLA_HDRLEN))
+
+/* Worker thread.  Reads NFQUEUE packets, applies the pending HMAC
+ * mutation (if any) to the first matching MP_JOIN ACK, and forwards
+ * everything else unchanged with NF_ACCEPT. */
+static void *brf_nfq_worker_loop(void *arg)
+{
+	(void)arg;
+	char buf[65536];
+
+	while (!BRF_ATOMIC_LOAD(&brf_nfq_worker_stop)) {
+		ssize_t n = recv(brf_nfq_fd, buf, sizeof(buf), 0);
+		if (n < 0) {
+			if (errno == EINTR) continue;
+			break;
+		}
+
+		struct nlmsghdr *nlh = (struct nlmsghdr *)buf;
+		if (!NLMSG_OK(nlh, (size_t)n))
+			continue;
+		if ((nlh->nlmsg_type >> 8) != NFNL_SUBSYS_QUEUE ||
+		    (nlh->nlmsg_type & 0xff) != NFQNL_MSG_PACKET)
+			continue;
+
+		struct nfgenmsg *nfg = (struct nfgenmsg *)NLMSG_DATA(nlh);
+		uint16_t queue_num = ntohs(nfg->res_id);
+
+		/* Walk attrs to find PACKET_HDR and PAYLOAD. */
+		struct nlattr *attr = (struct nlattr *)
+			((char *)nfg + NLMSG_ALIGN(sizeof(*nfg)));
+		int attr_len = nlh->nlmsg_len - NLMSG_HDRLEN -
+			NLMSG_ALIGN(sizeof(*nfg));
+
+		uint32_t packet_id = 0;
+		uint8_t *payload = NULL;
+		int payload_len = 0;
+		while (BRF_NLA_OK(attr, attr_len)) {
+			if (attr->nla_type == NFQA_PACKET_HDR) {
+				struct nfqnl_msg_packet_hdr *ph =
+					(struct nfqnl_msg_packet_hdr *)
+					BRF_NLA_DATA(attr);
+				packet_id = ntohl(ph->packet_id);
+			} else if (attr->nla_type == NFQA_PAYLOAD) {
+				payload = (uint8_t *)BRF_NLA_DATA(attr);
+				payload_len = attr->nla_len - NLA_HDRLEN;
+			}
+			attr = BRF_NLA_NEXT(attr, attr_len);
+		}
+
+		/* Default verdict: pass through unchanged. */
+		int mut_to_apply = 0;
+		uint8_t *opt = NULL;
+
+		if (payload && payload_len >=
+		    (int)(sizeof(struct iphdr) + sizeof(struct tcphdr))) {
+			struct iphdr *ip = (struct iphdr *)payload;
+			int ip_hlen = ip->ihl * 4;
+			if (ip->protocol == IPPROTO_TCP &&
+			    payload_len >= ip_hlen + (int)sizeof(struct tcphdr)) {
+				struct tcphdr *tcp = (struct tcphdr *)
+					(payload + ip_hlen);
+				int tcp_hlen = tcp->doff * 4;
+				if (payload_len >= ip_hlen + tcp_hlen &&
+				    tcp->ack && !tcp->syn && !tcp->fin &&
+				    !tcp->rst) {
+					opt = brf_nfq_find_mp_join_ack(
+						(uint8_t *)tcp, tcp_hlen);
+					if (opt && !BRF_ATOMIC_LOAD(
+						&brf_nfq_mut_fired)) {
+						mut_to_apply = BRF_ATOMIC_LOAD(
+						    &brf_nfq_pending_hmac_mut);
+					}
+				}
+				if (mut_to_apply != 0 &&
+				    mut_to_apply != MPTCP_HMAC_NORMAL) {
+					brf_nfq_apply_hmac_mut(opt,
+							       mut_to_apply);
+					brf_nfq_tcp_compute_checksum_ipv4(
+						tcp, ip);
+					BRF_ATOMIC_STORE(&brf_nfq_mut_fired, 1);
+					debug("nfq_worker: applied "
+					      "hmac_mut=%d to MP_JOIN ACK\n",
+					      mut_to_apply);
+					brf_nfq_send_verdict(brf_nfq_fd,
+						queue_num, packet_id,
+						NF_ACCEPT, payload,
+						(uint16_t)payload_len);
+					continue;
+				}
+			}
+		}
+
+		brf_nfq_send_verdict(brf_nfq_fd, queue_num, packet_id,
+				     NF_ACCEPT, NULL, 0);
+	}
+	return NULL;
+}
+
 /* Idempotent setup.  Called lazily from syz_mptcp_join_subflow when a
  * mutation mode is requested.  Returns 0 on success; on failure leaves
  * the static state cleaned up so a retry can run.
@@ -310,9 +589,19 @@ static int brf_mptcp_ensure_nfq_setup(void)
 	brf_nfq_iptables_inserted = 1;
 	atexit(brf_nfq_cleanup);
 
+	/* Spawn the worker thread (C2b).  Once running, packets arriving
+	 * on the queue are forwarded with NF_ACCEPT and the first MP_JOIN
+	 * ACK matching a pending mutation gets rewritten in-flight. */
+	if (pthread_create(&brf_nfq_worker_thread, NULL,
+			   brf_nfq_worker_loop, NULL) != 0) {
+		debug("nfq_setup: pthread_create worker: %s\n",
+		      strerror(errno));
+		goto fail;
+	}
+	brf_nfq_worker_started = 1;
+
 	brf_nfq_setup_done = 1;
-	debug("nfq_setup: queue=%d fd=%d iptables installed; mutation "
-	      "worker comes online with C2b\n",
+	debug("nfq_setup: queue=%d fd=%d iptables+worker online\n",
 	      BRF_NFQ_QUEUE_NUM, brf_nfq_fd);
 	return 0;
 
