@@ -1501,13 +1501,89 @@ static long syz_mptcp_join_subflow(volatile long a0, volatile long a1,
 #endif
 
 #if SYZ_EXECUTOR || __NR_syz_mptcp_drive_traffic
+/*
+ * v04 C1: send `data_len` bytes through an established MP_CAPABLE pair's
+ * client->server direction, exercising the MPTCP-level data path
+ * (mptcp_sendmsg, mptcp_established_options_dss emit, server's
+ * mptcp_incoming_options DSS parse, mptcp_subflow_data_available etc).
+ *
+ * subflow_id is informational in v04 C1 -- writes go through client_msk_fd
+ * which lets the kernel's mptcp_subflow_get_send scheduler pick.  A future
+ * iteration can write directly on pair->subflows[subflow_id].tcp_subflow_fd
+ * for per-subflow steering, at the cost of bypassing the MPTCP layer.
+ *
+ * map_mut != NORMAL is reserved for v04 C2 (NFQUEUE worker rewrites the DSS
+ * option bytes in flight, similar to v02 C2/C3 for HMAC/nonce); rejected
+ * here with -1 so the fuzzer's corpus still has the surface but doesn't
+ * silently no-op on unimplemented modes.
+ *
+ * Bounded send (4096 bytes max) + best-effort drain on server side so a
+ * pathological prog can't wedge the pair's TX buffer for the rest of the
+ * fuzz iteration.  Errors are non-fatal -- the syscall returns the bytes
+ * actually sent (or 0 if nothing went through); fuzzer cares about
+ * kcov coverage from the attempted send, not a success bit.
+ */
 static long syz_mptcp_drive_traffic(volatile long a0, volatile long a1,
 				    volatile long a2, volatile long a3,
 				    volatile long a4)
 {
-	// a0: pair, a1: subflow_id, a2: data ptr, a3: len, a4: map_mut
-	debug("syz_mptcp_drive_traffic: not implemented (v0 skeleton)\n");
-	return -1;
+	struct brf_mptcp_pair_state *pair;
+	long slot = a0;
+	const void *data = (const void *)a2;
+	size_t data_len = (size_t)a3;
+	uint8_t map_mut = (uint8_t)a4;
+	char drain_buf[4096];
+	ssize_t sent, drained, total_drained = 0;
+
+	(void)a1;	/* subflow_id -- informational in v04 C1 */
+
+	if (map_mut != MPTCP_MAP_NORMAL) {
+		debug("syz_mptcp_drive_traffic: map_mut=%u not implemented "
+		      "(planned for v04 C2)\n", map_mut);
+		return -1;
+	}
+
+	if (slot < 0 || slot >= MPTCP_PAIR_POOL_SIZE) {
+		debug("syz_mptcp_drive_traffic: slot %ld out of range\n", slot);
+		return -1;
+	}
+	pair = &brf_mptcp_pair_pool[slot];
+	if (!pair->in_use) {
+		debug("syz_mptcp_drive_traffic: slot %ld not in use\n", slot);
+		return -1;
+	}
+	if (pair->client_msk_fd < 0 || pair->server_msk_fd < 0) {
+		debug("syz_mptcp_drive_traffic: slot %ld fds not set "
+		      "(client=%d server=%d)\n", slot,
+		      pair->client_msk_fd, pair->server_msk_fd);
+		return -1;
+	}
+
+	/* Cap the send size -- syzkaller will mutate data_len wildly and we
+	 * don't want a 16MB send wedging the pair. */
+	if (data_len > sizeof(drain_buf))
+		data_len = sizeof(drain_buf);
+
+	sent = send(pair->client_msk_fd, data, data_len,
+		    MSG_DONTWAIT | MSG_NOSIGNAL);
+	if (sent < 0 && errno != EAGAIN && errno != EWOULDBLOCK)
+		debug("syz_mptcp_drive_traffic: send: %s\n", strerror(errno));
+
+	/* Drain server side -- bounded so we don't loop forever on a chatty
+	 * peer.  Without this, the pair's RX buffer fills and subsequent
+	 * sends start EAGAIN-ing.  Max 8 iterations = up to 32KB drained. */
+	for (int i = 0; i < 8; i++) {
+		drained = recv(pair->server_msk_fd, drain_buf,
+			       sizeof(drain_buf),
+			       MSG_DONTWAIT | MSG_NOSIGNAL);
+		if (drained <= 0)
+			break;
+		total_drained += drained;
+	}
+
+	debug("syz_mptcp_drive_traffic: slot=%ld sent=%zd drained=%zd "
+	      "data_len=%zu\n", slot, sent, total_drained, data_len);
+	return sent >= 0 ? sent : 0;
 }
 #endif
 
