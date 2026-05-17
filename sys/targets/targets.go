@@ -495,7 +495,18 @@ var oses = map[string]osCommon{
 			"syz_bpf_prog_load":   {"bpf$PROG_LOAD"},
 			"syz_bpf_prog_attach": {"bpf$BPF_PROG_ATTACH"},
 		},
-		cflags: []string{"-static-pie"},
+		// `-pie` (not `-static-pie`) because Debian trixie's elfutils
+		// 0.192-4 has a packaging gap: libelf.a internally calls
+		// eu_search_tree_init / _fini but the helper archive
+		// providing those symbols is not shipped.  Static linking
+		// therefore fails to satisfy them.  Dynamic linking (libelf.so)
+		// resolves them transparently.  The dev_env VM has the
+		// required .so files installed; portable single-binary
+		// deployment is sacrificed but not needed for the Mpiric
+		// fuzzing setup.  Restore `-static-pie` when either Debian
+		// fixes the packaging or we move to a distro that ships the
+		// missing helpers.  See brf/BUILD_DEPS.md.
+		cflags: []string{"-pie"},
 	},
 	FreeBSD: {
 		SyscallNumbers:         true,
