@@ -158,9 +158,10 @@ static int brf_nfq_iptables_inserted = 0;
  * MP_JOIN ACK appears on egress.  Use GCC __atomic builtins rather
  * than <stdatomic.h> because the executor compiles as C++ where
  * atomic_int has different semantics; __atomic_* works in both. */
-static volatile int brf_nfq_pending_hmac_mut = 0;  /* MPTCP_HMAC_NORMAL */
-static volatile int brf_nfq_mut_fired        = 0;
-static volatile int brf_nfq_worker_stop      = 0;
+static volatile int brf_nfq_pending_hmac_mut  = 0;  /* MPTCP_HMAC_NORMAL */
+static volatile int brf_nfq_pending_nonce_mut = 0;  /* MPTCP_NONCE_NORMAL */
+static volatile int brf_nfq_mut_fired         = 0;
+static volatile int brf_nfq_worker_stop       = 0;
 static pthread_t    brf_nfq_worker_thread;
 static int          brf_nfq_worker_started   = 0;
 
@@ -380,9 +381,11 @@ static int brf_nfq_send_verdict(int fd, uint16_t queue_num,
 	return (int)send(fd, buf, nlh->nlmsg_len, 0);
 }
 
-/* Walk TCP options.  Returns pointer to the MP_JOIN ACK option's kind
- * byte (kind=30, len=24, subtype=1) within tcp_seg, or NULL. */
-static uint8_t *brf_nfq_find_mp_join_ack(uint8_t *tcp_seg, int tcp_hlen)
+/* Walk TCP options.  Returns pointer to the MP_JOIN option's kind byte
+ * if it matches kind=30, subtype=1, AND the caller-specified expected
+ * length.  Use expected_len=24 for MP_JOIN ACK, 12 for MP_JOIN SYN. */
+static uint8_t *brf_nfq_find_mp_join_option(uint8_t *tcp_seg, int tcp_hlen,
+					    uint8_t expected_len)
 {
 	int optlen = tcp_hlen - (int)sizeof(struct tcphdr);
 	uint8_t *opts = tcp_seg + sizeof(struct tcphdr);
@@ -400,13 +403,27 @@ static uint8_t *brf_nfq_find_mp_join_ack(uint8_t *tcp_seg, int tcp_hlen)
 		uint8_t len = opts[i + 1];
 		if (len < 2 || i + len > optlen)
 			break;
-		/* MP_JOIN ACK: kind=30, len=24, subtype (high nibble of byte 2) = 1 */
-		if (kind == 30 && len == 24 &&
+		/* MP_JOIN: kind=30, subtype (high nibble of byte 2) = 1.
+		 * Length distinguishes SYN(12) / SYN-ACK(16) / ACK(24). */
+		if (kind == 30 && len == expected_len &&
 		    (opts[i + 2] >> 4) == 1)
 			return &opts[i];
 		i += len;
 	}
 	return NULL;
+}
+
+/* Backwards-compat alias; callers pre-C3 expected MP_JOIN ACK. */
+static inline uint8_t *brf_nfq_find_mp_join_ack(uint8_t *tcp_seg, int tcp_hlen)
+{
+	return brf_nfq_find_mp_join_option(tcp_seg, tcp_hlen, 24);
+}
+
+/* Find MP_JOIN SYN option (kind=30, len=12, subtype=1).  Nonce is at
+ * option offset 8 (4 bytes); token is at option offset 4 (4 bytes). */
+static inline uint8_t *brf_nfq_find_mp_join_syn(uint8_t *tcp_seg, int tcp_hlen)
+{
+	return brf_nfq_find_mp_join_option(tcp_seg, tcp_hlen, 12);
 }
 
 /* Apply HMAC mutation to MP_JOIN ACK option bytes.  Option offset 4
@@ -423,6 +440,40 @@ static void brf_nfq_apply_hmac_mut(uint8_t *opt, int mut_type)
 	/* HMAC_TRUNCATE / HMAC_SWAP land in a later commit -- they
 	 * change the option length which requires resizing the TCP
 	 * header, more involved than a same-size byte rewrite. */
+	default:
+		break;
+	}
+}
+
+/* Apply nonce mutation to MP_JOIN SYN option bytes.  Option layout:
+ *   byte 0:  Kind = 30
+ *   byte 1:  Length = 12
+ *   byte 2:  Subtype (high 4) = 1, addr_id flags (low 4)
+ *   byte 3:  Address ID
+ *   bytes 4-7:  Receiver's Token (4 bytes)
+ *   bytes 8-11: Sender's Random Nonce (4 bytes)  <-- our target
+ *
+ * The server's HMAC is computed over (server_key, client_key,
+ * server_nonce, client_nonce).  Mutating the client nonce makes the
+ * client's HMAC computation diverge from what server expects -- the
+ * SYN-ACK's truncated HMAC won't match and the CLIENT side rejects
+ * via subflow_thmac_valid (different gate than HMAC_BIT_FLIP, which
+ * targets the server's ACK validation). */
+static void brf_nfq_apply_nonce_mut(uint8_t *opt, int mut_type)
+{
+	switch (mut_type) {
+	case MPTCP_NONCE_ZERO:
+		memset(&opt[8], 0, 4);
+		break;
+	case MPTCP_NONCE_FLIP_HIGH:
+		opt[8] ^= 0x80;
+		break;
+	case MPTCP_NONCE_FLIP_LOW:
+		opt[11] ^= 0x01;
+		break;
+	/* NONCE_REPLAY needs stored prior-session nonce state; not
+	 * implemented in C3.  Trivially adds in v03 by stashing the
+	 * nonce from a previous mutation cycle in a static buffer. */
 	default:
 		break;
 	}
@@ -488,47 +539,70 @@ static void *brf_nfq_worker_loop(void *arg)
 			attr = BRF_NLA_NEXT(attr, attr_len);
 		}
 
-		/* Default verdict: pass through unchanged. */
-		int mut_to_apply = 0;
-		uint8_t *opt = NULL;
+		/* Default: pass through unchanged.  Otherwise dispatch on
+		 * which MP_JOIN variant the packet carries and which
+		 * mutation kind is currently pending. */
+		int  applied_mut = 0;
+		const char *applied_what = NULL;
+		struct iphdr  *ip  = NULL;
+		struct tcphdr *tcp = NULL;
 
 		if (payload && payload_len >=
 		    (int)(sizeof(struct iphdr) + sizeof(struct tcphdr))) {
-			struct iphdr *ip = (struct iphdr *)payload;
+			ip = (struct iphdr *)payload;
 			int ip_hlen = ip->ihl * 4;
 			if (ip->protocol == IPPROTO_TCP &&
 			    payload_len >= ip_hlen + (int)sizeof(struct tcphdr)) {
-				struct tcphdr *tcp = (struct tcphdr *)
-					(payload + ip_hlen);
+				tcp = (struct tcphdr *)(payload + ip_hlen);
 				int tcp_hlen = tcp->doff * 4;
 				if (payload_len >= ip_hlen + tcp_hlen &&
-				    tcp->ack && !tcp->syn && !tcp->fin &&
-				    !tcp->rst) {
-					opt = brf_nfq_find_mp_join_ack(
-						(uint8_t *)tcp, tcp_hlen);
-					if (opt && !BRF_ATOMIC_LOAD(
-						&brf_nfq_mut_fired)) {
-						mut_to_apply = BRF_ATOMIC_LOAD(
+				    !BRF_ATOMIC_LOAD(&brf_nfq_mut_fired)) {
+					/* MP_JOIN ACK egress -- pure ACK
+					 * with kind=30 len=24 subtype=1
+					 * carrying the 20-byte HMAC. */
+					if (tcp->ack && !tcp->syn &&
+					    !tcp->fin && !tcp->rst) {
+						uint8_t *opt = brf_nfq_find_mp_join_ack(
+							(uint8_t *)tcp, tcp_hlen);
+						int hmac_mut = BRF_ATOMIC_LOAD(
 						    &brf_nfq_pending_hmac_mut);
+						if (opt && hmac_mut != MPTCP_HMAC_NORMAL) {
+							brf_nfq_apply_hmac_mut(
+								opt, hmac_mut);
+							applied_mut = hmac_mut;
+							applied_what = "MP_JOIN ACK hmac";
+						}
+					}
+					/* MP_JOIN SYN egress -- pure SYN
+					 * with kind=30 len=12 subtype=1
+					 * carrying token + 4-byte client
+					 * nonce. */
+					else if (tcp->syn && !tcp->ack &&
+						 !tcp->fin && !tcp->rst) {
+						uint8_t *opt = brf_nfq_find_mp_join_syn(
+							(uint8_t *)tcp, tcp_hlen);
+						int nonce_mut = BRF_ATOMIC_LOAD(
+						    &brf_nfq_pending_nonce_mut);
+						if (opt && nonce_mut != MPTCP_NONCE_NORMAL) {
+							brf_nfq_apply_nonce_mut(
+								opt, nonce_mut);
+							applied_mut = nonce_mut;
+							applied_what = "MP_JOIN SYN nonce";
+						}
 					}
 				}
-				if (mut_to_apply != 0 &&
-				    mut_to_apply != MPTCP_HMAC_NORMAL) {
-					brf_nfq_apply_hmac_mut(opt,
-							       mut_to_apply);
-					brf_nfq_tcp_compute_checksum_ipv4(
-						tcp, ip);
-					BRF_ATOMIC_STORE(&brf_nfq_mut_fired, 1);
-					debug("nfq_worker: applied "
-					      "hmac_mut=%d to MP_JOIN ACK\n",
-					      mut_to_apply);
-					brf_nfq_send_verdict(brf_nfq_fd,
-						queue_num, packet_id,
-						NF_ACCEPT, payload,
-						(uint16_t)payload_len);
-					continue;
-				}
 			}
+		}
+
+		if (applied_mut != 0) {
+			brf_nfq_tcp_compute_checksum_ipv4(tcp, ip);
+			BRF_ATOMIC_STORE(&brf_nfq_mut_fired, 1);
+			debug("nfq_worker: applied %s mut=%d\n",
+			      applied_what, applied_mut);
+			brf_nfq_send_verdict(brf_nfq_fd, queue_num, packet_id,
+					     NF_ACCEPT, payload,
+					     (uint16_t)payload_len);
+			continue;
 		}
 
 		brf_nfq_send_verdict(brf_nfq_fd, queue_num, packet_id,
@@ -1288,32 +1362,31 @@ static long syz_mptcp_join_subflow(volatile long a0, volatile long a1,
 	const uint32_t local_addr_be  = htonl(0x7f000002);
 	const uint32_t remote_addr_be = htonl(0x7f000001);
 
-	/* Mutation mode dispatch (v02 C2c):
-	 *   - nonce_mut: still v01-only.  v02 C3 will wire MP_JOIN SYN
-	 *     egress through the same NFQUEUE path.
-	 *   - hmac_mut:  routed via brf_nfq_pending_hmac_mut atomic to
-	 *     the worker spawned by brf_mptcp_ensure_nfq_setup().  The
-	 *     worker rewrites the first matching MP_JOIN ACK before the
-	 *     kernel forwards it.  Whether the subflow ends up rejected
-	 *     by subflow_hmac_valid (HMAC_BIT_FLIP / HMAC_ZERO) or just
-	 *     not-yet-implemented (HMAC_TRUNCATE / HMAC_SWAP) is observed
-	 *     post-hoc; this pseudo-syscall returns 0 either way because
-	 *     the value to the fuzzer is the kcov coverage from the
-	 *     attempted handshake, not a binary success bit. */
-	if (nonce_mut != MPTCP_NONCE_NORMAL) {
-		debug("syz_mptcp_join_subflow: nonce_mut=%u not implemented "
-		      "(planned for v02 C3)\n", nonce_mut);
-		return -1;
-	}
-
+	/* Mutation mode dispatch (v02 C2 + C3):
+	 *   - hmac_mut  != NORMAL: rewrite MP_JOIN ACK's HMAC field.
+	 *     Server's subflow_hmac_valid gate catches it.
+	 *   - nonce_mut != NORMAL: rewrite MP_JOIN SYN's client nonce.
+	 *     The server-side HMAC computation diverges from what the
+	 *     client expects in the SYN-ACK; client's subflow_thmac_valid
+	 *     gate catches it (different gate, different rejection path).
+	 *   - Both set: nonce_mut fires first (SYN egress precedes ACK
+	 *     egress), mut_fired latches at 1, ACK passes through
+	 *     unmodified.  Acceptable behavior for fuzzer coverage.
+	 *
+	 * Whether the subflow ends up rejected (expected) or not, this
+	 * pseudo-syscall returns 0 -- the value to the fuzzer is the
+	 * kcov coverage from the attempted handshake, not a binary
+	 * success bit. */
 	if (brf_mptcp_ensure_executor_setup() < 0)
 		return -1;
 
-	if (hmac_mut != MPTCP_HMAC_NORMAL) {
+	if (hmac_mut != MPTCP_HMAC_NORMAL ||
+	    nonce_mut != MPTCP_NONCE_NORMAL) {
 		if (brf_mptcp_ensure_nfq_setup() < 0)
 			return -1;
 		BRF_ATOMIC_STORE(&brf_nfq_mut_fired, 0);
 		BRF_ATOMIC_STORE(&brf_nfq_pending_hmac_mut, hmac_mut);
+		BRF_ATOMIC_STORE(&brf_nfq_pending_nonce_mut, nonce_mut);
 	}
 
 	if (slot < 0 || slot >= MPTCP_PAIR_POOL_SIZE) {
@@ -1364,13 +1437,15 @@ static long syz_mptcp_join_subflow(volatile long a0, volatile long a1,
 	 * the count goes up, with a ~1s ceiling -- a loopback handshake
 	 * should complete in well under a millisecond.
 	 *
-	 * Mutation modes (hmac_mut != NORMAL) flip the success condition:
-	 * we expect the subflow to NOT establish because the worker
-	 * mutated the MP_JOIN ACK and the kernel's HMAC gate rejected it.
-	 * Return 0 in either case (subflow joined OR mutation observed)
-	 * since the kcov coverage from the handshake is what the fuzzer
-	 * consumes.  Subflow bookkeeping (subflow_count++) only on actual
-	 * establishment. */
+	 * Mutation modes (hmac_mut or nonce_mut != NORMAL) flip the
+	 * success condition: we expect the subflow to NOT establish
+	 * because the worker mutated either the MP_JOIN SYN (nonce) or
+	 * ACK (hmac) and a kernel gate rejected it.  Return 0 either way
+	 * (subflow joined OR mutation observed) since the kcov coverage
+	 * from the handshake is what the fuzzer consumes.  Subflow
+	 * bookkeeping (subflow_count++) only on actual establishment. */
+	int is_mutation = (hmac_mut != MPTCP_HMAC_NORMAL) ||
+			  (nonce_mut != MPTCP_NONCE_NORMAL);
 	for (retries = 0; retries < 20; retries++) {
 		struct brf_mptcp_info_short info;
 		socklen_t ilen = sizeof(info);
@@ -1382,34 +1457,41 @@ static long syz_mptcp_join_subflow(volatile long a0, volatile long a1,
 				pair->subflow_count++;
 				debug("syz_mptcp_join_subflow: pair=%ld subflow=%d "
 				      "established (server mptcpi_subflows=%u, "
-				      "polls=%d, hmac_mut=%u)\n", slot, sub_slot,
-				      info.mptcpi_subflows, retries + 1,
-				      hmac_mut);
-				if (hmac_mut != MPTCP_HMAC_NORMAL)
+				      "polls=%d, hmac_mut=%u, nonce_mut=%u)\n",
+				      slot, sub_slot, info.mptcpi_subflows,
+				      retries + 1, hmac_mut, nonce_mut);
+				if (is_mutation) {
 					BRF_ATOMIC_STORE(
 						&brf_nfq_pending_hmac_mut, 0);
+					BRF_ATOMIC_STORE(
+						&brf_nfq_pending_nonce_mut, 0);
+				}
 				return 0;
 			}
-			if (hmac_mut != MPTCP_HMAC_NORMAL &&
+			if (is_mutation &&
 			    BRF_ATOMIC_LOAD(&brf_nfq_mut_fired)) {
 				debug("syz_mptcp_join_subflow: pair=%ld "
-				      "hmac_mut=%u applied; subflow rejected "
-				      "as expected (polls=%d)\n",
-				      slot, hmac_mut, retries + 1);
+				      "hmac_mut=%u nonce_mut=%u applied; "
+				      "subflow rejected as expected "
+				      "(polls=%d)\n", slot, hmac_mut,
+				      nonce_mut, retries + 1);
 				BRF_ATOMIC_STORE(
 					&brf_nfq_pending_hmac_mut, 0);
+				BRF_ATOMIC_STORE(
+					&brf_nfq_pending_nonce_mut, 0);
 				return 0;
 			}
 		}
 		usleep(50000);	/* 50 ms */
 	}
-	if (hmac_mut != MPTCP_HMAC_NORMAL) {
-		debug("syz_mptcp_join_subflow: pair=%ld hmac_mut=%u no "
-		      "resolution in 1s (mut_fired=%d) -- returning 0 anyway "
-		      "since kcov coverage from attempted handshake is the "
-		      "useful signal\n", slot, hmac_mut,
-		      BRF_ATOMIC_LOAD(&brf_nfq_mut_fired));
+	if (is_mutation) {
+		debug("syz_mptcp_join_subflow: pair=%ld hmac_mut=%u "
+		      "nonce_mut=%u no resolution in 1s (mut_fired=%d) -- "
+		      "returning 0 anyway since kcov coverage from attempted "
+		      "handshake is the useful signal\n", slot, hmac_mut,
+		      nonce_mut, BRF_ATOMIC_LOAD(&brf_nfq_mut_fired));
 		BRF_ATOMIC_STORE(&brf_nfq_pending_hmac_mut, 0);
+		BRF_ATOMIC_STORE(&brf_nfq_pending_nonce_mut, 0);
 		return 0;
 	}
 	debug("syz_mptcp_join_subflow: pair=%ld subflow=%d not established "
