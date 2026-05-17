@@ -30,6 +30,35 @@ Toolchain:
 | `go build` hash step | `error: readlink("dashboard/app/static/common.js"): Too many levels of symbolic links` printed by every build. | Cosmetic only -- the build proceeds.  Stale symlink in BRF's dashboard webroot from the upstream Syzkaller fork.  Not worth fixing until/unless we touch dashboard. |
 | `apt-get` package name | Package is `libnetfilter-queue-dev` with a hyphen, not `libnetfilter_queue-dev` with an underscore. | -- |
 
+## Runtime quirks (running syz-execprog / syz-executor in the dev_env VM)
+
+Captured alongside build quirks for the same reason -- so the setup-
+script promotion later folds these in instead of re-discovering.
+
+| Where it surfaced | Quirk | Workaround |
+|-------------------|-------|------------|
+| `syz-execprog ... /tmp/prog` from `/mnt/src/fuzzing/brf` (9p mount) | `SYZFAIL: mkswap failed (errno 95: Operation not supported)` -- syz-executor's setup creates `./swap-file` in the cwd, calls `mkswap` + `swapon`; 9p's superblock has no `swap_activate` op so `swapon` returns EOPNOTSUPP regardless of file size. | `cd /root` (or any local-rootfs dir) before running syz-execprog.  Wrapper script does this. |
+| Repeat-run noise on stdout | `mkdir(/syzcgroup) failed: 17`, `mount(binfmt_misc) failed: 16`, `write(/proc/sys/fs/binfmt_misc/register) failed: 17` -- the sandbox setup tries to recreate things that survived from a previous run. | `-sandbox=none` -- our MPTCP harness runs in the executor's root namespace, the sandbox isolates from the kernel state we want to fuzz.  Wrapper script defaults to this. |
+| `mount -t 9p brf /mnt/brf_work_dir: special device brf does not exist` at executor startup | BRF's eBPF runtime path mounts a 9p share named `brf` for compiled BPF objects.  The dev_env VM only exposes `hostshare` (at `/mnt/host`). | Benign -- BRF logs the failure and falls back to a local directory.  Our MPTCP harness path doesn't use this.  Would matter only if/when we revive eBPF runtime fuzzing. |
+| syz-executor invoked directly | `./bin/linux_amd64/syz-executor` and `--help`/`-help` print "unknown command" and exit. | Expected.  syz-executor is meant to be invoked by syz-execprog / syz-fuzzer / syz-manager which pass it specific subcommand verbs (`setup`, `exec`, `cover` etc.).  Use syz-execprog wrapper for direct prog runs. |
+
+### Wrapper script
+
+`/mnt/host/mpiric/027_netdev_0x1a_proposal/work/brf_protocol_fuzz_setup/scripts/run_brf_prog.sh`
+folds the above into a single invocation:
+
+```bash
+/mnt/host/mpiric/027_netdev_0x1a_proposal/work/brf_protocol_fuzz_setup/scripts/run_brf_prog.sh \
+    /mnt/host/mpiric/027_netdev_0x1a_proposal/work/brf_protocol_fuzz_setup/progs/pair_init.prog
+```
+
+Env-var overrides: `BRF` (path to BRF tree, default `/mnt/src/fuzzing/brf`),
+`REPEAT`, `THREADED`, `DEBUG`.  See the script's header comment for the
+full rationale.
+
+Sample progs live alongside in `progs/`.  The first one is
+`pair_init.prog` -- single-syscall smoke test for syz_mptcp_pair_init.
+
 ## When to promote to a setup script
 
 Triggers:
