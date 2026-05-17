@@ -333,7 +333,10 @@ static int brf_nfq_send_verdict(int fd, uint16_t queue_num,
 				uint32_t packet_id, uint32_t verdict,
 				const uint8_t *payload, uint16_t payload_len)
 {
-	char buf[65536 + 256];
+	/* Static (BSS) instead of stack -- syz-executor uses
+	 * -Wframe-larger-than=16384 and only the worker thread calls
+	 * this so single-instance reuse is safe. */
+	static char buf[65536 + 256];
 	struct nlmsghdr *nlh = (struct nlmsghdr *)buf;
 	struct nfgenmsg *nfg = (struct nfgenmsg *)NLMSG_DATA(nlh);
 	struct {
@@ -441,7 +444,10 @@ static void brf_nfq_apply_hmac_mut(uint8_t *opt, int mut_type)
 static void *brf_nfq_worker_loop(void *arg)
 {
 	(void)arg;
-	char buf[65536];
+	/* Static (BSS) instead of stack -- see comment in
+	 * brf_nfq_send_verdict.  This function is the sole producer of
+	 * its own buffer and the only worker thread. */
+	static char buf[65536];
 
 	while (!BRF_ATOMIC_LOAD(&brf_nfq_worker_stop)) {
 		ssize_t n = recv(brf_nfq_fd, buf, sizeof(buf), 0);
