@@ -40,8 +40,9 @@
 //          MPJoinAckHMacFailure  +1  (HMAC gate fired)
 //
 // Build:
-//   gcc -O2 -Wall -o test_mp_join_hmac_bitflip test_mp_join_hmac_bitflip.c \
+//   gcc -O2 -Wall -o test_mp_join_hmac_bitflip test_mp_join_hmac_bitflip.c
 //       -lnetfilter_queue -lnfnetlink -lpthread
+//   (one line; broken here for readability)
 //
 // Run (as root, in the patched VM, from any dir):
 //   ./test_mp_join_hmac_bitflip
@@ -235,7 +236,7 @@ static uint8_t *find_mp_join_ack(uint8_t *tcp_seg, int tcp_hlen)
 
 /* ----- NFQUEUE callback ------------------------------------------- */
 
-static int nfq_callback(struct nfq_q_handle *qh, struct nfgenmsg *nfmsg,
+static int brf_nfq_callback(struct nfq_q_handle *qh, struct nfgenmsg *nfmsg,
 			struct nfq_data *nfa, void *data)
 {
 	(void)nfmsg;
@@ -766,7 +767,7 @@ int main(void)
 		perror("nfq_bind_pf");
 		goto out;
 	}
-	g_nfq_qh = nfq_create_queue(g_nfq_h, NFQUEUE_NUM, &nfq_callback, NULL);
+	g_nfq_qh = nfq_create_queue(g_nfq_h, NFQUEUE_NUM, &brf_nfq_callback, NULL);
 	if (!g_nfq_qh) {
 		perror("nfq_create_queue");
 		goto out;
