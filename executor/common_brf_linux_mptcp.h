@@ -86,6 +86,13 @@ struct mptcp_debug_keys {
 // headers usually carry this since iproute2 ships against it; the fallback
 // below mirrors include/uapi/linux/mptcp_pm.h at the kernel base commit
 // 232989ca65248 in case the host headers lag.
+// NFQUEUE infrastructure for v02 wire-level mutation (HMAC_BIT_FLIP etc.
+// in syz_mptcp_join_subflow).  Standard Linux uapi; available on Debian
+// trixie and any kernel built with CONFIG_NETFILTER_NETLINK_QUEUE.
+#include <linux/netfilter.h>
+#include <linux/netfilter/nfnetlink.h>
+#include <linux/netfilter/nfnetlink_queue.h>
+
 #if __has_include(<linux/mptcp_pm.h>)
 #include <linux/mptcp_pm.h>
 #else
@@ -125,6 +132,197 @@ enum {
 	MPTCP_PM_CMD_SUBFLOW_DESTROY,
 };
 #endif
+
+// ---------- NFQUEUE raw-netlink plumbing (v02 C2a) ----------
+//
+// We open NETLINK_NETFILTER, bind queue 0, set NFQNL_COPY_PACKET mode,
+// and install an iptables OUTPUT rule.  The worker thread + mutation
+// callback come in C2b; this file's C2a just stands up the
+// infrastructure so brf_mptcp_ensure_nfq_setup() returning 0 means
+// the queue is live and packets are buffered for us.
+//
+// libnetfilter_queue is intentionally avoided here to keep
+// syz-executor's link surface clean.  The smoke test at
+// kernel_patches/mptcp_kcov/test_mp_join_hmac_bitflip.c uses libnfq
+// since it's a standalone program.  ~150 LOC of raw netlink + the
+// ported checksum helper (next commit) buys us no new build dep.
+
+#define BRF_NFQ_QUEUE_NUM 0
+
+static int brf_nfq_fd = -1;
+static int brf_nfq_setup_done = 0;
+static int brf_nfq_iptables_inserted = 0;
+
+static void brf_nfq_cleanup(void)
+{
+	if (brf_nfq_iptables_inserted) {
+		int rc = system("iptables -D OUTPUT -p tcp -j NFQUEUE "
+				"--queue-num 0 2>/dev/null");
+		(void)rc;
+		brf_nfq_iptables_inserted = 0;
+	}
+	if (brf_nfq_fd >= 0) {
+		close(brf_nfq_fd);
+		brf_nfq_fd = -1;
+	}
+}
+
+/* Send one NFQUEUE netlink message and wait for the NLMSG_ERROR ack.
+ * msg_type is e.g. ((NFNL_SUBSYS_QUEUE << 8) | NFQNL_MSG_CONFIG).
+ * res_id is the queue number (in host order; we htons() it here).
+ * attr_payload (if non-NULL) is appended after the nfgenmsg as raw
+ * netlink-attribute bytes the caller has already laid out. */
+static int brf_nfq_send_msg(int fd, uint16_t msg_type, uint16_t res_id,
+			    const void *attr_payload, uint16_t attr_payload_len)
+{
+	char buf[256];
+	struct nlmsghdr *nlh = (struct nlmsghdr *)buf;
+	struct nfgenmsg *nfg = (struct nfgenmsg *)NLMSG_DATA(nlh);
+	char ack_buf[256];
+	ssize_t n;
+
+	if (NLMSG_LENGTH(sizeof(*nfg)) + attr_payload_len > sizeof(buf))
+		return -1;
+	memset(buf, 0, sizeof(buf));
+	nlh->nlmsg_len = NLMSG_LENGTH(sizeof(*nfg));
+	nlh->nlmsg_type = msg_type;
+	nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
+	nlh->nlmsg_seq = (uint32_t)time(NULL);
+	nlh->nlmsg_pid = 0;
+	nfg->nfgen_family = AF_UNSPEC;
+	nfg->version = NFNETLINK_V0;
+	nfg->res_id = htons(res_id);
+	if (attr_payload && attr_payload_len > 0) {
+		memcpy((char *)nlh + NLMSG_ALIGN(nlh->nlmsg_len),
+		       attr_payload, attr_payload_len);
+		nlh->nlmsg_len += attr_payload_len;
+	}
+
+	if (send(fd, buf, nlh->nlmsg_len, 0) < 0)
+		return -1;
+
+	n = recv(fd, ack_buf, sizeof(ack_buf), 0);
+	if (n < 0)
+		return -1;
+	struct nlmsghdr *ack_nlh = (struct nlmsghdr *)ack_buf;
+	if (ack_nlh->nlmsg_type == NLMSG_ERROR) {
+		struct nlmsgerr *err = (struct nlmsgerr *)NLMSG_DATA(ack_nlh);
+		if (err->error != 0) {
+			errno = -err->error;
+			return -1;
+		}
+	}
+	return 0;
+}
+
+/* NFQNL_CFG_CMD_{BIND,UNBIND,PF_BIND,PF_UNBIND} for a given queue. */
+static int brf_nfq_send_config_cmd(int fd, uint16_t queue_num,
+				   uint8_t cmd, uint16_t pf)
+{
+	struct {
+		struct nlattr nla;
+		struct nfqnl_msg_config_cmd cfg;
+	} __attribute__((packed)) payload;
+
+	payload.nla.nla_len = sizeof(payload);
+	payload.nla.nla_type = NFQA_CFG_CMD;
+	payload.cfg.command = cmd;
+	payload.cfg._pad = 0;
+	payload.cfg.pf = htons(pf);
+	return brf_nfq_send_msg(fd,
+		(NFNL_SUBSYS_QUEUE << 8) | NFQNL_MSG_CONFIG,
+		queue_num, &payload, sizeof(payload));
+}
+
+/* NFQA_CFG_PARAMS -- copy mode + range. */
+static int brf_nfq_send_config_params(int fd, uint16_t queue_num,
+				      uint8_t copy_mode, uint32_t copy_range)
+{
+	struct {
+		struct nlattr nla;
+		struct nfqnl_msg_config_params params;
+	} __attribute__((packed)) payload;
+
+	payload.nla.nla_len = sizeof(payload);
+	payload.nla.nla_type = NFQA_CFG_PARAMS;
+	payload.params.copy_mode = copy_mode;
+	payload.params.copy_range = htonl(copy_range);
+	return brf_nfq_send_msg(fd,
+		(NFNL_SUBSYS_QUEUE << 8) | NFQNL_MSG_CONFIG,
+		queue_num, &payload, sizeof(payload));
+}
+
+/* Idempotent setup.  Called lazily from syz_mptcp_join_subflow when a
+ * mutation mode is requested.  Returns 0 on success; on failure leaves
+ * the static state cleaned up so a retry can run.
+ *
+ * Marked unused for C2a: the call site lands in C2c when the mutation
+ * branch in syz_mptcp_join_subflow stops returning -1.  The attribute
+ * is a no-op once the function is referenced. */
+static int brf_mptcp_ensure_nfq_setup(void) __attribute__((unused));
+static int brf_mptcp_ensure_nfq_setup(void)
+{
+	struct sockaddr_nl sa;
+
+	if (brf_nfq_setup_done)
+		return 0;
+
+	brf_nfq_fd = socket(AF_NETLINK, SOCK_RAW, NETLINK_NETFILTER);
+	if (brf_nfq_fd < 0) {
+		debug("nfq_setup: socket(NETLINK_NETFILTER): %s\n",
+		      strerror(errno));
+		return -1;
+	}
+	memset(&sa, 0, sizeof(sa));
+	sa.nl_family = AF_NETLINK;
+	if (bind(brf_nfq_fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
+		debug("nfq_setup: bind: %s\n", strerror(errno));
+		goto fail;
+	}
+
+	/* PF_BIND/PF_UNBIND are no-ops on modern kernels but cheap to
+	 * send; failures here are non-fatal (kernel returns EOPNOTSUPP or
+	 * just acks with 0). */
+	(void)brf_nfq_send_config_cmd(brf_nfq_fd, 0,
+				      NFQNL_CFG_CMD_PF_UNBIND, AF_INET);
+	(void)brf_nfq_send_config_cmd(brf_nfq_fd, 0,
+				      NFQNL_CFG_CMD_PF_BIND, AF_INET);
+
+	if (brf_nfq_send_config_cmd(brf_nfq_fd, BRF_NFQ_QUEUE_NUM,
+				    NFQNL_CFG_CMD_BIND, AF_UNSPEC) < 0) {
+		debug("nfq_setup: CMD_BIND queue %d: %s\n",
+		      BRF_NFQ_QUEUE_NUM, strerror(errno));
+		goto fail;
+	}
+	if (brf_nfq_send_config_params(brf_nfq_fd, BRF_NFQ_QUEUE_NUM,
+				       NFQNL_COPY_PACKET, 0xffff) < 0) {
+		debug("nfq_setup: COPY_PACKET mode: %s\n", strerror(errno));
+		goto fail;
+	}
+
+	/* iptables rule -- catches ALL egress TCP; callback (C2b) filters
+	 * by TCP-option kind + MP_JOIN subtype + option length. */
+	if (system("iptables -I OUTPUT -p tcp -j NFQUEUE --queue-num 0") != 0) {
+		debug("nfq_setup: iptables -I OUTPUT failed "
+		      "(need CAP_NET_ADMIN?)\n");
+		goto fail;
+	}
+	brf_nfq_iptables_inserted = 1;
+	atexit(brf_nfq_cleanup);
+
+	brf_nfq_setup_done = 1;
+	debug("nfq_setup: queue=%d fd=%d iptables installed; mutation "
+	      "worker comes online with C2b\n",
+	      BRF_NFQ_QUEUE_NUM, brf_nfq_fd);
+	return 0;
+
+fail:
+	if (brf_nfq_fd >= 0) {
+		close(brf_nfq_fd);
+		brf_nfq_fd = -1;
+	}
+	return -1;
+}
 
 // Subset of struct mptcp_info we need (mptcpi_token + mptcpi_csum_enabled).
 // We declare our own packed view to avoid pulling in linux/mptcp.h with a
