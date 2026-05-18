@@ -17,7 +17,7 @@
 #ifndef BRF_COMMON_LINUX_MPTCP_H
 #define BRF_COMMON_LINUX_MPTCP_H
 
-#define MPTCP_PAIR_POOL_SIZE         16
+#define MPTCP_PAIR_POOL_SIZE         64
 #define MPTCP_MAX_SUBFLOWS_PER_PAIR  8
 
 // ---------- Flag enum values ----------
@@ -161,7 +161,16 @@ static int brf_nfq_iptables_inserted = 0;
 static volatile int brf_nfq_pending_hmac_mut  = 0;  /* MPTCP_HMAC_NORMAL */
 static volatile int brf_nfq_pending_nonce_mut = 0;  /* MPTCP_NONCE_NORMAL */
 static volatile int brf_nfq_pending_map_mut   = 0;  /* MPTCP_MAP_NORMAL */
-static volatile int brf_nfq_mut_fired         = 0;
+/* v05 multi-pair: per-mutation-type fired flag so concurrent calls of
+ * different kinds (e.g., pair A's hmac_mut + pair B's map_mut) each
+ * fire independently instead of racing on a single mut_fired.  Worker
+ * checks the relevant flag per option type.  brf_nfq_mut_fired remains
+ * as a legacy any-mutation-fired indicator for poll loops that just
+ * want "did anything happen". */
+static volatile int brf_nfq_mut_fired_hmac    = 0;
+static volatile int brf_nfq_mut_fired_nonce   = 0;
+static volatile int brf_nfq_mut_fired_map     = 0;
+static volatile int brf_nfq_mut_fired         = 0;  /* OR of the three */
 static volatile int brf_nfq_worker_stop       = 0;
 static pthread_t    brf_nfq_worker_thread;
 static int          brf_nfq_worker_started   = 0;
@@ -642,13 +651,16 @@ static void *brf_nfq_worker_loop(void *arg)
 			    payload_len >= ip_hlen + (int)sizeof(struct tcphdr)) {
 				tcp = (struct tcphdr *)(payload + ip_hlen);
 				int tcp_hlen = tcp->doff * 4;
-				if (payload_len >= ip_hlen + tcp_hlen &&
-				    !BRF_ATOMIC_LOAD(&brf_nfq_mut_fired)) {
-					/* MP_JOIN ACK egress -- pure ACK
-					 * with kind=30 len=24 subtype=1
-					 * carrying the 20-byte HMAC. */
+				if (payload_len >= ip_hlen + tcp_hlen) {
+					/* v05 multi-pair: each mutation kind
+					 * has its own fired flag, so a pending
+					 * HMAC mutation doesn't get blocked by
+					 * a prior map_mut firing.  Each branch
+					 * checks its own type. */
+					/* MP_JOIN ACK egress (hmac). */
 					if (tcp->ack && !tcp->syn &&
-					    !tcp->fin && !tcp->rst) {
+					    !tcp->fin && !tcp->rst &&
+					    !BRF_ATOMIC_LOAD(&brf_nfq_mut_fired_hmac)) {
 						uint8_t *opt = brf_nfq_find_mp_join_ack(
 							(uint8_t *)tcp, tcp_hlen);
 						int hmac_mut = BRF_ATOMIC_LOAD(
@@ -658,14 +670,15 @@ static void *brf_nfq_worker_loop(void *arg)
 								opt, hmac_mut);
 							applied_mut = hmac_mut;
 							applied_what = "MP_JOIN ACK hmac";
+							BRF_ATOMIC_STORE(
+								&brf_nfq_mut_fired_hmac, 1);
 						}
 					}
-					/* DSS egress (v04 C2) -- any ACK
-					 * packet on an established subflow
-					 * has a kind=30 subtype=2 option. */
+					/* DSS egress (map). */
 					if (!applied_mut &&
 					    tcp->ack && !tcp->syn &&
-					    !tcp->fin && !tcp->rst) {
+					    !tcp->fin && !tcp->rst &&
+					    !BRF_ATOMIC_LOAD(&brf_nfq_mut_fired_map)) {
 						uint8_t *opt = brf_nfq_find_dss_option(
 							(uint8_t *)tcp, tcp_hlen);
 						int map_mut = BRF_ATOMIC_LOAD(
@@ -675,14 +688,14 @@ static void *brf_nfq_worker_loop(void *arg)
 								opt, map_mut);
 							applied_mut = map_mut;
 							applied_what = "DSS map";
+							BRF_ATOMIC_STORE(
+								&brf_nfq_mut_fired_map, 1);
 						}
 					}
-					/* MP_JOIN SYN egress -- pure SYN
-					 * with kind=30 len=12 subtype=1
-					 * carrying token + 4-byte client
-					 * nonce. */
+					/* MP_JOIN SYN egress (nonce). */
 					else if (tcp->syn && !tcp->ack &&
-						 !tcp->fin && !tcp->rst) {
+						 !tcp->fin && !tcp->rst &&
+						 !BRF_ATOMIC_LOAD(&brf_nfq_mut_fired_nonce)) {
 						uint8_t *opt = brf_nfq_find_mp_join_syn(
 							(uint8_t *)tcp, tcp_hlen);
 						int nonce_mut = BRF_ATOMIC_LOAD(
@@ -692,6 +705,8 @@ static void *brf_nfq_worker_loop(void *arg)
 								opt, nonce_mut);
 							applied_mut = nonce_mut;
 							applied_what = "MP_JOIN SYN nonce";
+							BRF_ATOMIC_STORE(
+								&brf_nfq_mut_fired_nonce, 1);
 						}
 					}
 				}
@@ -700,6 +715,8 @@ static void *brf_nfq_worker_loop(void *arg)
 
 		if (applied_mut != 0) {
 			brf_nfq_tcp_compute_checksum_ipv4(tcp, ip);
+			/* legacy mut_fired = OR of types; consumers that
+			 * just want "did anything fire" still work. */
 			BRF_ATOMIC_STORE(&brf_nfq_mut_fired, 1);
 			debug("nfq_worker: applied %s mut=%d\n",
 			      applied_what, applied_mut);
@@ -1488,7 +1505,15 @@ static long syz_mptcp_join_subflow(volatile long a0, volatile long a1,
 	    nonce_mut != MPTCP_NONCE_NORMAL) {
 		if (brf_mptcp_ensure_nfq_setup() < 0)
 			return -1;
+		/* v05 multi-pair: reset only the per-type fired flags we
+		 * care about so a concurrent drive_traffic's pending
+		 * map_mut isn't disturbed.  Legacy mut_fired still gets
+		 * reset for poll-loop backwards compat. */
 		BRF_ATOMIC_STORE(&brf_nfq_mut_fired, 0);
+		if (hmac_mut != MPTCP_HMAC_NORMAL)
+			BRF_ATOMIC_STORE(&brf_nfq_mut_fired_hmac, 0);
+		if (nonce_mut != MPTCP_NONCE_NORMAL)
+			BRF_ATOMIC_STORE(&brf_nfq_mut_fired_nonce, 0);
 		BRF_ATOMIC_STORE(&brf_nfq_pending_hmac_mut, hmac_mut);
 		BRF_ATOMIC_STORE(&brf_nfq_pending_nonce_mut, nonce_mut);
 	}
@@ -1646,11 +1671,15 @@ static long syz_mptcp_drive_traffic(volatile long a0, volatile long a1,
 
 	/* v04 C2: route map_mut through the NFQUEUE worker shared with
 	 * v02 (HMAC/nonce).  Worker rewrites the DSS option bytes of the
-	 * first egress data ACK that carries one. */
+	 * first egress data ACK that carries one.
+	 *
+	 * v05 multi-pair: only reset the map per-type fired flag so a
+	 * concurrent join_subflow's pending hmac/nonce isn't disturbed. */
 	if (map_mut != MPTCP_MAP_NORMAL) {
 		if (brf_mptcp_ensure_nfq_setup() < 0)
 			return -1;
 		BRF_ATOMIC_STORE(&brf_nfq_mut_fired, 0);
+		BRF_ATOMIC_STORE(&brf_nfq_mut_fired_map, 0);
 		BRF_ATOMIC_STORE(&brf_nfq_pending_map_mut, map_mut);
 	}
 
