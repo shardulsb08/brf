@@ -160,6 +160,7 @@ static int brf_nfq_iptables_inserted = 0;
  * atomic_int has different semantics; __atomic_* works in both. */
 static volatile int brf_nfq_pending_hmac_mut  = 0;  /* MPTCP_HMAC_NORMAL */
 static volatile int brf_nfq_pending_nonce_mut = 0;  /* MPTCP_NONCE_NORMAL */
+static volatile int brf_nfq_pending_map_mut   = 0;  /* MPTCP_MAP_NORMAL */
 static volatile int brf_nfq_mut_fired         = 0;
 static volatile int brf_nfq_worker_stop       = 0;
 static pthread_t    brf_nfq_worker_thread;
@@ -426,6 +427,92 @@ static inline uint8_t *brf_nfq_find_mp_join_syn(uint8_t *tcp_seg, int tcp_hlen)
 	return brf_nfq_find_mp_join_option(tcp_seg, tcp_hlen, 12);
 }
 
+/* Find DSS option (kind=30, subtype=2).  Variable length depending on
+ * flags m/M/a/A in option byte 3:
+ *   - A=1: includes a DSN_ACK (4 bytes if a=0, 8 bytes if a=1)
+ *   - M=1: includes a mapping (4-byte DSN if m=0 / 8-byte DSN if m=1,
+ *          + 4-byte subflow seq + 2-byte length + optional 2-byte csum)
+ * For mutation we don't need to fully parse, just locate the option. */
+static uint8_t *brf_nfq_find_dss_option(uint8_t *tcp_seg, int tcp_hlen)
+{
+	int optlen = tcp_hlen - (int)sizeof(struct tcphdr);
+	uint8_t *opts = tcp_seg + sizeof(struct tcphdr);
+	int i = 0;
+	while (i < optlen) {
+		uint8_t kind = opts[i];
+		if (kind == 0)
+			break;
+		if (kind == 1) {
+			i++;
+			continue;
+		}
+		if (i + 1 >= optlen)
+			break;
+		uint8_t len = opts[i + 1];
+		if (len < 2 || i + len > optlen)
+			break;
+		/* DSS: kind=30, subtype=2 in high nibble of byte 2 */
+		if (kind == 30 && len >= 4 &&
+		    (opts[i + 2] >> 4) == 2)
+			return &opts[i];
+		i += len;
+	}
+	return NULL;
+}
+
+/* Apply DSS mutation.  DSS option layout (RFC 8684 Section 3.3) is
+ * variable -- depends on flag bits in opt[3] (m, M, a, A).  Rather
+ * than parse the variant, mutate at offsets that are present in the
+ * common variants; depending on actual flags this hits either the
+ * DSN_ACK or the DSN mapping or the subflow_seq field.  All variants
+ * exercise the parser in net/mptcp/options.c either way. */
+static void brf_nfq_apply_map_mut(uint8_t *opt, int mut_type)
+{
+	uint8_t opt_len = opt[1];
+
+	switch (mut_type) {
+	case MPTCP_MAP_STALE_SEQ:
+		/* Subtract 0x1000 from the first 32-bit field after the
+		 * option header.  Hits DSN_ACK if A=1, else DSN. */
+		if (opt_len >= 8) {
+			uint32_t v;
+			memcpy(&v, opt + 4, 4);
+			v = htonl(ntohl(v) - 0x1000);
+			memcpy(opt + 4, &v, 4);
+		}
+		break;
+	case MPTCP_MAP_OFF_BY_ONE:
+		/* Add 1 to the first 32-bit field.  Subtle: trips
+		 * out-of-order / sequence-boundary code. */
+		if (opt_len >= 8) {
+			uint32_t v;
+			memcpy(&v, opt + 4, 4);
+			v = htonl(ntohl(v) + 1);
+			memcpy(opt + 4, &v, 4);
+		}
+		break;
+	case MPTCP_MAP_INFINITE:
+		/* Set M=1 in opt[3] (mapping present flag).  If the packet
+		 * didn't have a mapping before, this confuses the parser
+		 * into expecting one. */
+		opt[3] |= 0x40;
+		break;
+	case MPTCP_MAP_HOLE:
+		/* Mutate subflow_seq (usually at offset 8 when both M=1
+		 * and a=0,A=1 -- common case).  Subtract 0x100 to create
+		 * an apparent sequence gap. */
+		if (opt_len >= 12) {
+			uint32_t v;
+			memcpy(&v, opt + 8, 4);
+			v = htonl(ntohl(v) - 0x100);
+			memcpy(opt + 8, &v, 4);
+		}
+		break;
+	default:
+		break;
+	}
+}
+
 /* Apply HMAC mutation to MP_JOIN ACK option bytes.  Option offset 4
  * starts the 20-byte HMAC field. */
 static void brf_nfq_apply_hmac_mut(uint8_t *opt, int mut_type)
@@ -571,6 +658,23 @@ static void *brf_nfq_worker_loop(void *arg)
 								opt, hmac_mut);
 							applied_mut = hmac_mut;
 							applied_what = "MP_JOIN ACK hmac";
+						}
+					}
+					/* DSS egress (v04 C2) -- any ACK
+					 * packet on an established subflow
+					 * has a kind=30 subtype=2 option. */
+					if (!applied_mut &&
+					    tcp->ack && !tcp->syn &&
+					    !tcp->fin && !tcp->rst) {
+						uint8_t *opt = brf_nfq_find_dss_option(
+							(uint8_t *)tcp, tcp_hlen);
+						int map_mut = BRF_ATOMIC_LOAD(
+						    &brf_nfq_pending_map_mut);
+						if (opt && map_mut != MPTCP_MAP_NORMAL) {
+							brf_nfq_apply_map_mut(
+								opt, map_mut);
+							applied_mut = map_mut;
+							applied_what = "DSS map";
 						}
 					}
 					/* MP_JOIN SYN egress -- pure SYN
@@ -1512,10 +1616,13 @@ static long syz_mptcp_join_subflow(volatile long a0, volatile long a1,
  * iteration can write directly on pair->subflows[subflow_id].tcp_subflow_fd
  * for per-subflow steering, at the cost of bypassing the MPTCP layer.
  *
- * map_mut != NORMAL is reserved for v04 C2 (NFQUEUE worker rewrites the DSS
- * option bytes in flight, similar to v02 C2/C3 for HMAC/nonce); rejected
- * here with -1 so the fuzzer's corpus still has the surface but doesn't
- * silently no-op on unimplemented modes.
+ * map_mut != NORMAL is routed through the NFQUEUE worker shared with v02
+ * (HMAC/nonce).  Worker rewrites the DSS option bytes of the first egress
+ * data ACK that carries one.  Mutation kinds: STALE_SEQ / OFF_BY_ONE
+ * (modify the first 32-bit field after option header, which is DSN_ACK
+ * or DSN depending on flags), INFINITE (set M=1 flag), HOLE (mutate
+ * subflow_seq).  Exercises mptcp_incoming_options DSS parsing edge
+ * cases.
  *
  * Bounded send (4096 bytes max) + best-effort drain on server side so a
  * pathological prog can't wedge the pair's TX buffer for the rest of the
@@ -1537,10 +1644,14 @@ static long syz_mptcp_drive_traffic(volatile long a0, volatile long a1,
 
 	(void)a1;	/* subflow_id -- informational in v04 C1 */
 
+	/* v04 C2: route map_mut through the NFQUEUE worker shared with
+	 * v02 (HMAC/nonce).  Worker rewrites the DSS option bytes of the
+	 * first egress data ACK that carries one. */
 	if (map_mut != MPTCP_MAP_NORMAL) {
-		debug("syz_mptcp_drive_traffic: map_mut=%u not implemented "
-		      "(planned for v04 C2)\n", map_mut);
-		return -1;
+		if (brf_mptcp_ensure_nfq_setup() < 0)
+			return -1;
+		BRF_ATOMIC_STORE(&brf_nfq_mut_fired, 0);
+		BRF_ATOMIC_STORE(&brf_nfq_pending_map_mut, map_mut);
 	}
 
 	if (slot < 0 || slot >= MPTCP_PAIR_POOL_SIZE) {
@@ -1582,7 +1693,13 @@ static long syz_mptcp_drive_traffic(volatile long a0, volatile long a1,
 	}
 
 	debug("syz_mptcp_drive_traffic: slot=%ld sent=%zd drained=%zd "
-	      "data_len=%zu\n", slot, sent, total_drained, data_len);
+	      "data_len=%zu map_mut=%u mut_fired=%d\n",
+	      slot, sent, total_drained, data_len, map_mut,
+	      BRF_ATOMIC_LOAD(&brf_nfq_mut_fired));
+	/* Clear pending mutation so the next prog's drive_traffic without
+	 * map_mut doesn't accidentally mutate a stale packet. */
+	if (map_mut != MPTCP_MAP_NORMAL)
+		BRF_ATOMIC_STORE(&brf_nfq_pending_map_mut, 0);
 	return sent >= 0 ? sent : 0;
 }
 #endif
