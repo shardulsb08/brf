@@ -572,6 +572,16 @@ static void brf_nfq_apply_hmac_mut(uint8_t *opt, int mut_type)
 	}
 }
 
+/* Rotating prior-nonce buffer for MPTCP_NONCE_REPLAY (v05.2).
+ * Initialized to a sentinel; each REPLAY mutation overwrites the
+ * outgoing SYN's nonce with this saved value AND saves the original
+ * nonce as the next round's replay target.  Effect: each REPLAY
+ * cycle injects a stale nonce + carries forward the current one.
+ * Tests the kernel's nonce-uniqueness assumptions across MP_JOIN
+ * attempts on the same token (mptcp_token_join_request and
+ * subflow_token_join_request paths). */
+static uint8_t brf_nfq_replay_nonce[4] = {0xde, 0xad, 0xbe, 0xef};
+
 /* Apply nonce mutation to MP_JOIN SYN option bytes.  Option layout:
  *   byte 0:  Kind = 30
  *   byte 1:  Length = 12
@@ -598,9 +608,17 @@ static void brf_nfq_apply_nonce_mut(uint8_t *opt, int mut_type)
 	case MPTCP_NONCE_FLIP_LOW:
 		opt[11] ^= 0x01;
 		break;
-	/* NONCE_REPLAY needs stored prior-session nonce state; not
-	 * implemented in C3.  Trivially adds in v03 by stashing the
-	 * nonce from a previous mutation cycle in a static buffer. */
+	case MPTCP_NONCE_REPLAY: {
+		/* Swap the SYN's current nonce with the saved one --
+		 * inject the saved nonce, then save the (just-replaced)
+		 * current nonce as the next REPLAY target.  Creates a
+		 * carry-forward chain across calls. */
+		uint8_t tmp[4];
+		memcpy(tmp, &opt[8], 4);
+		memcpy(&opt[8], brf_nfq_replay_nonce, 4);
+		memcpy(brf_nfq_replay_nonce, tmp, 4);
+		break;
+	}
 	default:
 		break;
 	}
