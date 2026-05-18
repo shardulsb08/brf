@@ -1705,12 +1705,114 @@ static long syz_mptcp_drive_traffic(volatile long a0, volatile long a1,
 #endif
 
 #if SYZ_EXECUTOR || __NR_syz_mptcp_send_control
+/*
+ * v04 C3: emit an MPTCP control event by closing the chosen socket with
+ * the mechanism that triggers the requested kind of control packet.
+ * The kernel does all the wire-side work -- we just pick which fd to
+ * close and how.
+ *
+ *   suboption == MPTCP_CTL_RST       -> SO_LINGER timeout=0 + close()
+ *                                       => RST on wire (kernel adds
+ *                                          MP_RST option if subflow is
+ *                                          still in MPTCP state).
+ *                                          Exercises subflow_reset,
+ *                                          mptcp_subflow_drop_ctx,
+ *                                          mptcp_pm_subflow_check_next.
+ *   suboption == MPTCP_CTL_FASTCLOSE -> shutdown(SHUT_RDWR) + close()
+ *                                       => graceful close, MPTCP emits
+ *                                          MP_FASTCLOSE if there's
+ *                                          unacked data or in specific
+ *                                          state.  Exercises
+ *                                          mptcp_do_fastclose,
+ *                                          __mptcp_destroy_sock cleanup
+ *                                          path, mptcp_close_wake_up.
+ *   suboption == MPTCP_CTL_FAIL      -> close() only
+ *                                       => normal FIN exchange.
+ *                                          Exercises mptcp_shutdown,
+ *                                          mptcp_check_send_data_fin,
+ *                                          mptcp_close_ssk.
+ *
+ * subflow_id selects which fd to close:
+ *   subflow_id <= 0 or out of range  -> client_msk_fd (whole MPTCP
+ *                                       connection from client side)
+ *   subflow_id in [0, subflow_count) -> that subflow's tcp_subflow_fd
+ *                                       (tears down just the subflow,
+ *                                        leaving the main connection)
+ *
+ * After close, the corresponding fd in pair state is set to -1 so the
+ * subsequent pair_close() doesn't double-close.  These close paths are
+ * historically the most bug-fertile area of MPTCP (every recent CVE
+ * has touched mptcp_close / __mptcp_destroy_sock / mptcp_do_fastclose).
+ */
 static long syz_mptcp_send_control(volatile long a0, volatile long a1,
 				   volatile long a2)
 {
-	// a0: pair, a1: subflow_id, a2: suboption
-	debug("syz_mptcp_send_control: not implemented (v0 skeleton)\n");
-	return -1;
+	struct brf_mptcp_pair_state *pair;
+	long slot = a0;
+	int subflow_id = (int)a1;
+	uint8_t suboption = (uint8_t)a2;
+	int fd = -1;
+	struct linger ling;
+	const char *target_name;
+
+	if (slot < 0 || slot >= MPTCP_PAIR_POOL_SIZE) {
+		debug("syz_mptcp_send_control: slot %ld out of range\n", slot);
+		return -1;
+	}
+	pair = &brf_mptcp_pair_pool[slot];
+	if (!pair->in_use) {
+		debug("syz_mptcp_send_control: slot %ld not in use\n", slot);
+		return -1;
+	}
+
+	if (subflow_id <= 0 || subflow_id >= pair->subflow_count) {
+		fd = pair->client_msk_fd;
+		target_name = "client_msk";
+	} else {
+		fd = pair->subflows[subflow_id].tcp_subflow_fd;
+		target_name = "subflow_tcp";
+	}
+
+	if (fd < 0) {
+		debug("syz_mptcp_send_control: slot=%ld subflow_id=%d "
+		      "target=%s already closed\n",
+		      slot, subflow_id, target_name);
+		return -1;
+	}
+
+	switch (suboption) {
+	case MPTCP_CTL_RST:
+		ling.l_onoff = 1;
+		ling.l_linger = 0;
+		setsockopt(fd, SOL_SOCKET, SO_LINGER, &ling, sizeof(ling));
+		close(fd);
+		break;
+	case MPTCP_CTL_FASTCLOSE:
+		shutdown(fd, SHUT_RDWR);
+		close(fd);
+		break;
+	case MPTCP_CTL_FAIL:
+		close(fd);
+		break;
+	default:
+		debug("syz_mptcp_send_control: unknown suboption=%u\n",
+		      suboption);
+		return -1;
+	}
+
+	/* Mark fd closed so pair_close / drive_traffic don't operate on
+	 * a recycled fd. */
+	if (subflow_id <= 0 || subflow_id >= pair->subflow_count) {
+		pair->client_msk_fd = -1;
+	} else {
+		pair->subflows[subflow_id].tcp_subflow_fd = -1;
+		pair->subflows[subflow_id].established = false;
+	}
+
+	debug("syz_mptcp_send_control: slot=%ld subflow_id=%d target=%s "
+	      "suboption=%u closed\n",
+	      slot, subflow_id, target_name, suboption);
+	return 0;
 }
 #endif
 
