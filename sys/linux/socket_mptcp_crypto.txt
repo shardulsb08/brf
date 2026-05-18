@@ -22,7 +22,7 @@ resource mptcp_pair[intptr]
 
 # syz_mptcp_pair_init: create server + client pair, complete MP_CAPABLE,
 # capture cryptographic state.  See design doc Section 5.1.
-syz_mptcp_pair_init(server_addr ptr[in, sockaddr_storage], client_addr ptr[in, sockaddr_storage], init_flags flags[mptcp_init_flags], out_state ptr[out, mptcp_pair_state_t]) mptcp_pair
+syz_mptcp_pair_init(server_addr ptr[in, int32], client_addr ptr[in, int32], init_flags flags[mptcp_init_flags], out_state ptr[out, mptcp_pair_state_t]) mptcp_pair
 
 # syz_mptcp_join_subflow: initiate MP_JOIN with valid token + HMAC.
 # nonce_mut / hmac_mut: rewrite the just-generated/computed bytes after.
@@ -39,6 +39,10 @@ syz_mptcp_send_control(pair mptcp_pair, subflow_id int32, suboption flags[mptcp_
 # Explicit close required because mptcp_pair is an intptr (not an fd),
 # so syzkaller resource lifecycle cannot free pool slots automatically.
 syz_mptcp_pair_close(pair mptcp_pair)
+
+# syz_mptcp_pm_announce: trigger kernel to emit ADD_ADDR option on
+# wire.  Exercises path-manager add-addr emit + peer-side parse paths.
+syz_mptcp_pm_announce(pair mptcp_pair, addr_id int8, addr int32be, port int16)
 
 # Out-param struct.  Mirrors `struct brf_mptcp_pair_state_out` in
 # executor/common_brf_linux_mptcp.h.  Field order and sizes must
