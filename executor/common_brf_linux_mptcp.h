@@ -533,9 +533,40 @@ static void brf_nfq_apply_hmac_mut(uint8_t *opt, int mut_type)
 	case MPTCP_HMAC_ZERO:
 		memset(&opt[4], 0, 20);
 		break;
-	/* HMAC_TRUNCATE / HMAC_SWAP land in a later commit -- they
-	 * change the option length which requires resizing the TCP
-	 * header, more involved than a same-size byte rewrite. */
+	case MPTCP_HMAC_TRUNCATE: {
+		/* Shorten the option from 24 bytes to 12, pad the rest of
+		 * the original option slot with TCPOPT_NOP (kind=1, single
+		 * byte each) so total TCP option length stays unchanged --
+		 * required for TCP header layout consistency.
+		 *
+		 * Effect on parser: the truncated MP_JOIN ACK looks like
+		 * an MP_JOIN SYN by length (12 = SYN length) but still
+		 * carries subtype=1, with the HMAC bytes gone.  Server's
+		 * check_fully_established path hits length-mismatch and
+		 * subtype-vs-length validation code that the fixed-length
+		 * mutations never reach.  Bug-fertile because the
+		 * length/subtype invariants are checked in multiple
+		 * places. */
+		opt[1] = 12;
+		for (int i = 12; i < 24; i++)
+			opt[i] = 1;	/* TCPOPT_NOP */
+		break;
+	}
+	case MPTCP_HMAC_SWAP: {
+		/* Swap the two halves of the 20-byte HMAC.  Same length,
+		 * so no TCP option resizing.  HMAC validation fails for
+		 * the same reason as BIT_FLIP, but the byte pattern is
+		 * structurally different (two contiguous valid-looking
+		 * 8-byte runs swapped) -- exercises any kernel code that
+		 * looks at the HMAC bytes beyond just "compare full
+		 * digest".  Note: HMAC is 20 bytes so the two halves are
+		 * unequal; swap [4..13] with [14..23] = 10-byte swap. */
+		uint8_t tmp[10];
+		memcpy(tmp, &opt[4], 10);
+		memcpy(&opt[4], &opt[14], 10);
+		memcpy(&opt[14], tmp, 10);
+		break;
+	}
 	default:
 		break;
 	}
