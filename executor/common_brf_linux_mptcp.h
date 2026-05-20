@@ -1865,6 +1865,91 @@ static int brf_mptcp_genl_set_flags(uint32_t token, uint8_t addr_id,
 #undef BRF_PUT_ATTR
 }
 
+/* MPTCP_PM_CMD_ADD_ADDR (kernel PM): register a netns-scoped address
+ * in pernet->local_addr_list.  No TOKEN -- operates per-netns, not
+ * per-msk.  Used by the v06.2 pseudo-syscall
+ * syz_mptcp_pm_kernel_add_addr to exercise the kernel-PM address-
+ * table code surface (pm_kernel.c) which is entirely separate from
+ * the userspace-PM address tracking the v05.x pseudo-syscalls touch.
+ *
+ * Attrs: nested ADDR with (FAMILY, ID, ADDR4, PORT, optional FLAGS).
+ */
+static int brf_mptcp_genl_kernel_add_addr(uint8_t addr_id,
+					  uint32_t addr_be, uint16_t port_h,
+					  uint32_t addr_flags)
+{
+	char buf[256];
+	struct nlmsghdr *nlh = (struct nlmsghdr *)buf;
+	struct genlmsghdr *ghdr;
+	struct nlattr *attr, *nest;
+	char *p;
+	ssize_t n;
+#define BRF_PUT_ATTR(typ, src, sz) do {				\
+		attr = (struct nlattr *)p;			\
+		attr->nla_type = (typ);				\
+		attr->nla_len  = NLA_HDRLEN + (sz);		\
+		memcpy((char *)attr + NLA_HDRLEN, (src), (sz));	\
+		p += NLA_ALIGN(attr->nla_len);			\
+	} while (0)
+
+	memset(buf, 0, sizeof(buf));
+	nlh->nlmsg_type  = brf_mptcp_pm_family_id;
+	nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
+	nlh->nlmsg_seq   = 7;
+	nlh->nlmsg_pid   = 0;
+	ghdr = (struct genlmsghdr *)NLMSG_DATA(nlh);
+	ghdr->cmd     = MPTCP_PM_CMD_ADD_ADDR;
+	ghdr->version = MPTCP_PM_VER;
+
+	p = (char *)NLMSG_DATA(nlh) + NLMSG_ALIGN(sizeof(*ghdr));
+
+	{
+		uint16_t fam_v = AF_INET;
+		nest = (struct nlattr *)p;
+		nest->nla_type = MPTCP_PM_ATTR_ADDR | NLA_F_NESTED;
+		p += NLA_HDRLEN;
+		BRF_PUT_ATTR(MPTCP_PM_ADDR_ATTR_FAMILY, &fam_v, sizeof(fam_v));
+		BRF_PUT_ATTR(MPTCP_PM_ADDR_ATTR_ID, &addr_id, sizeof(addr_id));
+		BRF_PUT_ATTR(MPTCP_PM_ADDR_ATTR_ADDR4, &addr_be,
+			     sizeof(addr_be));
+		BRF_PUT_ATTR(MPTCP_PM_ADDR_ATTR_PORT, &port_h, sizeof(port_h));
+		if (addr_flags)
+			BRF_PUT_ATTR(MPTCP_PM_ADDR_ATTR_FLAGS, &addr_flags,
+				     sizeof(addr_flags));
+		nest->nla_len = p - (char *)nest;
+	}
+
+	nlh->nlmsg_len = p - buf;
+
+	if (send(brf_mptcp_genl_sock, buf, nlh->nlmsg_len, 0) < 0) {
+		debug("pm_kernel_add_addr: send: %s\n", strerror(errno));
+		return -1;
+	}
+	n = recv(brf_mptcp_genl_sock, buf, sizeof(buf), 0);
+	if (n < 0) {
+		debug("pm_kernel_add_addr: recv: %s\n", strerror(errno));
+		return -1;
+	}
+	nlh = (struct nlmsghdr *)buf;
+	if (nlh->nlmsg_type != NLMSG_ERROR) {
+		debug("pm_kernel_add_addr: unexpected ack type %u\n",
+		      nlh->nlmsg_type);
+		errno = EPROTO;
+		return -1;
+	}
+	{
+		struct nlmsgerr *ne = (struct nlmsgerr *)NLMSG_DATA(nlh);
+		if (ne->error) {
+			debug("pm_kernel_add_addr: kernel err=%d (%s)\n",
+			      ne->error, strerror(-ne->error));
+			errno = -ne->error;
+			return -1;
+		}
+	}
+	return 0;
+#undef BRF_PUT_ATTR
+}
+
 static long syz_mptcp_join_subflow(volatile long a0, volatile long a1,
 				   volatile long a2, volatile long a3,
 				   volatile long a4)
@@ -2490,6 +2575,40 @@ static long syz_mptcp_pm_set_flags(volatile long a0, volatile long a1,
 
 	debug("syz_mptcp_pm_set_flags: slot=%ld id=%u flags=0x%x "
 	      "port=%u set\n", slot, addr_id, addr_flags, port_h);
+	return 0;
+}
+#endif
+
+#if SYZ_EXECUTOR || __NR_syz_mptcp_pm_kernel_add_addr
+/*
+ * v06.2: register a netns-scoped address in the kernel PM's
+ * pernet->local_addr_list via MPTCP_PM_CMD_ADD_ADDR.  Exercises
+ * pm_kernel.c surface (id-allocation bitmap, pernet locking,
+ * address-entry kmalloc) that the v05.x pseudo-syscalls do not
+ * touch.  Per-netns (no msk / pair argument).
+ */
+static long syz_mptcp_pm_kernel_add_addr(volatile long a0, volatile long a1,
+					 volatile long a2, volatile long a3)
+{
+	uint8_t addr_id = (uint8_t)a0;
+	uint32_t addr_be = (uint32_t)a1;
+	uint16_t port_h = (uint16_t)a2;
+	uint32_t addr_flags = (uint32_t)a3;
+
+	if (brf_mptcp_ensure_executor_setup() < 0)
+		return -1;
+
+	if (brf_mptcp_genl_kernel_add_addr(addr_id, addr_be, port_h,
+					   addr_flags) < 0) {
+		debug("syz_mptcp_pm_kernel_add_addr: id=%u addr=0x%08x "
+		      "port=%u flags=0x%x failed\n",
+		      addr_id, ntohl(addr_be), port_h, addr_flags);
+		return -1;
+	}
+
+	debug("syz_mptcp_pm_kernel_add_addr: id=%u addr=0x%08x port=%u "
+	      "flags=0x%x added\n",
+	      addr_id, ntohl(addr_be), port_h, addr_flags);
 	return 0;
 }
 #endif

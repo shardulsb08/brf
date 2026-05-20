@@ -74,6 +74,14 @@ syz_mptcp_pm_subflow_destroy(pair mptcp_pair, addr_id int8, local_port int16, re
 # emission path that sends backup-flag transitions on live subflows.
 syz_mptcp_pm_set_flags(pair mptcp_pair, addr_id int8, addr_flags int32, port int16)
 
+# syz_mptcp_pm_kernel_add_addr: register an address in the kernel PM's
+# per-netns address table via MPTCP_PM_CMD_ADD_ADDR.  Netns-scoped (no
+# msk / token required); operates on pernet->local_addr_list in
+# pm_kernel.c.  The table state is real regardless of pm_type; kernel
+# ID-allocation bitmap and locking are exercised.  Sibling of v06.3
+# del_addr and v06.4 flush_addrs.
+syz_mptcp_pm_kernel_add_addr(addr_id int8, addr int32be, port int16, addr_flags int32)
+
 # Out-param struct.  Mirrors `struct brf_mptcp_pair_state_out` in
 # executor/common_brf_linux_mptcp.h.  Field order and sizes must
 # match exactly.
