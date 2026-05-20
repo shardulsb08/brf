@@ -2076,6 +2076,72 @@ static int brf_mptcp_genl_kernel_flush_addrs(void)
 	return 0;
 }
 
+/* MPTCP_PM_CMD_SET_LIMITS (kernel PM): set per-netns limits on
+ * accepted ADD_ADDRs and on extra subflows.  Attrs: RCV_ADD_ADDRS
+ * (u32) + SUBFLOWS (u32).  Used by v06.5 syz_mptcp_pm_set_limits.
+ */
+static int brf_mptcp_genl_set_limits(uint32_t rcv_add_addrs,
+				     uint32_t subflows)
+{
+	char buf[128];
+	struct nlmsghdr *nlh = (struct nlmsghdr *)buf;
+	struct genlmsghdr *ghdr;
+	struct nlattr *attr;
+	char *p;
+	ssize_t n;
+#define BRF_PUT_ATTR(typ, src, sz) do {				\
+		attr = (struct nlattr *)p;			\
+		attr->nla_type = (typ);				\
+		attr->nla_len  = NLA_HDRLEN + (sz);		\
+		memcpy((char *)attr + NLA_HDRLEN, (src), (sz));	\
+		p += NLA_ALIGN(attr->nla_len);			\
+	} while (0)
+
+	memset(buf, 0, sizeof(buf));
+	nlh->nlmsg_type  = brf_mptcp_pm_family_id;
+	nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
+	nlh->nlmsg_seq   = 10;
+	nlh->nlmsg_pid   = 0;
+	ghdr = (struct genlmsghdr *)NLMSG_DATA(nlh);
+	ghdr->cmd     = MPTCP_PM_CMD_SET_LIMITS;
+	ghdr->version = MPTCP_PM_VER;
+
+	p = (char *)NLMSG_DATA(nlh) + NLMSG_ALIGN(sizeof(*ghdr));
+	BRF_PUT_ATTR(MPTCP_PM_ATTR_RCV_ADD_ADDRS, &rcv_add_addrs,
+		     sizeof(rcv_add_addrs));
+	BRF_PUT_ATTR(MPTCP_PM_ATTR_SUBFLOWS, &subflows, sizeof(subflows));
+
+	nlh->nlmsg_len = p - buf;
+
+	if (send(brf_mptcp_genl_sock, buf, nlh->nlmsg_len, 0) < 0) {
+		debug("pm_set_limits: send: %s\n", strerror(errno));
+		return -1;
+	}
+	n = recv(brf_mptcp_genl_sock, buf, sizeof(buf), 0);
+	if (n < 0) {
+		debug("pm_set_limits: recv: %s\n", strerror(errno));
+		return -1;
+	}
+	nlh = (struct nlmsghdr *)buf;
+	if (nlh->nlmsg_type != NLMSG_ERROR) {
+		debug("pm_set_limits: unexpected ack type %u\n",
+		      nlh->nlmsg_type);
+		errno = EPROTO;
+		return -1;
+	}
+	{
+		struct nlmsgerr *ne = (struct nlmsgerr *)NLMSG_DATA(nlh);
+		if (ne->error) {
+			debug("pm_set_limits: kernel err=%d (%s)\n",
+			      ne->error, strerror(-ne->error));
+			errno = -ne->error;
+			return -1;
+		}
+	}
+	return 0;
+#undef BRF_PUT_ATTR
+}
+
 static long syz_mptcp_join_subflow(volatile long a0, volatile long a1,
 				   volatile long a2, volatile long a3,
 				   volatile long a4)
@@ -2789,6 +2855,31 @@ static long syz_mptcp_pm_kernel_flush_addrs(void)
 	}
 
 	debug("syz_mptcp_pm_kernel_flush_addrs: addrs flushed\n");
+	return 0;
+}
+#endif
+
+#if SYZ_EXECUTOR || __NR_syz_mptcp_pm_set_limits
+/*
+ * v06.5: set the kernel PM's per-netns limit_add_addr_accepted and
+ * limit_extra_subflows.  Exercises mptcp_pm_nl_set_limits_doit and
+ * the downstream readers that consult these values when accepting
+ * remote ADD_ADDRs / additional subflows.
+ */
+static long syz_mptcp_pm_set_limits(volatile long a0, volatile long a1)
+{
+	uint32_t rcv_add_addrs = (uint32_t)a0;
+	uint32_t subflows = (uint32_t)a1;
+
+	if (brf_mptcp_ensure_executor_setup() < 0)
+		return -1;
+	if (brf_mptcp_genl_set_limits(rcv_add_addrs, subflows) < 0) {
+		debug("syz_mptcp_pm_set_limits: rcv=%u sf=%u failed\n",
+		      rcv_add_addrs, subflows);
+		return -1;
+	}
+	debug("syz_mptcp_pm_set_limits: rcv=%u sf=%u set\n",
+	      rcv_add_addrs, subflows);
 	return 0;
 }
 #endif

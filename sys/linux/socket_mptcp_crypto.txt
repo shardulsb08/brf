@@ -100,6 +100,12 @@ syz_mptcp_pm_kernel_del_addr(addr_id int8)
 # the bulk-vs-incremental race surface.
 syz_mptcp_pm_kernel_flush_addrs()
 
+# syz_mptcp_pm_set_limits: per-netns limits on accepted ADD_ADDRs and
+# on extra subflows allowed by the kernel PM.  Two u32 attrs.  Exercises
+# mptcp_pm_nl_set_limits_doit (pm_kernel.c) and the WRITE_ONCE-guarded
+# limit fields that downstream subflow-accept paths read.
+syz_mptcp_pm_set_limits(rcv_add_addrs int32, subflows int32)
+
 # Out-param struct.  Mirrors `struct brf_mptcp_pair_state_out` in
 # executor/common_brf_linux_mptcp.h.  Field order and sizes must
 # match exactly.
