@@ -2981,4 +2981,52 @@ static long syz_mptcp_diag(volatile long a0, volatile long a1,
 }
 #endif
 
+#if SYZ_EXECUTOR || __NR_syz_mptcp_setsockopt_fuzz
+/*
+ * v08: setsockopt on SOL_MPTCP with fuzzer-controlled optname and
+ * payload.  Exercises net/mptcp/sockopt.c validation branches for
+ * optnames the targeted pseudo-syscalls don't reach (MPTCP_FULL_INFO,
+ * MPTCP_TCPINFO, MPTCP_SUBFLOW_ADDRS, MPTCP_CHKSUM, etc.).  Errors
+ * are expected for many optname+payload combos; the call counts as
+ * "exercise the validation path" regardless of return value.
+ */
+static long syz_mptcp_setsockopt_fuzz(volatile long a0, volatile long a1,
+				      volatile long a2, volatile long a3)
+{
+	struct brf_mptcp_pair_state *pair;
+	long slot = a0;
+	int optname = (int)a1;
+	void *val = (void *)a2;
+	socklen_t val_len = (socklen_t)a3;
+	int r;
+
+	if (slot < 0 || slot >= MPTCP_PAIR_POOL_SIZE)
+		return -1;
+	pair = &brf_mptcp_pair_pool[slot];
+	if (!pair->in_use)
+		return -1;
+
+	/* Cap payload size; setsockopt with huge val_len gets rejected
+	 * before validation anyway and burns time we don't need to burn. */
+	if (val_len > 256)
+		val_len = 256;
+
+	/* Try on both client and server-accepted msk fds; the kernel
+	 * may validate differently depending on socket state. */
+	if (pair->client_msk_fd >= 0) {
+		r = setsockopt(pair->client_msk_fd, SOL_MPTCP, optname,
+			       val, val_len);
+		(void)r;
+	}
+	if (pair->server_msk_fd >= 0) {
+		r = setsockopt(pair->server_msk_fd, SOL_MPTCP, optname,
+			       val, val_len);
+		(void)r;
+	}
+	debug("syz_mptcp_setsockopt_fuzz: slot=%ld optname=%d len=%u done\n",
+	      slot, optname, val_len);
+	return 0;
+}
+#endif
+
 #endif // BRF_COMMON_LINUX_MPTCP_H

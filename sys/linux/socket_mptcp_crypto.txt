@@ -116,6 +116,16 @@ syz_mptcp_diag(family flags[mptcp_diag_family], states int32, ext int8)
 
 mptcp_diag_family = 2, 10  # AF_INET, AF_INET6
 
+# syz_mptcp_setsockopt_fuzz: arbitrary setsockopt on SOL_MPTCP with
+# fuzzer-controlled optname and payload.  Exercises validation
+# branches in net/mptcp/sockopt.c gated on specific optnames the
+# other pseudo-syscalls don't reach (MPTCP_FULL_INFO=4,
+# MPTCP_TCPINFO=2, MPTCP_SUBFLOW_ADDRS=3, MPTCP_DEBUG_KEYS=6,
+# MPTCP_CHKSUM=5, etc.).
+syz_mptcp_setsockopt_fuzz(pair mptcp_pair, optname flags[mptcp_sockopt_name], val ptr[in, array[int8]], val_len bytesize[val])
+
+mptcp_sockopt_name = 1, 2, 3, 4, 5, 6, 7  # MPTCP_INFO..
+
 # Out-param struct.  Mirrors `struct brf_mptcp_pair_state_out` in
 # executor/common_brf_linux_mptcp.h.  Field order and sizes must
 # match exactly.
