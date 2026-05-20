@@ -90,6 +90,16 @@ syz_mptcp_pm_kernel_add_addr(addr_id int8, addr int32be, port int16, addr_flags 
 # teardown whose alloc side produced the kmemleak race.
 syz_mptcp_pm_kernel_del_addr(addr_id int8)
 
+# syz_mptcp_pm_kernel_flush_addrs: clear the kernel PM's
+# pernet->local_addr_list in one shot via MPTCP_PM_CMD_FLUSH_ADDRS.
+# Bulk-teardown counterpart to v06.3 del_addr.  Exercises
+# mptcp_pm_nl_flush_addrs_doit which walks the list, splice-init's
+# it under pernet->lock, then iterates the freed entries -- same
+# splice-then-iterate shape as mptcp_pm_destroy on the userspace
+# side.  Worth fuzzing concurrently with add_addr / del_addr for
+# the bulk-vs-incremental race surface.
+syz_mptcp_pm_kernel_flush_addrs()
+
 # Out-param struct.  Mirrors `struct brf_mptcp_pair_state_out` in
 # executor/common_brf_linux_mptcp.h.  Field order and sizes must
 # match exactly.

@@ -2024,6 +2024,58 @@ static int brf_mptcp_genl_kernel_del_addr(uint8_t addr_id)
 #undef BRF_PUT_ATTR
 }
 
+/* MPTCP_PM_CMD_FLUSH_ADDRS (kernel PM): bulk-clear
+ * pernet->local_addr_list.  Used by the v06.4 pseudo-syscall
+ * syz_mptcp_pm_kernel_flush_addrs.  Exercises the same
+ * splice-then-iterate teardown shape as mptcp_pm_destroy on the
+ * userspace side.  No attrs required.
+ */
+static int brf_mptcp_genl_kernel_flush_addrs(void)
+{
+	char buf[64];
+	struct nlmsghdr *nlh = (struct nlmsghdr *)buf;
+	struct genlmsghdr *ghdr;
+	ssize_t n;
+
+	memset(buf, 0, sizeof(buf));
+	nlh->nlmsg_type  = brf_mptcp_pm_family_id;
+	nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
+	nlh->nlmsg_seq   = 9;
+	nlh->nlmsg_pid   = 0;
+	ghdr = (struct genlmsghdr *)NLMSG_DATA(nlh);
+	ghdr->cmd     = MPTCP_PM_CMD_FLUSH_ADDRS;
+	ghdr->version = MPTCP_PM_VER;
+
+	nlh->nlmsg_len = NLMSG_HDRLEN + NLMSG_ALIGN(sizeof(*ghdr));
+
+	if (send(brf_mptcp_genl_sock, buf, nlh->nlmsg_len, 0) < 0) {
+		debug("pm_kernel_flush_addrs: send: %s\n", strerror(errno));
+		return -1;
+	}
+	n = recv(brf_mptcp_genl_sock, buf, sizeof(buf), 0);
+	if (n < 0) {
+		debug("pm_kernel_flush_addrs: recv: %s\n", strerror(errno));
+		return -1;
+	}
+	nlh = (struct nlmsghdr *)buf;
+	if (nlh->nlmsg_type != NLMSG_ERROR) {
+		debug("pm_kernel_flush_addrs: unexpected ack type %u\n",
+		      nlh->nlmsg_type);
+		errno = EPROTO;
+		return -1;
+	}
+	{
+		struct nlmsgerr *ne = (struct nlmsgerr *)NLMSG_DATA(nlh);
+		if (ne->error) {
+			debug("pm_kernel_flush_addrs: kernel err=%d (%s)\n",
+			      ne->error, strerror(-ne->error));
+			errno = -ne->error;
+			return -1;
+		}
+	}
+	return 0;
+}
+
 static long syz_mptcp_join_subflow(volatile long a0, volatile long a1,
 				   volatile long a2, volatile long a3,
 				   volatile long a4)
@@ -2711,6 +2763,32 @@ static long syz_mptcp_pm_kernel_del_addr(volatile long a0)
 	}
 
 	debug("syz_mptcp_pm_kernel_del_addr: id=%u deleted\n", addr_id);
+	return 0;
+}
+#endif
+
+#if SYZ_EXECUTOR || __NR_syz_mptcp_pm_kernel_flush_addrs
+/*
+ * v06.4: bulk-clear pernet->local_addr_list via
+ * MPTCP_PM_CMD_FLUSH_ADDRS.  Exercises the splice-then-iterate
+ * teardown shape -- same structural pattern as the userspace-side
+ * mptcp_pm_destroy code whose alloc-during-teardown race was just
+ * fixed.  Worth fuzzing concurrently with v06.2 add_addr and v06.3
+ * del_addr for the bulk-vs-incremental race surface.
+ *
+ * No args -- the command is bare.
+ */
+static long syz_mptcp_pm_kernel_flush_addrs(void)
+{
+	if (brf_mptcp_ensure_executor_setup() < 0)
+		return -1;
+
+	if (brf_mptcp_genl_kernel_flush_addrs() < 0) {
+		debug("syz_mptcp_pm_kernel_flush_addrs: failed\n");
+		return -1;
+	}
+
+	debug("syz_mptcp_pm_kernel_flush_addrs: addrs flushed\n");
 	return 0;
 }
 #endif
