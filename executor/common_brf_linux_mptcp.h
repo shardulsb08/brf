@@ -1187,6 +1187,35 @@ static long syz_mptcp_pair_init(volatile long a0, volatile long a1,
 	pair->token = info.mptcpi_token;
 	pair->csum_enabled = info.mptcpi_csum_enabled;
 
+	/* 5.5. Plumb the kcov remote handle into both msks.  The MP_JOIN
+	 *      validity gates instrumented by kernel patch 0002
+	 *      (subflow_hmac_valid / subflow_thmac_valid /
+	 *      subflow_token_join_request) wrap their bodies in
+	 *      BRF_MPTCP_KCOV_START, a no-op unless the msk carries a
+	 *      non-zero kcov_remote_handle.  Those gates run in softirq
+	 *      (inbound SYN / SYN-ACK / 3rd-ACK processing), where
+	 *      per-task kcov records nothing outside a kcov_remote
+	 *      region -- so without this setsockopt the harness's
+	 *      MP_JOIN crypto surface produces zero coverage feedback.
+	 *      Mirrors the eBPF path's bpf_object__add_kcov_handle().
+	 *
+	 *      Set on client + server msk fds directly, NOT
+	 *      server_listen_fd: a handle on the listener is inherited
+	 *      by every accepted msk via sk_clone_lock, so all 64 pool
+	 *      pairs would share one coverage area.  Best-effort -- a
+	 *      kernel without patch 0001 returns -EOPNOTSUPP. */
+	{
+		__u64 kh = kcov_common_handle();
+		if (setsockopt(pair->client_msk_fd, SOL_MPTCP,
+			       MPTCP_KCOV_HANDLE, &kh, sizeof(kh)) < 0)
+			debug("syz_mptcp_pair_init: MPTCP_KCOV_HANDLE "
+			      "client: %s\n", strerror(errno));
+		if (setsockopt(pair->server_msk_fd, SOL_MPTCP,
+			       MPTCP_KCOV_HANDLE, &kh, sizeof(kh)) < 0)
+			debug("syz_mptcp_pair_init: MPTCP_KCOV_HANDLE "
+			      "server: %s\n", strerror(errno));
+	}
+
 	/* 6. Populate the syzlang out-param. */
 	if (out) {
 		out->server_fd = pair->server_listen_fd;
@@ -1374,6 +1403,21 @@ static long syz_mptcp_pair_init_v6(volatile long a0, volatile long a1,
 	}
 	pair->token = info.mptcpi_token;
 	pair->csum_enabled = info.mptcpi_csum_enabled;
+
+	/* Plumb the kcov remote handle into both msks -- see the full
+	 * rationale on the equivalent block in syz_mptcp_pair_init.
+	 * Family-agnostic; v6 msks reach the same patch-0002 gates. */
+	{
+		__u64 kh = kcov_common_handle();
+		if (setsockopt(pair->client_msk_fd, SOL_MPTCP,
+			       MPTCP_KCOV_HANDLE, &kh, sizeof(kh)) < 0)
+			debug("syz_mptcp_pair_init_v6: MPTCP_KCOV_HANDLE "
+			      "client: %s\n", strerror(errno));
+		if (setsockopt(pair->server_msk_fd, SOL_MPTCP,
+			       MPTCP_KCOV_HANDLE, &kh, sizeof(kh)) < 0)
+			debug("syz_mptcp_pair_init_v6: MPTCP_KCOV_HANDLE "
+			      "server: %s\n", strerror(errno));
+	}
 
 	if (out) {
 		out->server_fd = pair->server_listen_fd;
