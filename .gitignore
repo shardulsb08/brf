@@ -34,3 +34,19 @@ dashboard/app/.gcloudignore
 # is local-only.  See .claude/README.md for the full split.
 /.claude/tasks/
 /.claude/settings.local.json
+
+# Compiled test binaries from kernel_patches/mptcp_kcov/test_*.c
+# (the .c sources are tracked; only the build artifacts are local).
+kernel_patches/mptcp_kcov/test_mp_*
+!kernel_patches/mptcp_kcov/test_mp_*.c
+!kernel_patches/mptcp_kcov/test_mp_*.h
+# Compiled test binaries when built in repo root.
+/test_mp_join_normal
+/test_mp_join_backup
+/test_mp_join_hmac_bitflip
+/test_mp_pm_announce_leak
+/test_setsockopt_handle
+
+# Local VM swap files (created by mkswap inside the dev_env VM).
+swap-file
+/swap-*
