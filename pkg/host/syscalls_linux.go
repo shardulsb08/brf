@@ -332,7 +332,7 @@ var syzkallSupport = map[string]func(*prog.Syscall, *prog.Target, string) (bool,
 	"syz_bpf_prog_load":           alwaysSupported,
 	"syz_bpf_prog_attach":         alwaysSupported,
 	// BRF MPTCP MP_JOIN harness (mpiric netdev 0x1A protocol_flow_fuzzing).
-	// All five are unconditionally supported when CONFIG_MPTCP=y; the
+	// All are unconditionally supported when CONFIG_MPTCP=y; the
 	// underlying setup (pm_type=1, NFQUEUE) is done lazily by the
 	// executor on first call.
 	"syz_mptcp_pair_init":         alwaysSupported,
@@ -341,6 +341,7 @@ var syzkallSupport = map[string]func(*prog.Syscall, *prog.Target, string) (bool,
 	"syz_mptcp_send_control":      alwaysSupported,
 	"syz_mptcp_pair_close":        alwaysSupported,
 	"syz_mptcp_pm_announce":       alwaysSupported,
+	"syz_mptcp_pm_remove":         alwaysSupported,
 }
 
 func isSupportedSyzkall(c *prog.Syscall, target *prog.Target, sandbox string) (bool, string) {

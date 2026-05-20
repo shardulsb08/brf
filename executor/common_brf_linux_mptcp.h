@@ -1603,6 +1603,81 @@ static int brf_mptcp_genl_announce(uint32_t token, uint8_t addr_id,
 #undef BRF_PUT_ATTR
 }
 
+/* MPTCP_PM_CMD_REMOVE: tell the kernel to remove an address that was
+ * previously tracked by the userspace path manager.  Used by the
+ * v05.4 pseudo-syscall syz_mptcp_pm_remove to exercise the inverse
+ * cleanup path of pm_announce -- the same anno_list /
+ * userspace_pm_local_addr_list lifecycle code whose ADD side
+ * produced the kmemleak race fixed upstream as
+ * "mptcp: pm: fix memory leak from alloc-during-teardown race".
+ *
+ * Required attributes: TOKEN, LOC_ID (the addr_id).  No nested ADDR
+ * attribute -- the kernel looks up by id alone.  addr_id == 0 takes
+ * a separate kernel path (mptcp_userspace_pm_remove_id_zero_address)
+ * that the fuzzer should reach via natural enum exploration; we do
+ * NOT coerce 0 to 1 the way pm_announce does, because for REMOVE
+ * the kernel accepts id == 0 as a meaningful value.
+ */
+static int brf_mptcp_genl_remove(uint32_t token, uint8_t addr_id)
+{
+	char buf[128];
+	struct nlmsghdr *nlh = (struct nlmsghdr *)buf;
+	struct genlmsghdr *ghdr;
+	struct nlattr *attr;
+	char *p;
+	ssize_t n;
+#define BRF_PUT_ATTR(typ, src, sz) do {				\
+		attr = (struct nlattr *)p;			\
+		attr->nla_type = (typ);				\
+		attr->nla_len  = NLA_HDRLEN + (sz);		\
+		memcpy((char *)attr + NLA_HDRLEN, (src), (sz));	\
+		p += NLA_ALIGN(attr->nla_len);			\
+	} while (0)
+
+	memset(buf, 0, sizeof(buf));
+	nlh->nlmsg_type  = brf_mptcp_pm_family_id;
+	nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
+	nlh->nlmsg_seq   = 4;
+	nlh->nlmsg_pid   = 0;
+	ghdr = (struct genlmsghdr *)NLMSG_DATA(nlh);
+	ghdr->cmd     = MPTCP_PM_CMD_REMOVE;
+	ghdr->version = MPTCP_PM_VER;
+
+	p = (char *)NLMSG_DATA(nlh) + NLMSG_ALIGN(sizeof(*ghdr));
+
+	BRF_PUT_ATTR(MPTCP_PM_ATTR_TOKEN, &token, sizeof(token));
+	BRF_PUT_ATTR(MPTCP_PM_ATTR_LOC_ID, &addr_id, sizeof(addr_id));
+
+	nlh->nlmsg_len = p - buf;
+
+	if (send(brf_mptcp_genl_sock, buf, nlh->nlmsg_len, 0) < 0) {
+		debug("pm_remove: send: %s\n", strerror(errno));
+		return -1;
+	}
+	n = recv(brf_mptcp_genl_sock, buf, sizeof(buf), 0);
+	if (n < 0) {
+		debug("pm_remove: recv: %s\n", strerror(errno));
+		return -1;
+	}
+	nlh = (struct nlmsghdr *)buf;
+	if (nlh->nlmsg_type != NLMSG_ERROR) {
+		debug("pm_remove: unexpected ack type %u\n", nlh->nlmsg_type);
+		errno = EPROTO;
+		return -1;
+	}
+	{
+		struct nlmsgerr *ne = (struct nlmsgerr *)NLMSG_DATA(nlh);
+		if (ne->error) {
+			debug("pm_remove: kernel err=%d (%s)\n",
+			      ne->error, strerror(-ne->error));
+			errno = -ne->error;
+			return -1;
+		}
+	}
+	return 0;
+#undef BRF_PUT_ATTR
+}
+
 static long syz_mptcp_join_subflow(volatile long a0, volatile long a1,
 				   volatile long a2, volatile long a3,
 				   volatile long a4)
@@ -2068,6 +2143,62 @@ static long syz_mptcp_pm_announce(volatile long a0, volatile long a1,
 	debug("syz_mptcp_pm_announce: slot=%ld addr_id=%u "
 	      "addr=0x%08x port=%u announced\n",
 	      slot, addr_id, ntohl(addr_be), port_h);
+	return 0;
+}
+#endif
+
+#if SYZ_EXECUTOR || __NR_syz_mptcp_pm_remove
+/*
+ * v05.4: tell the kernel to remove an address that was previously
+ * tracked by the userspace path manager.  Sibling of pm_announce
+ * (v05.3); exercises the inverse cleanup path:
+ *   - mptcp_pm_nl_remove_doit (kernel-side genl handler)
+ *   - mptcp_pm_remove_addr_entry (entry teardown)
+ *   - mptcp_remove_anno_list_by_saddr (anno_list cleanup)
+ *   - mptcp_pm_del_add_timer (add-timer cancellation)
+ *   - mptcp_userspace_pm_remove_id_zero_address (addr_id == 0 path)
+ *
+ * Production hypothesis (per the memory at
+ * project_harness_viability_assessment):  fuzzing the same
+ * anno_list / userspace_pm_local_addr_list lifecycle code from the
+ * REMOVE side, after the ADD side produced the kmemleak race we
+ * just fixed, has a high probability of surfacing a related bug.
+ * This pseudo-syscall is the cheapest possible test of that
+ * hypothesis -- if v05.4 doesn't produce a finding within a week
+ * of fuzzer time, the model needs revisiting.
+ *
+ * addr_id is passed straight through; the kernel routes
+ * addr_id == 0 to a separate handler
+ * (mptcp_userspace_pm_remove_id_zero_address) which is itself a
+ * code surface the fuzzer should reach.  Unlike pm_announce we do
+ * NOT coerce 0 to 1.
+ */
+static long syz_mptcp_pm_remove(volatile long a0, volatile long a1)
+{
+	struct brf_mptcp_pair_state *pair;
+	long slot = a0;
+	uint8_t addr_id = (uint8_t)a1;
+
+	if (slot < 0 || slot >= MPTCP_PAIR_POOL_SIZE) {
+		debug("syz_mptcp_pm_remove: slot %ld out of range\n", slot);
+		return -1;
+	}
+	pair = &brf_mptcp_pair_pool[slot];
+	if (!pair->in_use) {
+		debug("syz_mptcp_pm_remove: slot %ld not in use\n", slot);
+		return -1;
+	}
+	if (brf_mptcp_ensure_executor_setup() < 0)
+		return -1;
+
+	if (brf_mptcp_genl_remove(pair->token, addr_id) < 0) {
+		debug("syz_mptcp_pm_remove: slot=%ld addr_id=%u failed\n",
+		      slot, addr_id);
+		return -1;
+	}
+
+	debug("syz_mptcp_pm_remove: slot=%ld addr_id=%u removed\n",
+	      slot, addr_id);
 	return 0;
 }
 #endif

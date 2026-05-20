@@ -44,6 +44,16 @@ syz_mptcp_pair_close(pair mptcp_pair)
 # wire.  Exercises path-manager add-addr emit + peer-side parse paths.
 syz_mptcp_pm_announce(pair mptcp_pair, addr_id int8, addr int32be, port int16)
 
+# syz_mptcp_pm_remove: trigger kernel to remove an address previously
+# tracked by the userspace path manager.  Sibling of pm_announce;
+# exercises the inverse path: mptcp_pm_nl_remove_doit ->
+# mptcp_pm_remove_addr_entry -> mptcp_remove_anno_list_by_saddr (and
+# mptcp_userspace_pm_remove_id_zero_address for addr_id == 0).
+# Targets the same anno_list / userspace_pm_local_addr_list cleanup
+# machinery whose ADD side produced the kmemleak race fixed in
+# findings/001_mptcp_pm_destroy_race/.
+syz_mptcp_pm_remove(pair mptcp_pair, addr_id int8)
+
 # Out-param struct.  Mirrors `struct brf_mptcp_pair_state_out` in
 # executor/common_brf_linux_mptcp.h.  Field order and sizes must
 # match exactly.
