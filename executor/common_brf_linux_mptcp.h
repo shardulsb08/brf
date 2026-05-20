@@ -1950,6 +1950,80 @@ static int brf_mptcp_genl_kernel_add_addr(uint8_t addr_id,
 #undef BRF_PUT_ATTR
 }
 
+/* MPTCP_PM_CMD_DEL_ADDR (kernel PM): remove an address from
+ * pernet->local_addr_list.  Companion to brf_mptcp_genl_kernel_add_addr.
+ * Used by the v06.3 pseudo-syscall syz_mptcp_pm_kernel_del_addr.
+ *
+ * Attrs: nested ADDR with (FAMILY, ID).  No TOKEN.
+ */
+static int brf_mptcp_genl_kernel_del_addr(uint8_t addr_id)
+{
+	char buf[128];
+	struct nlmsghdr *nlh = (struct nlmsghdr *)buf;
+	struct genlmsghdr *ghdr;
+	struct nlattr *attr, *nest;
+	char *p;
+	ssize_t n;
+#define BRF_PUT_ATTR(typ, src, sz) do {				\
+		attr = (struct nlattr *)p;			\
+		attr->nla_type = (typ);				\
+		attr->nla_len  = NLA_HDRLEN + (sz);		\
+		memcpy((char *)attr + NLA_HDRLEN, (src), (sz));	\
+		p += NLA_ALIGN(attr->nla_len);			\
+	} while (0)
+
+	memset(buf, 0, sizeof(buf));
+	nlh->nlmsg_type  = brf_mptcp_pm_family_id;
+	nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
+	nlh->nlmsg_seq   = 8;
+	nlh->nlmsg_pid   = 0;
+	ghdr = (struct genlmsghdr *)NLMSG_DATA(nlh);
+	ghdr->cmd     = MPTCP_PM_CMD_DEL_ADDR;
+	ghdr->version = MPTCP_PM_VER;
+
+	p = (char *)NLMSG_DATA(nlh) + NLMSG_ALIGN(sizeof(*ghdr));
+
+	{
+		uint16_t fam_v = AF_INET;
+		nest = (struct nlattr *)p;
+		nest->nla_type = MPTCP_PM_ATTR_ADDR | NLA_F_NESTED;
+		p += NLA_HDRLEN;
+		BRF_PUT_ATTR(MPTCP_PM_ADDR_ATTR_FAMILY, &fam_v, sizeof(fam_v));
+		BRF_PUT_ATTR(MPTCP_PM_ADDR_ATTR_ID, &addr_id, sizeof(addr_id));
+		nest->nla_len = p - (char *)nest;
+	}
+
+	nlh->nlmsg_len = p - buf;
+
+	if (send(brf_mptcp_genl_sock, buf, nlh->nlmsg_len, 0) < 0) {
+		debug("pm_kernel_del_addr: send: %s\n", strerror(errno));
+		return -1;
+	}
+	n = recv(brf_mptcp_genl_sock, buf, sizeof(buf), 0);
+	if (n < 0) {
+		debug("pm_kernel_del_addr: recv: %s\n", strerror(errno));
+		return -1;
+	}
+	nlh = (struct nlmsghdr *)buf;
+	if (nlh->nlmsg_type != NLMSG_ERROR) {
+		debug("pm_kernel_del_addr: unexpected ack type %u\n",
+		      nlh->nlmsg_type);
+		errno = EPROTO;
+		return -1;
+	}
+	{
+		struct nlmsgerr *ne = (struct nlmsgerr *)NLMSG_DATA(nlh);
+		if (ne->error) {
+			debug("pm_kernel_del_addr: kernel err=%d (%s)\n",
+			      ne->error, strerror(-ne->error));
+			errno = -ne->error;
+			return -1;
+		}
+	}
+	return 0;
+#undef BRF_PUT_ATTR
+}
+
 static long syz_mptcp_join_subflow(volatile long a0, volatile long a1,
 				   volatile long a2, volatile long a3,
 				   volatile long a4)
@@ -2609,6 +2683,34 @@ static long syz_mptcp_pm_kernel_add_addr(volatile long a0, volatile long a1,
 	debug("syz_mptcp_pm_kernel_add_addr: id=%u addr=0x%08x port=%u "
 	      "flags=0x%x added\n",
 	      addr_id, ntohl(addr_be), port_h, addr_flags);
+	return 0;
+}
+#endif
+
+#if SYZ_EXECUTOR || __NR_syz_mptcp_pm_kernel_del_addr
+/*
+ * v06.3: remove an address from the kernel PM's
+ * pernet->local_addr_list via MPTCP_PM_CMD_DEL_ADDR.  Companion to
+ * v06.2 add_addr.  Exercises kernel-PM teardown machinery (id
+ * lookup, list_del, kfree_rcu) structurally similar to the
+ * userspace-PM teardown whose alloc side produced the kmemleak
+ * race -- hypothesis is a related class of race may exist on the
+ * kernel-PM side.
+ */
+static long syz_mptcp_pm_kernel_del_addr(volatile long a0)
+{
+	uint8_t addr_id = (uint8_t)a0;
+
+	if (brf_mptcp_ensure_executor_setup() < 0)
+		return -1;
+
+	if (brf_mptcp_genl_kernel_del_addr(addr_id) < 0) {
+		debug("syz_mptcp_pm_kernel_del_addr: id=%u failed\n",
+		      addr_id);
+		return -1;
+	}
+
+	debug("syz_mptcp_pm_kernel_del_addr: id=%u deleted\n", addr_id);
 	return 0;
 }
 #endif

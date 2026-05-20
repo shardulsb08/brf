@@ -82,6 +82,14 @@ syz_mptcp_pm_set_flags(pair mptcp_pair, addr_id int8, addr_flags int32, port int
 # del_addr and v06.4 flush_addrs.
 syz_mptcp_pm_kernel_add_addr(addr_id int8, addr int32be, port int16, addr_flags int32)
 
+# syz_mptcp_pm_kernel_del_addr: remove a previously-registered address
+# from the kernel PM's pernet->local_addr_list via
+# MPTCP_PM_CMD_DEL_ADDR.  Companion to v06.2 add_addr; netns-scoped.
+# Exercises the kernel-PM teardown path (id lookup, list_del,
+# kfree_rcu) which is structurally similar to the userspace-PM
+# teardown whose alloc side produced the kmemleak race.
+syz_mptcp_pm_kernel_del_addr(addr_id int8)
+
 # Out-param struct.  Mirrors `struct brf_mptcp_pair_state_out` in
 # executor/common_brf_linux_mptcp.h.  Field order and sizes must
 # match exactly.
