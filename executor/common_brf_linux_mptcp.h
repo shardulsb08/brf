@@ -988,7 +988,41 @@ static long syz_mptcp_pair_init(volatile long a0, volatile long a1,
 
 	(void)a0;	/* server_addr (sockaddr_storage)  -- ignored in v01 */
 	(void)a1;	/* client_addr (sockaddr_storage)  -- ignored in v01 */
-	(void)a2;	/* init_flags                      -- ignored in v01 */
+
+	/* v09: wire init_flags through to the netns-scoped sysctls that
+	 * actually control MPTCP option emission.  Bits:
+	 *   MPTCP_INIT_CSUM_ON    -> /proc/sys/net/mptcp/checksum_enabled = 1
+	 *                            (MP_CAPABLE carries CSUM_REQD bit)
+	 *   MPTCP_INIT_CSUM_OFF   -> checksum_enabled = 0 (default; still
+	 *                            useful to exercise the sysctl write
+	 *                            path itself)
+	 *   MPTCP_INIT_DENY_JOIN_ID0 -> allow_join_initial_addr_port = 0
+	 *                            (MP_CAPABLE carries DENY_JOIN_ID0 bit)
+	 * The two CSUM bits are mutually exclusive at intended use; if
+	 * the fuzzer sets both, ON wins.  All writes are best-effort --
+	 * a failure here is logged but does not fail the pair init,
+	 * since the underlying handshake still works at the kernel
+	 * default. */
+	{
+		unsigned long init_flags_v = (unsigned long)a2;
+		if (init_flags_v & MPTCP_INIT_CSUM_ON) {
+			if (!write_file("/proc/sys/net/mptcp/checksum_enabled",
+					"1"))
+				debug("syz_mptcp_pair_init: csum_enabled=1 "
+				      "write failed: %s\n", strerror(errno));
+		} else if (init_flags_v & MPTCP_INIT_CSUM_OFF) {
+			if (!write_file("/proc/sys/net/mptcp/checksum_enabled",
+					"0"))
+				debug("syz_mptcp_pair_init: csum_enabled=0 "
+				      "write failed: %s\n", strerror(errno));
+		}
+		if (init_flags_v & MPTCP_INIT_DENY_JOIN_ID0) {
+			if (!write_file("/proc/sys/net/mptcp/allow_join_initial_addr_port",
+					"0"))
+				debug("syz_mptcp_pair_init: deny_join_id0 "
+				      "write failed: %s\n", strerror(errno));
+		}
+	}
 
 	/* 0. Flip the netns to userspace PM mode BEFORE creating any msk:
 	 *    msk->pm.pm_type is captured at sock-creation time
