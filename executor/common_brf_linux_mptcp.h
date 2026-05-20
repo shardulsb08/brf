@@ -1678,6 +1678,107 @@ static int brf_mptcp_genl_remove(uint32_t token, uint8_t addr_id)
 #undef BRF_PUT_ATTR
 }
 
+/* MPTCP_PM_CMD_SUBFLOW_DESTROY: tell the kernel to tear down the
+ * subflow matching (local addr+port, remote addr+port) on the msk
+ * identified by token.  Same payload shape as SUBFLOW_CREATE
+ * (nested ADDR + nested ADDR_REMOTE, both with family + addr4 +
+ * port).  Used by v05.5 pseudo-syscall syz_mptcp_pm_subflow_destroy
+ * to exercise the subflow-teardown path -- a different code area
+ * from pm_remove's addr-list teardown.
+ *
+ * Kernel side: mptcp_pm_nl_subflow_destroy_doit ->
+ * (subflow lookup by tuple) -> mptcp_close_ssk -> subflow cleanup.
+ */
+static int brf_mptcp_genl_subflow_destroy(uint32_t token, uint8_t addr_id,
+					  uint32_t local_addr_be,
+					  uint16_t local_port_h,
+					  uint32_t remote_addr_be,
+					  uint16_t remote_port_h)
+{
+	char buf[256];
+	struct nlmsghdr *nlh = (struct nlmsghdr *)buf;
+	struct genlmsghdr *ghdr;
+	struct nlattr *attr, *nest;
+	char *p;
+	ssize_t n;
+#define BRF_PUT_ATTR(typ, src, sz) do {				\
+		attr = (struct nlattr *)p;			\
+		attr->nla_type = (typ);				\
+		attr->nla_len  = NLA_HDRLEN + (sz);		\
+		memcpy((char *)attr + NLA_HDRLEN, (src), (sz));	\
+		p += NLA_ALIGN(attr->nla_len);			\
+	} while (0)
+
+	memset(buf, 0, sizeof(buf));
+	nlh->nlmsg_type  = brf_mptcp_pm_family_id;
+	nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
+	nlh->nlmsg_seq   = 5;
+	nlh->nlmsg_pid   = 0;
+	ghdr = (struct genlmsghdr *)NLMSG_DATA(nlh);
+	ghdr->cmd     = MPTCP_PM_CMD_SUBFLOW_DESTROY;
+	ghdr->version = MPTCP_PM_VER;
+
+	p = (char *)NLMSG_DATA(nlh) + NLMSG_ALIGN(sizeof(*ghdr));
+
+	BRF_PUT_ATTR(MPTCP_PM_ATTR_TOKEN, &token, sizeof(token));
+
+	{
+		uint16_t fam_v = AF_INET;
+		nest = (struct nlattr *)p;
+		nest->nla_type = MPTCP_PM_ATTR_ADDR | NLA_F_NESTED;
+		p += NLA_HDRLEN;
+		BRF_PUT_ATTR(MPTCP_PM_ADDR_ATTR_FAMILY, &fam_v, sizeof(fam_v));
+		BRF_PUT_ATTR(MPTCP_PM_ADDR_ATTR_ID, &addr_id, sizeof(addr_id));
+		BRF_PUT_ATTR(MPTCP_PM_ADDR_ATTR_ADDR4, &local_addr_be,
+			     sizeof(local_addr_be));
+		BRF_PUT_ATTR(MPTCP_PM_ADDR_ATTR_PORT, &local_port_h,
+			     sizeof(local_port_h));
+		nest->nla_len = p - (char *)nest;
+	}
+	{
+		uint16_t fam_v = AF_INET;
+		nest = (struct nlattr *)p;
+		nest->nla_type = MPTCP_PM_ATTR_ADDR_REMOTE | NLA_F_NESTED;
+		p += NLA_HDRLEN;
+		BRF_PUT_ATTR(MPTCP_PM_ADDR_ATTR_FAMILY, &fam_v, sizeof(fam_v));
+		BRF_PUT_ATTR(MPTCP_PM_ADDR_ATTR_ADDR4, &remote_addr_be,
+			     sizeof(remote_addr_be));
+		BRF_PUT_ATTR(MPTCP_PM_ADDR_ATTR_PORT, &remote_port_h,
+			     sizeof(remote_port_h));
+		nest->nla_len = p - (char *)nest;
+	}
+
+	nlh->nlmsg_len = p - buf;
+
+	if (send(brf_mptcp_genl_sock, buf, nlh->nlmsg_len, 0) < 0) {
+		debug("pm_subflow_destroy: send: %s\n", strerror(errno));
+		return -1;
+	}
+	n = recv(brf_mptcp_genl_sock, buf, sizeof(buf), 0);
+	if (n < 0) {
+		debug("pm_subflow_destroy: recv: %s\n", strerror(errno));
+		return -1;
+	}
+	nlh = (struct nlmsghdr *)buf;
+	if (nlh->nlmsg_type != NLMSG_ERROR) {
+		debug("pm_subflow_destroy: unexpected ack type %u\n",
+		      nlh->nlmsg_type);
+		errno = EPROTO;
+		return -1;
+	}
+	{
+		struct nlmsgerr *ne = (struct nlmsgerr *)NLMSG_DATA(nlh);
+		if (ne->error) {
+			debug("pm_subflow_destroy: kernel err=%d (%s)\n",
+			      ne->error, strerror(-ne->error));
+			errno = -ne->error;
+			return -1;
+		}
+	}
+	return 0;
+#undef BRF_PUT_ATTR
+}
+
 static long syz_mptcp_join_subflow(volatile long a0, volatile long a1,
 				   volatile long a2, volatile long a3,
 				   volatile long a4)
@@ -2199,6 +2300,62 @@ static long syz_mptcp_pm_remove(volatile long a0, volatile long a1)
 
 	debug("syz_mptcp_pm_remove: slot=%ld addr_id=%u removed\n",
 	      slot, addr_id);
+	return 0;
+}
+#endif
+
+#if SYZ_EXECUTOR || __NR_syz_mptcp_pm_subflow_destroy
+/*
+ * v05.5: tell the kernel to tear down a specific subflow on this
+ * msk, identified by (local addr+port, remote addr+port).  Sibling
+ * of v01's join_subflow (SUBFLOW_CREATE); exercises the subflow
+ * teardown path which is a different code area from pm_remove's
+ * addr-list teardown.
+ *
+ * Local addr is fixed at 127.0.0.2 (matches what join_subflow
+ * uses); remote addr is fixed at 127.0.0.1.  Ports are passed
+ * through from the syscall args -- fuzzer mutations occasionally
+ * happen to match a real subflow's tuple (exercises the
+ * mptcp_close_ssk success path) and mostly don't (exercises the
+ * tuple-lookup failure path in mptcp_pm_nl_subflow_destroy_doit).
+ * Both surfaces are interesting; we deliberately do not try to
+ * cleverly select port=server_port to bias toward matching.
+ */
+static long syz_mptcp_pm_subflow_destroy(volatile long a0, volatile long a1,
+					 volatile long a2, volatile long a3)
+{
+	struct brf_mptcp_pair_state *pair;
+	long slot = a0;
+	uint8_t addr_id = (uint8_t)a1;
+	uint16_t local_port_h  = (uint16_t)a2;
+	uint16_t remote_port_h = (uint16_t)a3;
+
+	if (slot < 0 || slot >= MPTCP_PAIR_POOL_SIZE) {
+		debug("syz_mptcp_pm_subflow_destroy: slot %ld out of range\n",
+		      slot);
+		return -1;
+	}
+	pair = &brf_mptcp_pair_pool[slot];
+	if (!pair->in_use) {
+		debug("syz_mptcp_pm_subflow_destroy: slot %ld not in use\n",
+		      slot);
+		return -1;
+	}
+	if (brf_mptcp_ensure_executor_setup() < 0)
+		return -1;
+
+	if (brf_mptcp_genl_subflow_destroy(pair->token, addr_id,
+					   htonl(0x7f000002), local_port_h,
+					   htonl(0x7f000001), remote_port_h) < 0) {
+		debug("syz_mptcp_pm_subflow_destroy: slot=%ld addr_id=%u "
+		      "lport=%u rport=%u failed\n",
+		      slot, addr_id, local_port_h, remote_port_h);
+		return -1;
+	}
+
+	debug("syz_mptcp_pm_subflow_destroy: slot=%ld addr_id=%u "
+	      "lport=%u rport=%u destroyed\n",
+	      slot, addr_id, local_port_h, remote_port_h);
 	return 0;
 }
 #endif

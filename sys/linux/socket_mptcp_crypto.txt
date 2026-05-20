@@ -54,6 +54,18 @@ syz_mptcp_pm_announce(pair mptcp_pair, addr_id int8, addr int32be, port int16)
 # findings/001_mptcp_pm_destroy_race/.
 syz_mptcp_pm_remove(pair mptcp_pair, addr_id int8)
 
+# syz_mptcp_pm_subflow_destroy: tell the kernel to tear down a
+# specific subflow on this msk.  Sibling of join_subflow's
+# SUBFLOW_CREATE; exercises mptcp_pm_nl_subflow_destroy_doit and
+# the subsequent mptcp_close_ssk / subflow teardown path.  Different
+# code area from pm_remove (subflow lifecycle vs addr-list
+# lifecycle).  Local/remote ports are passed through host-byte-order
+# per the same kernel convention as SUBFLOW_CREATE; the fuzzer's
+# port mutations occasionally happen to match a real subflow
+# (exercises success path) and mostly don't (exercises tuple-lookup
+# failure path).  Both surfaces are interesting.
+syz_mptcp_pm_subflow_destroy(pair mptcp_pair, addr_id int8, local_port int16, remote_port int16)
+
 # Out-param struct.  Mirrors `struct brf_mptcp_pair_state_out` in
 # executor/common_brf_linux_mptcp.h.  Field order and sizes must
 # match exactly.
