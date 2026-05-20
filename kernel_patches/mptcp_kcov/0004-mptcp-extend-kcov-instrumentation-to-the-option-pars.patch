@@ -1,0 +1,65 @@
+From 45f8d3880bef68894da93097995e546a1204bbea Mon Sep 17 00:00:00 2001
+From: Shardul Bankar <shardul.b@mpiricsoftware.com>
+Date: Thu, 21 May 2026 02:43:23 +0530
+Subject: [PATCH] mptcp: extend kcov instrumentation to the option parser
+
+The commit "mptcp: instrument MP_JOIN validity gates with kcov"
+wrapped three subflow-level validity gates but explicitly
+deferred mptcp_parse_option -- the per-suboption parse dispatch
+-- noting "no clean way to reach the relevant msk from a bare
+sk_buff without an invasive refactor."
+
+This adds that coverage without the refactor.  mptcp_parse_option
+is reached only through mptcp_get_options(), and the sole caller
+of mptcp_get_options() in options.c is mptcp_incoming_options(),
+which already derives the parent msk from the subflow socket at
+function entry.  Wrapping the mptcp_get_options() call there --
+not the parser itself -- gives the parser an active kcov_remote
+region keyed on the msk's handle, with no signature change.
+
+mptcp_incoming_options() runs in softirq on every incoming
+segment of an established connection, so without this the
+per-suboption parsing of ADD_ADDR / RM_ADDR / MP_PRIO / MP_FAIL /
+MP_RST / DSS contributes no coverage to a kcov-driven fuzzer.
+That is the surface the BRF protocol-flow harness's wire-level
+option mutations target; coverage feedback there is what lets a
+coverage-guided fuzzer evolve toward the deeper parse paths.
+
+The other mptcp_get_options() call sites all live in subflow.c
+(subflow establishment and data-ready paths) and are not wrapped
+here: the load-bearing MP_JOIN validity gates already carry their
+own kcov regions from the preceding patch, and not all of those
+call sites have an msk in scope.
+
+BRF_MPTCP_KCOV_START / _STOP reduce to a single branch when the
+msk carries no handle, and compile to nothing when CONFIG_KCOV=n.
+
+Assisted-by: Claude:claude-opus-4-7
+Signed-off-by: Shardul Bankar <shardul.b@mpiricsoftware.com>
+---
+ net/mptcp/options.c | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/net/mptcp/options.c b/net/mptcp/options.c
+index 4cc583fdc7a9c..58cba581f7907 100644
+--- a/net/mptcp/options.c
++++ b/net/mptcp/options.c
+@@ -1188,7 +1188,13 @@ bool mptcp_incoming_options(struct sock *sk, struct sk_buff *skb)
+ 		return true;
+ 	}
+ 
++	/* BRF kcov: cover the softirq-context option parser so the
++	 * wire-mutation harness gets feedback for ADD_ADDR / RM_ADDR /
++	 * MP_PRIO / MP_FAIL / DSS parsing.  Wrapped here (msk in scope)
++	 * rather than inside mptcp_get_options(), which sees only skb. */
++	BRF_MPTCP_KCOV_START(msk);
+ 	mptcp_get_options(skb, &mp_opt);
++	BRF_MPTCP_KCOV_STOP(msk);
+ 
+ 	/* The subflow can be in close state only if check_fully_established()
+ 	 * just sent a reset. If so, tell the caller to ignore the current packet.
+
+base-commit: 7e6dbef35ec947d15465f814a198a6872ffc9911
+-- 
+2.34.1
+
