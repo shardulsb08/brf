@@ -2952,7 +2952,13 @@ static long syz_mptcp_diag(volatile long a0, volatile long a1,
 	nlh->nlmsg_len   = NLMSG_HDRLEN + NLMSG_ALIGN(sizeof(*req));
 	req = (struct brf_inet_diag_req_v2 *)NLMSG_DATA(nlh);
 	req->sdiag_family   = family;
-	req->sdiag_protocol = IPPROTO_MPTCP;
+	/* sdiag_protocol is u8 in inet_diag uapi; IPPROTO_MPTCP (262)
+	 * intentionally truncates -- this is what iproute2's ss does
+	 * with `ss --mptcp`.  The kernel-side dispatch in
+	 * net/ipv4/inet_diag.c keys handlers off this byte; the
+	 * MPTCP-specific dumper in net/mptcp/mptcp_diag.c is reached
+	 * accordingly. */
+	req->sdiag_protocol = (uint8_t)IPPROTO_MPTCP;
 	req->idiag_ext      = ext;
 	req->idiag_states   = states;
 
