@@ -336,6 +336,7 @@ var syzkallSupport = map[string]func(*prog.Syscall, *prog.Target, string) (bool,
 	// underlying setup (pm_type=1, NFQUEUE) is done lazily by the
 	// executor on first call.
 	"syz_mptcp_pair_init":         alwaysSupported,
+	"syz_mptcp_pair_init_v6":      alwaysSupported,
 	"syz_mptcp_join_subflow":      alwaysSupported,
 	"syz_mptcp_drive_traffic":     alwaysSupported,
 	"syz_mptcp_send_control":      alwaysSupported,

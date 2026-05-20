@@ -894,6 +894,14 @@ struct brf_mptcp_subflow_state {
 struct brf_mptcp_pair_state {
 	bool     in_use;
 
+	// Address family: AF_INET (set by syz_mptcp_pair_init, v01) or
+	// AF_INET6 (set by syz_mptcp_pair_init_v6, v10.1).  Pseudo-syscalls
+	// that build genl addresses inspect this to dispatch ADDR4 vs ADDR6
+	// payloads; family-agnostic operations (pair_close, drive_traffic,
+	// send_control) ignore it.  Unset slots (in_use=false) leave this
+	// at zero, which is intentionally not a valid family.
+	uint16_t family;
+
 	// Endpoint sockets (set up in syz_mptcp_pair_init).
 	int      server_listen_fd;
 	int      server_msk_fd;
@@ -1047,6 +1055,7 @@ static long syz_mptcp_pair_init(volatile long a0, volatile long a1,
 	pair = &brf_mptcp_pair_pool[slot];
 	memset(pair, 0, sizeof(*pair));
 	pair->in_use = true;
+	pair->family = AF_INET;	/* v01 IPv4 pair; v10.1 added AF_INET6 variant */
 	pair->server_listen_fd = -1;
 	pair->server_msk_fd = -1;
 	pair->client_msk_fd = -1;
@@ -1195,6 +1204,193 @@ static long syz_mptcp_pair_init(volatile long a0, volatile long a1,
 	return slot;
 
 fail:
+	if (pair->server_msk_fd    >= 0) close(pair->server_msk_fd);
+	if (pair->client_msk_fd    >= 0) close(pair->client_msk_fd);
+	if (pair->server_listen_fd >= 0) close(pair->server_listen_fd);
+	memset(pair, 0, sizeof(*pair));
+	return -1;
+}
+#endif
+
+#if SYZ_EXECUTOR || __NR_syz_mptcp_pair_init_v6
+/*
+ * v10.1: IPv6 variant of syz_mptcp_pair_init.  Same flow -- MP_CAPABLE
+ * on loopback, 1-byte priming, key + token capture -- but with
+ * AF_INET6 sockets on ::1.  Sets pair->family = AF_INET6 so future
+ * v10.2 family-aware genl helpers can dispatch the right ADDR6
+ * nested attribute for subsequent join_subflow / pm_announce /
+ * pm_subflow_destroy / pm_set_flags calls on this pair.
+ *
+ * Today (v10.1 only): pair_close, send_control, drive_traffic are
+ * family-agnostic and work on v6 pairs unchanged; the four
+ * genl-using pseudo-syscalls still emit ADDR4 nested attributes
+ * and so will fail when called on a v6 pair (the genl attr won't
+ * match the msk's family).  The failure path is itself useful fuzz
+ * surface (exercises the kernel parser's mismatched-family
+ * validation).  v10.2 will plumb family through the helpers.
+ *
+ * Relies on ::1 being bound to lo (kernel default); no explicit
+ * `ip -6 addr add` performed.
+ */
+static long syz_mptcp_pair_init_v6(volatile long a0, volatile long a1,
+				   volatile long a2, volatile long a3)
+{
+	struct brf_mptcp_pair_state_out *out =
+		(struct brf_mptcp_pair_state_out *)a3;
+	struct brf_mptcp_pair_state *pair;
+	struct sockaddr_in6 srv_addr;
+	struct mptcp_debug_keys keys;
+	struct brf_mptcp_info_short info;
+	socklen_t alen, klen, ilen;
+	int slot, one = 1;
+
+	(void)a0;	/* server_addr ignored */
+	(void)a1;	/* client_addr ignored */
+
+	/* v09 init_flags wiring -- netns sysctls are family-agnostic. */
+	{
+		unsigned long init_flags_v = (unsigned long)a2;
+		if (init_flags_v & MPTCP_INIT_CSUM_ON) {
+			if (!write_file("/proc/sys/net/mptcp/checksum_enabled",
+					"1"))
+				debug("syz_mptcp_pair_init_v6: csum_enabled=1 "
+				      "write failed: %s\n", strerror(errno));
+		} else if (init_flags_v & MPTCP_INIT_CSUM_OFF) {
+			if (!write_file("/proc/sys/net/mptcp/checksum_enabled",
+					"0"))
+				debug("syz_mptcp_pair_init_v6: csum_enabled=0 "
+				      "write failed: %s\n", strerror(errno));
+		}
+		if (init_flags_v & MPTCP_INIT_DENY_JOIN_ID0) {
+			if (!write_file("/proc/sys/net/mptcp/allow_join_initial_addr_port",
+					"0"))
+				debug("syz_mptcp_pair_init_v6: deny_join_id0 "
+				      "write failed: %s\n", strerror(errno));
+		}
+	}
+
+#if SYZ_EXECUTOR || __NR_syz_mptcp_join_subflow
+	if (brf_mptcp_ensure_executor_setup() < 0)
+		return -1;
+#endif
+
+	for (slot = 0; slot < MPTCP_PAIR_POOL_SIZE; slot++)
+		if (!brf_mptcp_pair_pool[slot].in_use)
+			break;
+	if (slot == MPTCP_PAIR_POOL_SIZE) {
+		debug("syz_mptcp_pair_init_v6: pool exhausted\n");
+		return -1;
+	}
+	pair = &brf_mptcp_pair_pool[slot];
+	memset(pair, 0, sizeof(*pair));
+	pair->in_use = true;
+	pair->family = AF_INET6;
+	pair->server_listen_fd = -1;
+	pair->server_msk_fd = -1;
+	pair->client_msk_fd = -1;
+	for (int s = 0; s < MPTCP_MAX_SUBFLOWS_PER_PAIR; s++)
+		pair->subflows[s].tcp_subflow_fd = -1;
+
+	pair->server_listen_fd = socket(AF_INET6, SOCK_STREAM, IPPROTO_MPTCP);
+	if (pair->server_listen_fd < 0) {
+		debug("syz_mptcp_pair_init_v6: server socket: %s\n",
+		      strerror(errno));
+		goto fail_v6;
+	}
+	setsockopt(pair->server_listen_fd, SOL_SOCKET, SO_REUSEADDR,
+		   &one, sizeof(one));
+
+	memset(&srv_addr, 0, sizeof(srv_addr));
+	srv_addr.sin6_family = AF_INET6;
+	srv_addr.sin6_port = 0;
+	srv_addr.sin6_addr = in6addr_loopback;	/* ::1 */
+	if (bind(pair->server_listen_fd, (struct sockaddr *)&srv_addr,
+		 sizeof(srv_addr)) < 0) {
+		debug("syz_mptcp_pair_init_v6: bind: %s\n", strerror(errno));
+		goto fail_v6;
+	}
+	alen = sizeof(srv_addr);
+	if (getsockname(pair->server_listen_fd,
+			(struct sockaddr *)&srv_addr, &alen) < 0) {
+		debug("syz_mptcp_pair_init_v6: getsockname: %s\n",
+		      strerror(errno));
+		goto fail_v6;
+	}
+	pair->server_listen_port = srv_addr.sin6_port;
+	if (listen(pair->server_listen_fd, 1) < 0) {
+		debug("syz_mptcp_pair_init_v6: listen: %s\n", strerror(errno));
+		goto fail_v6;
+	}
+
+	pair->client_msk_fd = socket(AF_INET6, SOCK_STREAM, IPPROTO_MPTCP);
+	if (pair->client_msk_fd < 0) {
+		debug("syz_mptcp_pair_init_v6: client socket: %s\n",
+		      strerror(errno));
+		goto fail_v6;
+	}
+	if (connect(pair->client_msk_fd, (struct sockaddr *)&srv_addr,
+		    sizeof(srv_addr)) < 0) {
+		debug("syz_mptcp_pair_init_v6: connect: %s\n", strerror(errno));
+		goto fail_v6;
+	}
+	pair->server_msk_fd = accept(pair->server_listen_fd, NULL, NULL);
+	if (pair->server_msk_fd < 0) {
+		debug("syz_mptcp_pair_init_v6: accept: %s\n", strerror(errno));
+		goto fail_v6;
+	}
+
+	/* 1-byte round-trip primer is family-agnostic. */
+	{
+		char b = 'x';
+		ssize_t n;
+		n = send(pair->client_msk_fd, &b, 1, 0);
+		if (n != 1) { debug("v6 prime send c->s: %s\n", strerror(errno)); goto fail_v6; }
+		n = recv(pair->server_msk_fd, &b, 1, MSG_WAITALL);
+		if (n != 1) { debug("v6 prime recv s: %s\n", strerror(errno)); goto fail_v6; }
+		n = send(pair->server_msk_fd, &b, 1, 0);
+		if (n != 1) { debug("v6 prime send s->c: %s\n", strerror(errno)); goto fail_v6; }
+		n = recv(pair->client_msk_fd, &b, 1, MSG_WAITALL);
+		if (n != 1) { debug("v6 prime recv c: %s\n", strerror(errno)); goto fail_v6; }
+	}
+
+	memset(&keys, 0, sizeof(keys));
+	klen = sizeof(keys);
+	if (getsockopt(pair->client_msk_fd, SOL_MPTCP, MPTCP_DEBUG_KEYS,
+		       &keys, &klen) < 0) {
+		debug("syz_mptcp_pair_init_v6: MPTCP_DEBUG_KEYS: %s\n",
+		      strerror(errno));
+		goto fail_v6;
+	}
+	pair->local_key = keys.local_key;
+	pair->remote_key = keys.remote_key;
+
+	memset(&info, 0, sizeof(info));
+	ilen = sizeof(info);
+	if (getsockopt(pair->client_msk_fd, SOL_MPTCP, MPTCP_INFO,
+		       &info, &ilen) < 0) {
+		debug("syz_mptcp_pair_init_v6: MPTCP_INFO: %s\n",
+		      strerror(errno));
+		goto fail_v6;
+	}
+	pair->token = info.mptcpi_token;
+	pair->csum_enabled = info.mptcpi_csum_enabled;
+
+	if (out) {
+		out->server_fd = pair->server_listen_fd;
+		out->client_fd = pair->client_msk_fd;
+		out->local_key = (int64_t)pair->local_key;
+		out->remote_key = (int64_t)pair->remote_key;
+		out->token = (int32_t)pair->token;
+		out->csum_enabled = (int8_t)pair->csum_enabled;
+	}
+
+	debug("syz_mptcp_pair_init_v6: pair %d (v6) established, "
+	      "port %d, token=0x%08x, csum=%d\n",
+	      slot, ntohs(srv_addr.sin6_port), pair->token,
+	      pair->csum_enabled);
+	return slot;
+
+fail_v6:
 	if (pair->server_msk_fd    >= 0) close(pair->server_msk_fd);
 	if (pair->client_msk_fd    >= 0) close(pair->client_msk_fd);
 	if (pair->server_listen_fd >= 0) close(pair->server_listen_fd);

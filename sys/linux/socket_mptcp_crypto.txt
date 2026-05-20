@@ -24,6 +24,16 @@ resource mptcp_pair[intptr]
 # capture cryptographic state.  See design doc Section 5.1.
 syz_mptcp_pair_init(server_addr ptr[in, int32], client_addr ptr[in, int32], init_flags flags[mptcp_init_flags], out_state ptr[out, mptcp_pair_state_t]) mptcp_pair
 
+# v10.1: IPv6 variant.  Creates an AF_INET6 MP_CAPABLE pair on ::1.
+# Pair state records family=AF_INET6; subsequent pair_close /
+# drive_traffic / send_control calls work as before (family-
+# agnostic), while the four genl-using pseudo-syscalls
+# (join_subflow, pm_announce, pm_subflow_destroy, pm_set_flags)
+# will fail with kernel-side ADDR4-vs-ADDR6 mismatch until v10.2
+# widens them.  Even so this opens fresh v6 socket-creation +
+# MP_CAPABLE-v6 + DSS-v6 surface for the fuzzer.
+syz_mptcp_pair_init_v6(server_addr ptr[in, array[int8, 16]], client_addr ptr[in, array[int8, 16]], init_flags flags[mptcp_init_flags], out_state ptr[out, mptcp_pair_state_t]) mptcp_pair
+
 # syz_mptcp_join_subflow: initiate MP_JOIN with valid token + HMAC.
 # nonce_mut / hmac_mut: rewrite the just-generated/computed bytes after.
 syz_mptcp_join_subflow(pair mptcp_pair, addr_id int8, backup int8[0:1], nonce_mut flags[mptcp_nonce_mut], hmac_mut flags[mptcp_hmac_mut])
