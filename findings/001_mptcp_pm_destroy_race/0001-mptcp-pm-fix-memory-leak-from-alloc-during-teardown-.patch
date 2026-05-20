@@ -1,0 +1,120 @@
+From 0774d3dde5d745ed21ddee6d3845457eee7fa978 Mon Sep 17 00:00:00 2001
+From: Shardul Bankar <shardul.b@mpiricsoftware.com>
+Date: Tue, 19 May 2026 22:24:56 +0530
+Subject: [PATCH net] mptcp: pm: fix memory leak from alloc-during-teardown
+ race
+
+mptcp_pm_destroy() drains msk->pm.anno_list via list_splice_init()
+under msk->pm.lock and then, for the userspace PM, drains
+msk->pm.userspace_pm_local_addr_list under the same lock. Between
+the two splices, msk->pm.lock is released.
+
+A concurrent userspace PM genl ANNOUNCE on the same msk holds a
+sock reference via mptcp_token_get_sock() and, in
+mptcp_pm_nl_announce_doit(), calls
+mptcp_userspace_pm_append_new_local_addr() and
+mptcp_pm_alloc_anno_list(). Both take msk->pm.lock briefly to
+add to their respective lists. Because the genl handler holds a
+sock reference, mptcp_pm_destroy() may run on the same msk via
+mptcp_disconnect(), which invokes mptcp_destroy_common() without
+dropping the sock refcount, before the handler completes.
+
+If the lock acquisitions interleave such that mptcp_pm_destroy()'s
+splice runs first, the subsequent alloc paths land on a list head
+pointing to itself. Nothing else iterates that list for this msk,
+and the added entry leaks. kmemleak reports both 192-byte
+mptcp_pm_add_entry objects (from mptcp_pm_alloc_anno_list()) and
+64-byte mptcp_pm_addr_entry objects (from
+mptcp_userspace_pm_append_new_local_addr()) under sustained
+concurrent ANNOUNCE + close load against the userspace PM.
+
+Add a teardown flag set by mptcp_pm_destroy() before its
+pm.lock-held splice and checked under pm.lock by the alloc paths.
+Either the alloc takes pm.lock first, in which case its entry
+will be on the list when destroy's splice runs and will be freed
+normally; or destroy takes pm.lock first, in which case the
+subsequent alloc observes the flag and refuses. Either ordering
+is correct, and the race that orphans an entry is precluded. The
+flag is cleared in mptcp_pm_data_init() so the state is correct
+on slab reuse.
+
+Found by an MPTCP protocol-flow harness extending BRF
+(arXiv:2305.08782). Baseline ~0.3 kmemleak reports/minute on the
+userspace PM reduces to zero across multi-hour runs with this
+patch applied.
+
+Assisted-by: Claude:claude-opus-4-7
+Signed-off-by: Shardul Bankar <shardul.b@mpiricsoftware.com>
+---
+ net/mptcp/pm.c           | 6 ++++++
+ net/mptcp/pm_userspace.c | 4 ++++
+ net/mptcp/protocol.h     | 7 +++++++
+ 3 files changed, 17 insertions(+)
+
+diff --git a/net/mptcp/pm.c b/net/mptcp/pm.c
+index 3e770c7407e1f..5b5c5e0c38583 100644
+--- a/net/mptcp/pm.c
++++ b/net/mptcp/pm.c
+@@ -440,6 +440,9 @@ bool mptcp_pm_alloc_anno_list(struct mptcp_sock *msk,
+ 
+ 	lockdep_assert_held(&msk->pm.lock);
+ 
++	if (READ_ONCE(msk->pm.destroying))
++		return false;
++
+ 	add_entry = mptcp_lookup_anno_list_by_saddr(msk, addr);
+ 
+ 	if (add_entry) {
+@@ -1109,6 +1112,8 @@ void mptcp_pm_worker(struct mptcp_sock *msk)
+ 
+ void mptcp_pm_destroy(struct mptcp_sock *msk)
+ {
++	WRITE_ONCE(msk->pm.destroying, true);
++
+ 	mptcp_pm_free_anno_list(msk);
+ 
+ 	if (mptcp_pm_is_userspace(msk))
+@@ -1149,6 +1154,7 @@ void mptcp_pm_data_init(struct mptcp_sock *msk)
+ 	spin_lock_init(&msk->pm.lock);
+ 	INIT_LIST_HEAD(&msk->pm.anno_list);
+ 	INIT_LIST_HEAD(&msk->pm.userspace_pm_local_addr_list);
++	msk->pm.destroying = false;
+ 	mptcp_pm_data_reset(msk);
+ }
+ 
+diff --git a/net/mptcp/pm_userspace.c b/net/mptcp/pm_userspace.c
+index 8cbc1920afb49..bf53db7307302 100644
+--- a/net/mptcp/pm_userspace.c
++++ b/net/mptcp/pm_userspace.c
+@@ -54,6 +54,10 @@ static int mptcp_userspace_pm_append_new_local_addr(struct mptcp_sock *msk,
+ 	bitmap_zero(id_bitmap, MPTCP_PM_MAX_ADDR_ID + 1);
+ 
+ 	spin_lock_bh(&msk->pm.lock);
++	if (READ_ONCE(msk->pm.destroying)) {
++		ret = -EINVAL;
++		goto append_err;
++	}
+ 	mptcp_for_each_userspace_pm_addr(msk, e) {
+ 		addr_match = mptcp_addresses_equal(&e->addr, &entry->addr, true);
+ 		if (addr_match && entry->addr.id == 0 && needs_id)
+diff --git a/net/mptcp/protocol.h b/net/mptcp/protocol.h
+index e4f5aba24da7d..c7a068ea71324 100644
+--- a/net/mptcp/protocol.h
++++ b/net/mptcp/protocol.h
+@@ -222,6 +222,13 @@ struct mptcp_pm_data {
+ 
+ 	spinlock_t	lock;		/*protects the whole PM data */
+ 
++	/* set by mptcp_pm_destroy() before its pm.lock-held splice;
++	 * checked under pm.lock by alloc paths to refuse adds that would
++	 * be orphaned by destroy's splice.  Cleared in mptcp_pm_data_init()
++	 * so the field is correct after slab reuse.
++	 */
++	bool		destroying;
++
+ 	struct_group(reset,
+ 
+ 	u8		addr_signal;
+-- 
+2.34.1
+
