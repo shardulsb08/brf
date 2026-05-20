@@ -1747,6 +1747,114 @@ static int brf_mptcp_genl_subflow_create(uint32_t token, uint8_t addr_id,
 #undef BRF_PUT_ATTR
 }
 
+/* IPv6 variant of brf_mptcp_genl_subflow_create (v10.2).  Identical
+ * wire shape -- the only differences are MPTCP_PM_ADDR_ATTR_FAMILY =
+ * AF_INET6 and a 16-byte MPTCP_PM_ADDR_ATTR_ADDR6 in place of the
+ * 4-byte ADDR4 in both the nested ADDR and ADDR_REMOTE entries.
+ * Dispatched from syz_mptcp_join_subflow when the pair was created
+ * by syz_mptcp_pair_init_v6 (pair->family == AF_INET6).  Both
+ * endpoints are ::1: the v4 path's 127.0.0.2/127.0.0.1 split has no
+ * v6 loopback equivalent (only ::1 is bound on lo), so the new v6
+ * subflow is distinguished from the initial one by its ephemeral
+ * source port -- a valid 4-tuple either way. */
+static int brf_mptcp_genl_subflow_create_v6(uint32_t token, uint8_t addr_id,
+					    uint32_t addr_flags,
+					    const struct in6_addr *local_addr6,
+					    uint16_t local_port_h,
+					    const struct in6_addr *remote_addr6,
+					    uint16_t remote_port_h)
+{
+	char buf[256];
+	struct nlmsghdr *nlh = (struct nlmsghdr *)buf;
+	struct genlmsghdr *ghdr;
+	struct nlattr *attr, *nest;
+	char *p;
+	ssize_t n;
+#define BRF_PUT_ATTR(typ, src, sz) do {				\
+		attr = (struct nlattr *)p;			\
+		attr->nla_type = (typ);				\
+		attr->nla_len  = NLA_HDRLEN + (sz);		\
+		memcpy((char *)attr + NLA_HDRLEN, (src), (sz));	\
+		p += NLA_ALIGN(attr->nla_len);			\
+	} while (0)
+
+	memset(buf, 0, sizeof(buf));
+	nlh->nlmsg_type  = brf_mptcp_pm_family_id;
+	nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
+	nlh->nlmsg_seq   = 2;
+	nlh->nlmsg_pid   = 0;
+	ghdr = (struct genlmsghdr *)NLMSG_DATA(nlh);
+	ghdr->cmd     = MPTCP_PM_CMD_SUBFLOW_CREATE;
+	ghdr->version = MPTCP_PM_VER;
+
+	p = (char *)NLMSG_DATA(nlh) + NLMSG_ALIGN(sizeof(*ghdr));
+
+	BRF_PUT_ATTR(MPTCP_PM_ATTR_TOKEN, &token, sizeof(token));
+
+	{
+		uint16_t fam_v = AF_INET6;
+		nest = (struct nlattr *)p;
+		nest->nla_type = MPTCP_PM_ATTR_ADDR | NLA_F_NESTED;
+		p += NLA_HDRLEN;
+		BRF_PUT_ATTR(MPTCP_PM_ADDR_ATTR_FAMILY, &fam_v,
+			     sizeof(fam_v));
+		BRF_PUT_ATTR(MPTCP_PM_ADDR_ATTR_ID, &addr_id,
+			     sizeof(addr_id));
+		BRF_PUT_ATTR(MPTCP_PM_ADDR_ATTR_ADDR6, local_addr6,
+			     sizeof(*local_addr6));
+		BRF_PUT_ATTR(MPTCP_PM_ADDR_ATTR_PORT, &local_port_h,
+			     sizeof(local_port_h));
+		if (addr_flags)
+			BRF_PUT_ATTR(MPTCP_PM_ADDR_ATTR_FLAGS, &addr_flags,
+				     sizeof(addr_flags));
+		nest->nla_len = p - (char *)nest;
+	}
+
+	{
+		uint16_t fam_v = AF_INET6;
+		nest = (struct nlattr *)p;
+		nest->nla_type = MPTCP_PM_ATTR_ADDR_REMOTE | NLA_F_NESTED;
+		p += NLA_HDRLEN;
+		BRF_PUT_ATTR(MPTCP_PM_ADDR_ATTR_FAMILY, &fam_v,
+			     sizeof(fam_v));
+		BRF_PUT_ATTR(MPTCP_PM_ADDR_ATTR_ADDR6, remote_addr6,
+			     sizeof(*remote_addr6));
+		BRF_PUT_ATTR(MPTCP_PM_ADDR_ATTR_PORT, &remote_port_h,
+			     sizeof(remote_port_h));
+		nest->nla_len = p - (char *)nest;
+	}
+
+	nlh->nlmsg_len = p - buf;
+
+	if (send(brf_mptcp_genl_sock, buf, nlh->nlmsg_len, 0) < 0) {
+		debug("subflow_create_v6: send: %s\n", strerror(errno));
+		return -1;
+	}
+	n = recv(brf_mptcp_genl_sock, buf, sizeof(buf), 0);
+	if (n < 0) {
+		debug("subflow_create_v6: recv: %s\n", strerror(errno));
+		return -1;
+	}
+	nlh = (struct nlmsghdr *)buf;
+	if (nlh->nlmsg_type != NLMSG_ERROR) {
+		debug("subflow_create_v6: unexpected ack type %u\n",
+		      nlh->nlmsg_type);
+		errno = EPROTO;
+		return -1;
+	}
+	{
+		struct nlmsgerr *ne = (struct nlmsgerr *)NLMSG_DATA(nlh);
+		if (ne->error) {
+			debug("subflow_create_v6: kernel err=%d (%s)\n",
+			      ne->error, strerror(-ne->error));
+			errno = -ne->error;
+			return -1;
+		}
+	}
+	return 0;
+#undef BRF_PUT_ATTR
+}
+
 /* MPTCP_PM_CMD_ANNOUNCE: tell the kernel to announce an additional
  * address via the ADD_ADDR option in the next outgoing packet on the
  * given token's connection.  Used by the v05.3 pseudo-syscall
@@ -1824,6 +1932,87 @@ static int brf_mptcp_genl_announce(uint32_t token, uint8_t addr_id,
 		struct nlmsgerr *ne = (struct nlmsgerr *)NLMSG_DATA(nlh);
 		if (ne->error) {
 			debug("pm_announce: kernel err=%d (%s)\n",
+			      ne->error, strerror(-ne->error));
+			errno = -ne->error;
+			return -1;
+		}
+	}
+	return 0;
+#undef BRF_PUT_ATTR
+}
+
+/* IPv6 variant of brf_mptcp_genl_announce (v10.2).  Nested ADDR
+ * entry carries AF_INET6 + a 16-byte ADDR6.  Dispatched from
+ * syz_mptcp_pm_announce for AF_INET6 pairs; announces ::1. */
+static int brf_mptcp_genl_announce_v6(uint32_t token, uint8_t addr_id,
+				      const struct in6_addr *addr6,
+				      uint16_t port_h, uint32_t addr_flags)
+{
+	char buf[256];
+	struct nlmsghdr *nlh = (struct nlmsghdr *)buf;
+	struct genlmsghdr *ghdr;
+	struct nlattr *attr, *nest;
+	char *p;
+	ssize_t n;
+#define BRF_PUT_ATTR(typ, src, sz) do {				\
+		attr = (struct nlattr *)p;			\
+		attr->nla_type = (typ);				\
+		attr->nla_len  = NLA_HDRLEN + (sz);		\
+		memcpy((char *)attr + NLA_HDRLEN, (src), (sz));	\
+		p += NLA_ALIGN(attr->nla_len);			\
+	} while (0)
+
+	memset(buf, 0, sizeof(buf));
+	nlh->nlmsg_type  = brf_mptcp_pm_family_id;
+	nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
+	nlh->nlmsg_seq   = 3;
+	nlh->nlmsg_pid   = 0;
+	ghdr = (struct genlmsghdr *)NLMSG_DATA(nlh);
+	ghdr->cmd     = MPTCP_PM_CMD_ANNOUNCE;
+	ghdr->version = MPTCP_PM_VER;
+
+	p = (char *)NLMSG_DATA(nlh) + NLMSG_ALIGN(sizeof(*ghdr));
+
+	BRF_PUT_ATTR(MPTCP_PM_ATTR_TOKEN, &token, sizeof(token));
+
+	{
+		uint16_t fam_v = AF_INET6;
+		nest = (struct nlattr *)p;
+		nest->nla_type = MPTCP_PM_ATTR_ADDR | NLA_F_NESTED;
+		p += NLA_HDRLEN;
+		BRF_PUT_ATTR(MPTCP_PM_ADDR_ATTR_FAMILY, &fam_v, sizeof(fam_v));
+		BRF_PUT_ATTR(MPTCP_PM_ADDR_ATTR_ID, &addr_id, sizeof(addr_id));
+		BRF_PUT_ATTR(MPTCP_PM_ADDR_ATTR_ADDR6, addr6,
+			     sizeof(*addr6));
+		BRF_PUT_ATTR(MPTCP_PM_ADDR_ATTR_PORT, &port_h, sizeof(port_h));
+		if (addr_flags)
+			BRF_PUT_ATTR(MPTCP_PM_ADDR_ATTR_FLAGS, &addr_flags,
+				     sizeof(addr_flags));
+		nest->nla_len = p - (char *)nest;
+	}
+
+	nlh->nlmsg_len = p - buf;
+
+	if (send(brf_mptcp_genl_sock, buf, nlh->nlmsg_len, 0) < 0) {
+		debug("pm_announce_v6: send: %s\n", strerror(errno));
+		return -1;
+	}
+	n = recv(brf_mptcp_genl_sock, buf, sizeof(buf), 0);
+	if (n < 0) {
+		debug("pm_announce_v6: recv: %s\n", strerror(errno));
+		return -1;
+	}
+	nlh = (struct nlmsghdr *)buf;
+	if (nlh->nlmsg_type != NLMSG_ERROR) {
+		debug("pm_announce_v6: unexpected ack type %u\n",
+		      nlh->nlmsg_type);
+		errno = EPROTO;
+		return -1;
+	}
+	{
+		struct nlmsgerr *ne = (struct nlmsgerr *)NLMSG_DATA(nlh);
+		if (ne->error) {
+			debug("pm_announce_v6: kernel err=%d (%s)\n",
 			      ne->error, strerror(-ne->error));
 			errno = -ne->error;
 			return -1;
@@ -2009,6 +2198,100 @@ static int brf_mptcp_genl_subflow_destroy(uint32_t token, uint8_t addr_id,
 #undef BRF_PUT_ATTR
 }
 
+/* IPv6 variant of brf_mptcp_genl_subflow_destroy (v10.2).  Nested
+ * ADDR and ADDR_REMOTE entries carry AF_INET6 + 16-byte ADDR6.
+ * Dispatched from syz_mptcp_pm_subflow_destroy for AF_INET6 pairs;
+ * both endpoints ::1, ports passed through from the syscall args. */
+static int brf_mptcp_genl_subflow_destroy_v6(uint32_t token, uint8_t addr_id,
+					     const struct in6_addr *local_addr6,
+					     uint16_t local_port_h,
+					     const struct in6_addr *remote_addr6,
+					     uint16_t remote_port_h)
+{
+	char buf[256];
+	struct nlmsghdr *nlh = (struct nlmsghdr *)buf;
+	struct genlmsghdr *ghdr;
+	struct nlattr *attr, *nest;
+	char *p;
+	ssize_t n;
+#define BRF_PUT_ATTR(typ, src, sz) do {				\
+		attr = (struct nlattr *)p;			\
+		attr->nla_type = (typ);				\
+		attr->nla_len  = NLA_HDRLEN + (sz);		\
+		memcpy((char *)attr + NLA_HDRLEN, (src), (sz));	\
+		p += NLA_ALIGN(attr->nla_len);			\
+	} while (0)
+
+	memset(buf, 0, sizeof(buf));
+	nlh->nlmsg_type  = brf_mptcp_pm_family_id;
+	nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
+	nlh->nlmsg_seq   = 5;
+	nlh->nlmsg_pid   = 0;
+	ghdr = (struct genlmsghdr *)NLMSG_DATA(nlh);
+	ghdr->cmd     = MPTCP_PM_CMD_SUBFLOW_DESTROY;
+	ghdr->version = MPTCP_PM_VER;
+
+	p = (char *)NLMSG_DATA(nlh) + NLMSG_ALIGN(sizeof(*ghdr));
+
+	BRF_PUT_ATTR(MPTCP_PM_ATTR_TOKEN, &token, sizeof(token));
+
+	{
+		uint16_t fam_v = AF_INET6;
+		nest = (struct nlattr *)p;
+		nest->nla_type = MPTCP_PM_ATTR_ADDR | NLA_F_NESTED;
+		p += NLA_HDRLEN;
+		BRF_PUT_ATTR(MPTCP_PM_ADDR_ATTR_FAMILY, &fam_v, sizeof(fam_v));
+		BRF_PUT_ATTR(MPTCP_PM_ADDR_ATTR_ID, &addr_id, sizeof(addr_id));
+		BRF_PUT_ATTR(MPTCP_PM_ADDR_ATTR_ADDR6, local_addr6,
+			     sizeof(*local_addr6));
+		BRF_PUT_ATTR(MPTCP_PM_ADDR_ATTR_PORT, &local_port_h,
+			     sizeof(local_port_h));
+		nest->nla_len = p - (char *)nest;
+	}
+	{
+		uint16_t fam_v = AF_INET6;
+		nest = (struct nlattr *)p;
+		nest->nla_type = MPTCP_PM_ATTR_ADDR_REMOTE | NLA_F_NESTED;
+		p += NLA_HDRLEN;
+		BRF_PUT_ATTR(MPTCP_PM_ADDR_ATTR_FAMILY, &fam_v, sizeof(fam_v));
+		BRF_PUT_ATTR(MPTCP_PM_ADDR_ATTR_ADDR6, remote_addr6,
+			     sizeof(*remote_addr6));
+		BRF_PUT_ATTR(MPTCP_PM_ADDR_ATTR_PORT, &remote_port_h,
+			     sizeof(remote_port_h));
+		nest->nla_len = p - (char *)nest;
+	}
+
+	nlh->nlmsg_len = p - buf;
+
+	if (send(brf_mptcp_genl_sock, buf, nlh->nlmsg_len, 0) < 0) {
+		debug("pm_subflow_destroy_v6: send: %s\n", strerror(errno));
+		return -1;
+	}
+	n = recv(brf_mptcp_genl_sock, buf, sizeof(buf), 0);
+	if (n < 0) {
+		debug("pm_subflow_destroy_v6: recv: %s\n", strerror(errno));
+		return -1;
+	}
+	nlh = (struct nlmsghdr *)buf;
+	if (nlh->nlmsg_type != NLMSG_ERROR) {
+		debug("pm_subflow_destroy_v6: unexpected ack type %u\n",
+		      nlh->nlmsg_type);
+		errno = EPROTO;
+		return -1;
+	}
+	{
+		struct nlmsgerr *ne = (struct nlmsgerr *)NLMSG_DATA(nlh);
+		if (ne->error) {
+			debug("pm_subflow_destroy_v6: kernel err=%d (%s)\n",
+			      ne->error, strerror(-ne->error));
+			errno = -ne->error;
+			return -1;
+		}
+	}
+	return 0;
+#undef BRF_PUT_ATTR
+}
+
 /* MPTCP_PM_CMD_SET_FLAGS: change flags (BACKUP / SIGNAL / SUBFLOW /
  * FULLMESH / IMPLICIT) on an address entry.  Used by the v06.1
  * pseudo-syscall syz_mptcp_pm_set_flags.  The kernel routes through
@@ -2086,6 +2369,87 @@ static int brf_mptcp_genl_set_flags(uint32_t token, uint8_t addr_id,
 		struct nlmsgerr *ne = (struct nlmsgerr *)NLMSG_DATA(nlh);
 		if (ne->error) {
 			debug("pm_set_flags: kernel err=%d (%s)\n",
+			      ne->error, strerror(-ne->error));
+			errno = -ne->error;
+			return -1;
+		}
+	}
+	return 0;
+#undef BRF_PUT_ATTR
+}
+
+/* IPv6 variant of brf_mptcp_genl_set_flags (v10.2).  Nested ADDR
+ * entry carries AF_INET6 + 16-byte ADDR6.  Local addr fixed at ::1
+ * (matches the v6 join_subflow address), same as the v4 helper
+ * fixes it at 127.0.0.2.  Dispatched from syz_mptcp_pm_set_flags
+ * for AF_INET6 pairs. */
+static int brf_mptcp_genl_set_flags_v6(uint32_t token, uint8_t addr_id,
+				       uint32_t addr_flags, uint16_t port_h)
+{
+	char buf[256];
+	struct nlmsghdr *nlh = (struct nlmsghdr *)buf;
+	struct genlmsghdr *ghdr;
+	struct nlattr *attr, *nest;
+	char *p;
+	ssize_t n;
+#define BRF_PUT_ATTR(typ, src, sz) do {				\
+		attr = (struct nlattr *)p;			\
+		attr->nla_type = (typ);				\
+		attr->nla_len  = NLA_HDRLEN + (sz);		\
+		memcpy((char *)attr + NLA_HDRLEN, (src), (sz));	\
+		p += NLA_ALIGN(attr->nla_len);			\
+	} while (0)
+
+	memset(buf, 0, sizeof(buf));
+	nlh->nlmsg_type  = brf_mptcp_pm_family_id;
+	nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
+	nlh->nlmsg_seq   = 6;
+	nlh->nlmsg_pid   = 0;
+	ghdr = (struct genlmsghdr *)NLMSG_DATA(nlh);
+	ghdr->cmd     = MPTCP_PM_CMD_SET_FLAGS;
+	ghdr->version = MPTCP_PM_VER;
+
+	p = (char *)NLMSG_DATA(nlh) + NLMSG_ALIGN(sizeof(*ghdr));
+
+	BRF_PUT_ATTR(MPTCP_PM_ATTR_TOKEN, &token, sizeof(token));
+
+	{
+		uint16_t fam_v = AF_INET6;
+		nest = (struct nlattr *)p;
+		nest->nla_type = MPTCP_PM_ATTR_ADDR | NLA_F_NESTED;
+		p += NLA_HDRLEN;
+		BRF_PUT_ATTR(MPTCP_PM_ADDR_ATTR_FAMILY, &fam_v, sizeof(fam_v));
+		BRF_PUT_ATTR(MPTCP_PM_ADDR_ATTR_ID, &addr_id, sizeof(addr_id));
+		BRF_PUT_ATTR(MPTCP_PM_ADDR_ATTR_ADDR6, &in6addr_loopback,
+			     sizeof(in6addr_loopback));
+		BRF_PUT_ATTR(MPTCP_PM_ADDR_ATTR_PORT, &port_h, sizeof(port_h));
+		BRF_PUT_ATTR(MPTCP_PM_ADDR_ATTR_FLAGS, &addr_flags,
+			     sizeof(addr_flags));
+		nest->nla_len = p - (char *)nest;
+	}
+
+	nlh->nlmsg_len = p - buf;
+
+	if (send(brf_mptcp_genl_sock, buf, nlh->nlmsg_len, 0) < 0) {
+		debug("pm_set_flags_v6: send: %s\n", strerror(errno));
+		return -1;
+	}
+	n = recv(brf_mptcp_genl_sock, buf, sizeof(buf), 0);
+	if (n < 0) {
+		debug("pm_set_flags_v6: recv: %s\n", strerror(errno));
+		return -1;
+	}
+	nlh = (struct nlmsghdr *)buf;
+	if (nlh->nlmsg_type != NLMSG_ERROR) {
+		debug("pm_set_flags_v6: unexpected ack type %u\n",
+		      nlh->nlmsg_type);
+		errno = EPROTO;
+		return -1;
+	}
+	{
+		struct nlmsgerr *ne = (struct nlmsgerr *)NLMSG_DATA(nlh);
+		if (ne->error) {
+			debug("pm_set_flags_v6: kernel err=%d (%s)\n",
 			      ne->error, strerror(-ne->error));
 			errno = -ne->error;
 			return -1;
@@ -2457,10 +2821,23 @@ static long syz_mptcp_join_subflow(volatile long a0, volatile long a1,
 	 * new subflow on the backup-priority code path
 	 * (mptcp_subflow_set_active / MP_PRIO handling). */
 	uint32_t addr_flags = backup ? MPTCP_PM_ADDR_FLAG_BACKUP : 0;
-	if (brf_mptcp_genl_subflow_create(pair->token, addr_id, addr_flags,
-					  local_addr_be,  0,
-					  remote_addr_be,
-					  ntohs(pair->server_listen_port)) < 0)
+	int create_rc;
+	/* v10.2: dispatch by pair family.  v6 pairs created by
+	 * syz_mptcp_pair_init_v6 use ::1 for both local and remote
+	 * endpoints (see brf_mptcp_genl_subflow_create_v6). */
+	if (pair->family == AF_INET6)
+		create_rc = brf_mptcp_genl_subflow_create_v6(
+				pair->token, addr_id, addr_flags,
+				&in6addr_loopback, 0,
+				&in6addr_loopback,
+				ntohs(pair->server_listen_port));
+	else
+		create_rc = brf_mptcp_genl_subflow_create(
+				pair->token, addr_id, addr_flags,
+				local_addr_be, 0,
+				remote_addr_be,
+				ntohs(pair->server_listen_port));
+	if (create_rc < 0)
 		return -1;
 
 	/* SUBFLOW_CREATE returns after __mptcp_subflow_connect() initiated
@@ -2827,8 +3204,17 @@ static long syz_mptcp_pm_announce(volatile long a0, volatile long a1,
 	if (addr_id == 0)
 		addr_id = 1;
 
-	if (brf_mptcp_genl_announce(pair->token, addr_id, addr_be, port_h,
-				    MPTCP_PM_ADDR_FLAG_SIGNAL) < 0) {
+	/* v10.2: dispatch by pair family.  v6 pairs announce ::1. */
+	int announce_rc;
+	if (pair->family == AF_INET6)
+		announce_rc = brf_mptcp_genl_announce_v6(
+				pair->token, addr_id, &in6addr_loopback,
+				port_h, MPTCP_PM_ADDR_FLAG_SIGNAL);
+	else
+		announce_rc = brf_mptcp_genl_announce(
+				pair->token, addr_id, addr_be, port_h,
+				MPTCP_PM_ADDR_FLAG_SIGNAL);
+	if (announce_rc < 0) {
 		debug("syz_mptcp_pm_announce: slot=%ld addr_id=%u failed\n",
 		      slot, addr_id);
 		return -1;
@@ -2937,9 +3323,19 @@ static long syz_mptcp_pm_subflow_destroy(volatile long a0, volatile long a1,
 	if (brf_mptcp_ensure_executor_setup() < 0)
 		return -1;
 
-	if (brf_mptcp_genl_subflow_destroy(pair->token, addr_id,
-					   htonl(0x7f000002), local_port_h,
-					   htonl(0x7f000001), remote_port_h) < 0) {
+	/* v10.2: dispatch by pair family.  v6 pairs use ::1 endpoints. */
+	int destroy_rc;
+	if (pair->family == AF_INET6)
+		destroy_rc = brf_mptcp_genl_subflow_destroy_v6(
+				pair->token, addr_id,
+				&in6addr_loopback, local_port_h,
+				&in6addr_loopback, remote_port_h);
+	else
+		destroy_rc = brf_mptcp_genl_subflow_destroy(
+				pair->token, addr_id,
+				htonl(0x7f000002), local_port_h,
+				htonl(0x7f000001), remote_port_h);
+	if (destroy_rc < 0) {
 		debug("syz_mptcp_pm_subflow_destroy: slot=%ld addr_id=%u "
 		      "lport=%u rport=%u failed\n",
 		      slot, addr_id, local_port_h, remote_port_h);
@@ -2987,8 +3383,15 @@ static long syz_mptcp_pm_set_flags(volatile long a0, volatile long a1,
 	if (brf_mptcp_ensure_executor_setup() < 0)
 		return -1;
 
-	if (brf_mptcp_genl_set_flags(pair->token, addr_id, addr_flags,
-				     port_h) < 0) {
+	/* v10.2: dispatch by pair family. */
+	int setflags_rc;
+	if (pair->family == AF_INET6)
+		setflags_rc = brf_mptcp_genl_set_flags_v6(
+				pair->token, addr_id, addr_flags, port_h);
+	else
+		setflags_rc = brf_mptcp_genl_set_flags(
+				pair->token, addr_id, addr_flags, port_h);
+	if (setflags_rc < 0) {
 		debug("syz_mptcp_pm_set_flags: slot=%ld id=%u flags=0x%x "
 		      "port=%u failed\n",
 		      slot, addr_id, addr_flags, port_h);

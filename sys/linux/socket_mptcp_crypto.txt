@@ -27,11 +27,12 @@ syz_mptcp_pair_init(server_addr ptr[in, int32], client_addr ptr[in, int32], init
 # v10.1: IPv6 variant.  Creates an AF_INET6 MP_CAPABLE pair on ::1.
 # Pair state records family=AF_INET6; subsequent pair_close /
 # drive_traffic / send_control calls work as before (family-
-# agnostic), while the four genl-using pseudo-syscalls
+# agnostic).  As of v10.2 the four genl-using pseudo-syscalls
 # (join_subflow, pm_announce, pm_subflow_destroy, pm_set_flags)
-# will fail with kernel-side ADDR4-vs-ADDR6 mismatch until v10.2
-# widens them.  Even so this opens fresh v6 socket-creation +
-# MP_CAPABLE-v6 + DSS-v6 surface for the fuzzer.
+# dispatch on pair->family inside the executor: v6 pairs emit
+# AF_INET6 / ADDR6 nested attributes with ::1 endpoints.  This
+# opens v6 socket-creation + MP_CAPABLE-v6 + DSS-v6 surface plus
+# the v6 MP_JOIN / ADD_ADDR / MP_PRIO genl paths for the fuzzer.
 syz_mptcp_pair_init_v6(server_addr ptr[in, array[int8, 16]], client_addr ptr[in, array[int8, 16]], init_flags flags[mptcp_init_flags], out_state ptr[out, mptcp_pair_state_t]) mptcp_pair
 
 # syz_mptcp_join_subflow: initiate MP_JOIN with valid token + HMAC.
