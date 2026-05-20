@@ -66,6 +66,14 @@ syz_mptcp_pm_remove(pair mptcp_pair, addr_id int8)
 # failure path).  Both surfaces are interesting.
 syz_mptcp_pm_subflow_destroy(pair mptcp_pair, addr_id int8, local_port int16, remote_port int16)
 
+# syz_mptcp_pm_set_flags: change flags (BACKUP / SIGNAL / SUBFLOW /
+# FULLMESH / IMPLICIT) on an address entry via MPTCP_PM_CMD_SET_FLAGS
+# genl.  Dispatches through mptcp_pm_set_flags which routes to either
+# pm_userspace or pm_kernel based on pm_type; in our pm_type=1 setup
+# this exercises the userspace-PM branch, including the MP_PRIO
+# emission path that sends backup-flag transitions on live subflows.
+syz_mptcp_pm_set_flags(pair mptcp_pair, addr_id int8, addr_flags int32, port int16)
+
 # Out-param struct.  Mirrors `struct brf_mptcp_pair_state_out` in
 # executor/common_brf_linux_mptcp.h.  Field order and sizes must
 # match exactly.
