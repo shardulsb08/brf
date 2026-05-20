@@ -106,6 +106,16 @@ syz_mptcp_pm_kernel_flush_addrs()
 # limit fields that downstream subflow-accept paths read.
 syz_mptcp_pm_set_limits(rcv_add_addrs int32, subflows int32)
 
+# syz_mptcp_diag: query the MPTCP sock_diag interface via
+# NETLINK_SOCK_DIAG.  Exercises net/mptcp/mptcp_diag.c handlers
+# (mptcp_diag_dump / mptcp_diag_get_info) -- entirely unreached by
+# the v01-v06 pseudo-syscalls which only do NETLINK_GENERIC genl.
+# Read-side dump that can race against destroy (similar bug class
+# to the alloc-during-teardown race in findings/001/).
+syz_mptcp_diag(family flags[mptcp_diag_family], states int32, ext int8)
+
+mptcp_diag_family = 2, 10  # AF_INET, AF_INET6
+
 # Out-param struct.  Mirrors `struct brf_mptcp_pair_state_out` in
 # executor/common_brf_linux_mptcp.h.  Field order and sizes must
 # match exactly.

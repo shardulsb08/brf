@@ -2884,4 +2884,101 @@ static long syz_mptcp_pm_set_limits(volatile long a0, volatile long a1)
 }
 #endif
 
+#if SYZ_EXECUTOR || __NR_syz_mptcp_diag
+/*
+ * v07: query MPTCP sock_diag.  Opens a NETLINK_SOCK_DIAG socket,
+ * sends an inet_diag_req_v2 dump request for IPPROTO_MPTCP, drains
+ * the response.  Exercises net/mptcp/mptcp_diag.c (mptcp_diag_dump,
+ * mptcp_diag_get_info, INET_DIAG_INFO extension fill-out) which is
+ * a separate file from anything v01-v06 touched.
+ *
+ * The kernel constants we use here are part of uapi for decades;
+ * defining inline avoids pulling linux/inet_diag.h (which conflicts
+ * with some distro userspace).
+ */
+#ifndef SOCK_DIAG_BY_FAMILY
+#define SOCK_DIAG_BY_FAMILY 20
+#endif
+#ifndef IPPROTO_MPTCP
+#define IPPROTO_MPTCP 262
+#endif
+
+struct brf_inet_diag_sockid {
+	uint16_t idiag_sport;
+	uint16_t idiag_dport;
+	uint32_t idiag_src[4];
+	uint32_t idiag_dst[4];
+	uint32_t idiag_if;
+	uint32_t idiag_cookie[2];
+};
+struct brf_inet_diag_req_v2 {
+	uint8_t  sdiag_family;
+	uint8_t  sdiag_protocol;
+	uint8_t  idiag_ext;
+	uint8_t  pad;
+	uint32_t idiag_states;
+	struct brf_inet_diag_sockid id;
+};
+
+static long syz_mptcp_diag(volatile long a0, volatile long a1,
+			   volatile long a2)
+{
+	uint8_t family = (uint8_t)a0;
+	uint32_t states = (uint32_t)a1;
+	uint8_t ext = (uint8_t)a2;
+	int sd_sock;
+	struct sockaddr_nl sa = { .nl_family = AF_NETLINK };
+	char buf[256];
+	struct nlmsghdr *nlh = (struct nlmsghdr *)buf;
+	struct brf_inet_diag_req_v2 *req;
+
+	sd_sock = socket(AF_NETLINK, SOCK_RAW, NETLINK_SOCK_DIAG);
+	if (sd_sock < 0) {
+		debug("syz_mptcp_diag: socket(NETLINK_SOCK_DIAG): %s\n",
+		      strerror(errno));
+		return -1;
+	}
+	if (bind(sd_sock, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
+		debug("syz_mptcp_diag: bind: %s\n", strerror(errno));
+		close(sd_sock);
+		return -1;
+	}
+
+	memset(buf, 0, sizeof(buf));
+	nlh->nlmsg_type  = SOCK_DIAG_BY_FAMILY;
+	nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP;
+	nlh->nlmsg_seq   = 11;
+	nlh->nlmsg_pid   = 0;
+	nlh->nlmsg_len   = NLMSG_HDRLEN + NLMSG_ALIGN(sizeof(*req));
+	req = (struct brf_inet_diag_req_v2 *)NLMSG_DATA(nlh);
+	req->sdiag_family   = family;
+	req->sdiag_protocol = IPPROTO_MPTCP;
+	req->idiag_ext      = ext;
+	req->idiag_states   = states;
+
+	if (send(sd_sock, buf, nlh->nlmsg_len, 0) < 0) {
+		debug("syz_mptcp_diag: send: %s\n", strerror(errno));
+		close(sd_sock);
+		return -1;
+	}
+
+	/* Drain the dump response.  Don't parse; we just want the
+	 * kernel-side dump iterator + get_info paths exercised. */
+	for (;;) {
+		ssize_t n = recv(sd_sock, buf, sizeof(buf), MSG_DONTWAIT);
+		if (n < 0)
+			break;
+		if (n == 0)
+			break;
+		if (((struct nlmsghdr *)buf)->nlmsg_type == NLMSG_DONE)
+			break;
+	}
+
+	close(sd_sock);
+	debug("syz_mptcp_diag: family=%u states=0x%x ext=0x%x done\n",
+	      family, states, ext);
+	return 0;
+}
+#endif
+
 #endif // BRF_COMMON_LINUX_MPTCP_H
