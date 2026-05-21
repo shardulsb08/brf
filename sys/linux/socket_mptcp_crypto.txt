@@ -192,7 +192,10 @@ mptcp_pair_state_t {
 
 # Mutation knob enums.  Values in socket_mptcp_crypto.txt.const;
 # constant names must match executor/common_brf_linux_mptcp.h #defines.
-mptcp_init_flags = MPTCP_INIT_CSUM_ON, MPTCP_INIT_CSUM_OFF, MPTCP_INIT_DENY_JOIN_ID0
+# MPTCP_INIT_KERNEL_PM (gap 10): create the pair under the kernel path
+# manager (pm_type=0) -- the kernel PM then auto-manages subflows /
+# ADD_ADDR from the netns addr table (pm_kernel_add_addr, pm_set_limits).
+mptcp_init_flags = MPTCP_INIT_CSUM_ON, MPTCP_INIT_CSUM_OFF, MPTCP_INIT_DENY_JOIN_ID0, MPTCP_INIT_KERNEL_PM
 mptcp_nonce_mut = MPTCP_NONCE_NORMAL, MPTCP_NONCE_ZERO, MPTCP_NONCE_FLIP_HIGH, MPTCP_NONCE_FLIP_LOW, MPTCP_NONCE_REPLAY
 mptcp_hmac_mut = MPTCP_HMAC_NORMAL, MPTCP_HMAC_ZERO, MPTCP_HMAC_BIT_FLIP, MPTCP_HMAC_TRUNCATE, MPTCP_HMAC_SWAP
 # MPTCP_MAP_BAD_CSUM (gap 2 Step 2): corrupt the DSS data checksum.  On a

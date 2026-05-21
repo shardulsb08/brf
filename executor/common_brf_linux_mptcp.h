@@ -25,6 +25,9 @@
 #define MPTCP_INIT_CSUM_ON           1
 #define MPTCP_INIT_CSUM_OFF          2
 #define MPTCP_INIT_DENY_JOIN_ID0     4
+/* gap 10: create this pair under the kernel path manager (pm_type=0)
+ * instead of the userspace PM the harness defaults to. */
+#define MPTCP_INIT_KERNEL_PM         8
 
 #define MPTCP_NONCE_NORMAL           0
 #define MPTCP_NONCE_ZERO             1
@@ -1247,6 +1250,14 @@ static long syz_mptcp_pair_init(volatile long a0, volatile long a1,
 				debug("syz_mptcp_pair_init: deny_join_id0 "
 				      "write failed: %s\n", strerror(errno));
 		}
+		/* gap 10: pm_type is captured per-msk at creation, so set
+		 * it per-pair.  MPTCP_INIT_KERNEL_PM -> pm_type=0 (kernel PM
+		 * auto-manages subflows / ADD_ADDR from the netns addr
+		 * table); otherwise pm_type=1 (userspace PM, the default). */
+		if (!write_file("/proc/sys/net/mptcp/pm_type",
+				(init_flags_v & MPTCP_INIT_KERNEL_PM) ? "0" : "1"))
+			debug("syz_mptcp_pair_init: pm_type write failed: "
+			      "%s\n", strerror(errno));
 	}
 
 	/* 0. Flip the netns to userspace PM mode BEFORE creating any msk:
@@ -1513,6 +1524,12 @@ static long syz_mptcp_pair_init_v6(volatile long a0, volatile long a1,
 				debug("syz_mptcp_pair_init_v6: deny_join_id0 "
 				      "write failed: %s\n", strerror(errno));
 		}
+		/* gap 10: pm_type captured per-msk at creation -- set it
+		 * per-pair (MPTCP_INIT_KERNEL_PM -> pm_type=0, else 1). */
+		if (!write_file("/proc/sys/net/mptcp/pm_type",
+				(init_flags_v & MPTCP_INIT_KERNEL_PM) ? "0" : "1"))
+			debug("syz_mptcp_pair_init_v6: pm_type write failed: "
+			      "%s\n", strerror(errno));
 	}
 
 #if SYZ_EXECUTOR || __NR_syz_mptcp_join_subflow
