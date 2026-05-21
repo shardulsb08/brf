@@ -312,7 +312,11 @@ func (brf *BpfRuntimeFuzzer) mutBpfProg(r *randGen, p *BpfProg, opt BrfGenProgOp
 
 func (brf *BpfRuntimeFuzzer) compileBpfProg(p *BpfProg) error {
 	var timeout time.Duration = 10000000000
-	cmd := exec.Command("/home/user/llvm-project/build/bin/clang-21", "-g", "-D__TARGET_ARCH_x86", "-mlittle-endian",
+	// clang-21 is resolved via PATH: BRF's BPF generator needs a
+	// recent clang (-mcpu=v3, BTF emission).  The previous hardcoded
+	// Fedora-docker path (/home/user/llvm-project/...) does not exist
+	// on the dev_env host, which has clang-21 in /usr/local/bin.
+	cmd := exec.Command("clang-21", "-g", "-D__TARGET_ARCH_x86", "-mlittle-endian",
 		"-idirafter", "/usr/local/include",
 		"-idirafter", "/usr/local/llvm/include",
 		"-idirafter", "/usr/include/x86_64-linux-gnu",
