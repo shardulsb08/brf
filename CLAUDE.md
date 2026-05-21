@@ -93,6 +93,9 @@ Session contract:
 | Picking or updating a kernel base for any harness, applying our      | `.claude/designs/kernel_base_management.md`             |
 | kernel-side patches, or recording reproducibility footers for bug    |                                                         |
 | reports                                                              |                                                         |
+| Implementing or extending **Phase 3** -- the BPF struct_ops MPTCP    | `.claude/designs/mptcp_bpf_sched_phase3.md`             |
+| scheduler -- or changing BRF's program generator (`prog/brf*.go`)    |                                                         |
+| for struct_ops program generation                                    |                                                         |
 
 ## Design principles (binding on all work in this tree)
 
