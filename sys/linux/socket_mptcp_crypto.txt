@@ -73,6 +73,14 @@ syz_mptcp_pm_remove(pair mptcp_pair, addr_id int8)
 # / pm_kernel_flush_addrs is the dump-vs-teardown surface.
 syz_mptcp_pm_get_addr(pair mptcp_pair, with_token int8[0:1])
 
+# syz_mptcp_pm_opt_mut (gap 7): arm the NFQUEUE worker to wire-mutate
+# the next emitted ADD_ADDR / RM_ADDR / MP_PRIO option.  Call right
+# before the pm_* syscall that emits it (pm_announce -> ADD_ADDR,
+# pm_remove -> RM_ADDR, pm_set_flags -> MP_PRIO).  The worker rewrites
+# the option bytes on the egress ACK so the peer kernel's path-manager
+# parser sees malformed input.
+syz_mptcp_pm_opt_mut(pair mptcp_pair, mut flags[mptcp_pm_opt_mut])
+
 # syz_mptcp_pm_subflow_destroy: tell the kernel to tear down a
 # specific subflow on this msk.  Sibling of join_subflow's
 # SUBFLOW_CREATE; exercises mptcp_pm_nl_subflow_destroy_doit and
@@ -177,3 +185,6 @@ mptcp_map_mut = MPTCP_MAP_NORMAL, MPTCP_MAP_STALE_SEQ, MPTCP_MAP_OFF_BY_ONE, MPT
 # MP_RST (reason / transient bit / option length), 6-7 mutate
 # MP_FASTCLOSE (receiver key / option length).
 mptcp_control_subopt = MPTCP_CTL_FAIL, MPTCP_CTL_FASTCLOSE, MPTCP_CTL_RST, MPTCP_CTL_RST_REASON, MPTCP_CTL_RST_TRANSIENT, MPTCP_CTL_RST_BADLEN, MPTCP_CTL_FASTCLOSE_KEY, MPTCP_CTL_FASTCLOSE_BADLEN
+# gap 7: ADD_ADDR / RM_ADDR / MP_PRIO option mutation -- 1-3 mutate
+# ADD_ADDR, 4-5 RM_ADDR, 6-7 MP_PRIO (see executor #defines).
+mptcp_pm_opt_mut = MPTCP_PM_OPT_NONE, MPTCP_PM_OPT_ADDR_HMAC, MPTCP_PM_OPT_ADDR_ECHO, MPTCP_PM_OPT_ADDR_BADLEN, MPTCP_PM_OPT_RM_ID, MPTCP_PM_OPT_RM_BADLEN, MPTCP_PM_OPT_PRIO_BACKUP, MPTCP_PM_OPT_PRIO_ID

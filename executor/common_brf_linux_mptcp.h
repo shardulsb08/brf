@@ -57,6 +57,17 @@
 #define MPTCP_CTL_RST_BADLEN         5
 #define MPTCP_CTL_FASTCLOSE_KEY      6
 #define MPTCP_CTL_FASTCLOSE_BADLEN   7
+/* gap 7: ADD_ADDR / RM_ADDR / MP_PRIO wire-mutation knobs (used by
+ * syz_mptcp_pm_opt_mut).  1-3 mutate ADD_ADDR, 4-5 RM_ADDR, 6-7
+ * MP_PRIO. */
+#define MPTCP_PM_OPT_NONE            0
+#define MPTCP_PM_OPT_ADDR_HMAC       1
+#define MPTCP_PM_OPT_ADDR_ECHO       2
+#define MPTCP_PM_OPT_ADDR_BADLEN     3
+#define MPTCP_PM_OPT_RM_ID           4
+#define MPTCP_PM_OPT_RM_BADLEN       5
+#define MPTCP_PM_OPT_PRIO_BACKUP     6
+#define MPTCP_PM_OPT_PRIO_ID         7
 
 // ---------- MPTCP uapi fallbacks ----------
 // Older distro headers won't have these; match the patched kernel.
@@ -189,6 +200,10 @@ static volatile int brf_nfq_mut_fired         = 0;  /* OR of the three */
 static volatile int brf_nfq_pending_ctl_mut   = 0;
 static volatile int brf_nfq_mut_fired_ctl     = 0;
 static volatile unsigned char brf_nfq_rst_reason_rot = 0;
+/* gap 7: ADD_ADDR / RM_ADDR / MP_PRIO option mutation (set by
+ * syz_mptcp_pm_opt_mut, consumed by the worker on the next ACK). */
+static volatile int brf_nfq_pending_pm_opt_mut = 0;
+static volatile int brf_nfq_mut_fired_pmopt   = 0;
 static volatile int brf_nfq_worker_stop       = 0;
 static pthread_t    brf_nfq_worker_thread;
 static int          brf_nfq_worker_started   = 0;
@@ -510,6 +525,50 @@ static void brf_nfq_apply_ctl_mut(uint8_t *opt, int mut)
 		break;
 	case MPTCP_CTL_FASTCLOSE_BADLEN:
 		opt[1] = 8;		/* claim 8 bytes for a 12-byte option */
+		break;
+	default:
+		break;
+	}
+}
+
+/* Apply a path-manager option mutation (gap 7) to an ADD_ADDR /
+ * RM_ADDR / MP_PRIO option on an egress ACK.  `opt` points at the
+ * option's kind byte.
+ *   ADD_ADDR: [30][len][subtype<<4|echo][id][addr..][port?][ahmac:8?]
+ *   RM_ADDR : [30][len][subtype<<4|flags][id..]
+ *   MP_PRIO : [30][3|4][subtype<<4|backup][id?]
+ * BADLEN rewrites only the length field, leaving the bytes intact. */
+static void brf_nfq_apply_pm_opt_mut(uint8_t *opt, int mut)
+{
+	uint8_t opt_len = opt[1];
+
+	switch (mut) {
+	case MPTCP_PM_OPT_ADDR_HMAC:
+		/* the 8-byte add-addr HMAC is the option tail; flipping its
+		 * last byte makes add_addr_hmac_valid() reject the option */
+		if (opt_len >= 16)
+			opt[opt_len - 1] ^= 0x01;
+		break;
+	case MPTCP_PM_OPT_ADDR_ECHO:
+		opt[2] ^= 0x01;		/* flip the ADD_ADDR echo (E) flag */
+		break;
+	case MPTCP_PM_OPT_ADDR_BADLEN:
+		if (opt_len >= 6)
+			opt[1] = opt_len - 2;
+		break;
+	case MPTCP_PM_OPT_RM_ID:
+		if (opt_len >= 4)
+			opt[3] ^= 0x01;	/* corrupt the first removed addr_id */
+		break;
+	case MPTCP_PM_OPT_RM_BADLEN:
+		opt[1] = 3;		/* claim the minimum, dropping id bytes */
+		break;
+	case MPTCP_PM_OPT_PRIO_BACKUP:
+		opt[2] ^= 0x01;		/* flip the MP_PRIO backup (B) flag */
+		break;
+	case MPTCP_PM_OPT_PRIO_ID:
+		if (opt_len >= 4)
+			opt[3] ^= 0x01;	/* corrupt the MP_PRIO addr_id */
 		break;
 	default:
 		break;
@@ -872,6 +931,30 @@ static void *brf_nfq_worker_loop(void *arg)
 							applied_what = "control option";
 							BRF_ATOMIC_STORE(
 								&brf_nfq_mut_fired_ctl, 1);
+						}
+					}
+					/* gap 7: ACK egress -- mutate the emitted
+					 * ADD_ADDR / RM_ADDR / MP_PRIO option. */
+					if (!applied_mut && tcp->ack && !tcp->syn &&
+					    !tcp->fin && !tcp->rst &&
+					    !BRF_ATOMIC_LOAD(&brf_nfq_mut_fired_pmopt)) {
+						int pm = BRF_ATOMIC_LOAD(
+							&brf_nfq_pending_pm_opt_mut);
+						/* 1-3 -> ADD_ADDR(3), 4-5 -> RM_ADDR(4),
+						 * 6-7 -> MP_PRIO(5). */
+						uint8_t st = pm <= MPTCP_PM_OPT_ADDR_BADLEN
+							? 3 : (pm <= MPTCP_PM_OPT_RM_BADLEN
+							       ? 4 : 5);
+						uint8_t *o = pm ?
+							brf_nfq_find_mptcp_subopt(
+								(uint8_t *)tcp,
+								tcp_hlen, st) : NULL;
+						if (o) {
+							brf_nfq_apply_pm_opt_mut(o, pm);
+							applied_mut = pm;
+							applied_what = "pm option";
+							BRF_ATOMIC_STORE(
+								&brf_nfq_mut_fired_pmopt, 1);
 						}
 					}
 				}
@@ -3981,6 +4064,43 @@ static long syz_mptcp_pm_get_addr(volatile long a0, volatile long a1)
 	}
 	debug("syz_mptcp_pm_get_addr: slot=%ld with_token=%d done\n",
 	      slot, with_token);
+	return 0;
+}
+#endif
+
+#if SYZ_EXECUTOR || __NR_syz_mptcp_pm_opt_mut
+/*
+ * gap 7: arm the NFQUEUE worker to wire-mutate the next emitted
+ * ADD_ADDR / RM_ADDR / MP_PRIO path-manager option.  Call this
+ * immediately before the pm_* syscall that emits the option
+ * (pm_announce -> ADD_ADDR, pm_remove -> RM_ADDR, pm_set_flags ->
+ * MP_PRIO): the worker rewrites the option bytes on the egress ACK
+ * so the peer kernel's path-manager option parser sees malformed
+ * input.  One mutation per call (mut_fired_pmopt gates re-firing
+ * until the next arm).  a0 = pair slot, a1 = MPTCP_PM_OPT_* knob.
+ */
+static long syz_mptcp_pm_opt_mut(volatile long a0, volatile long a1)
+{
+	struct brf_mptcp_pair_state *pair;
+	long slot = a0;
+	int mut = (int)a1;
+
+	if (slot < 0 || slot >= MPTCP_PAIR_POOL_SIZE) {
+		debug("syz_mptcp_pm_opt_mut: slot %ld out of range\n", slot);
+		return -1;
+	}
+	pair = &brf_mptcp_pair_pool[slot];
+	if (!pair->in_use) {
+		debug("syz_mptcp_pm_opt_mut: slot %ld not in use\n", slot);
+		return -1;
+	}
+	if (mut == MPTCP_PM_OPT_NONE)
+		return 0;
+	if (brf_mptcp_ensure_nfq_setup() < 0)
+		return -1;
+	BRF_ATOMIC_STORE(&brf_nfq_mut_fired_pmopt, 0);
+	BRF_ATOMIC_STORE(&brf_nfq_pending_pm_opt_mut, mut);
+	debug("syz_mptcp_pm_opt_mut: slot=%ld armed mut=%d\n", slot, mut);
 	return 0;
 }
 #endif
