@@ -144,20 +144,23 @@ syz_mptcp_diag(family flags[mptcp_diag_family], states int32, ext int8)
 # AF_INET = 2, AF_INET6 = 10
 mptcp_diag_family = 2, 10
 
-# syz_mptcp_setsockopt_fuzz: setsockopt on SOL_MPTCP with a
-# fuzzer-controlled optname + payload.  optname 5 is excluded from
-# the enum below (and hard-rejected in the executor): in the
-# BRF-patched kernel optname 5 is MPTCP_KCOV_HANDLE, the harness's
-# own kcov plumbing -- fuzzing it overwrites msk->kcov_remote_handle
-# with garbage and trips kcov_check_handle()'s WARN.  The remaining
-# optnames are getsockopt names, so SOL_MPTCP setsockopt returns
-# -EOPNOTSUPP; real setsockopt surface needs a level arg (gap 3).
-syz_mptcp_setsockopt_fuzz(pair mptcp_pair, optname flags[mptcp_sockopt_name], val ptr[in, array[int8]], val_len bytesize[val])
+# syz_mptcp_setsockopt_fuzz (gap 3): setsockopt with a fuzzer-
+# controlled level, optname and payload.  An MPTCP socket routes
+# SOL_TCP / SOL_SOCKET setsockopts to its subflows, so fuzzing the
+# level reaches real sockopt surface beyond the SOL_MPTCP switch.
+# The executor hard-rejects setsockopt(SOL_MPTCP, MPTCP_KCOV_HANDLE)
+# -- that optname is the harness's own kcov plumbing.
+syz_mptcp_setsockopt_fuzz(pair mptcp_pair, optname int32, val ptr[in, array[int8]], val_len bytesize[val], level flags[mptcp_sockopt_level])
 
-# 1 MPTCP_INFO, 2 MPTCP_TCPINFO, 3 MPTCP_SUBFLOW_ADDRS,
-# 4 MPTCP_FULL_INFO, 6 MPTCP_DEBUG_KEYS, 7 MPTCP_PM_LIST.
-# 5 (MPTCP_KCOV_HANDLE) is intentionally omitted -- see above.
-mptcp_sockopt_name = 1, 2, 3, 4, 6, 7
+# syz_mptcp_getsockopt_fuzz (gap 4): getsockopt with a fuzzer-
+# controlled level / optname / optlen on the client + server msk.
+# Exercises the MPTCP getsockopt handlers (MPTCP_INFO, SUBFLOW_ADDRS,
+# FULL_INFO, ...) and the SOL_TCP / SOL_SOCKET getsockopt paths; a
+# fuzzed optlen probes copy-length / truncation handling.
+syz_mptcp_getsockopt_fuzz(pair mptcp_pair, level flags[mptcp_sockopt_level], optname int32, optlen int32)
+
+# SOL_IP=0, SOL_SOCKET=1, SOL_TCP=6, SOL_IPV6=41, SOL_MPTCP=284
+mptcp_sockopt_level = 0, 1, 6, 41, 284
 
 # Out-param struct.  Mirrors `struct brf_mptcp_pair_state_out` in
 # executor/common_brf_linux_mptcp.h.  Field order and sizes must

@@ -3898,26 +3898,28 @@ static long syz_mptcp_diag(volatile long a0, volatile long a1,
 
 #if SYZ_EXECUTOR || __NR_syz_mptcp_setsockopt_fuzz
 /*
- * v08: setsockopt on SOL_MPTCP with a fuzzer-controlled optname and
- * payload.  optname MPTCP_KCOV_HANDLE (5) is rejected up front: it
- * is the harness's own kcov instrumentation plumbing, not a real
- * MPTCP sockopt.  A fuzzer-controlled value there overwrites
- * msk->kcov_remote_handle with garbage, which then trips
- * kcov_check_handle()'s WARN_ON in kcov_remote_start_prealloc()
- * (kernel/kcov.c:971).  optname 5 is also dropped from the
- * mptcp_sockopt_name syzlang enum; this is the executor backstop.
- * The remaining SOL_MPTCP optnames are getsockopt names, so
- * setsockopt returns -EOPNOTSUPP -- real setsockopt surface needs
- * a level argument (audit backlog gap 3, a later change).
+ * v08 + gap 3: setsockopt with a fuzzer-controlled level, optname and
+ * payload on the client / server msk.  level selects SOL_MPTCP,
+ * SOL_SOCKET, SOL_TCP, SOL_IP or SOL_IPV6 -- an MPTCP socket routes
+ * SOL_TCP / SOL_SOCKET setsockopts to its subflows
+ * (mptcp_setsockopt_sol_tcp / _sol_socket), so fuzzing the level
+ * reaches real sockopt surface beyond the thin SOL_MPTCP switch.
+ *
+ * setsockopt(SOL_MPTCP, MPTCP_KCOV_HANDLE) is rejected up front: that
+ * optname is the harness's own kcov instrumentation plumbing; a
+ * fuzzer-controlled value there overwrites msk->kcov_remote_handle
+ * and trips kcov_check_handle()'s WARN.  Only dangerous at SOL_MPTCP.
  */
 static long syz_mptcp_setsockopt_fuzz(volatile long a0, volatile long a1,
-				      volatile long a2, volatile long a3)
+				      volatile long a2, volatile long a3,
+				      volatile long a4)
 {
 	struct brf_mptcp_pair_state *pair;
 	long slot = a0;
 	int optname = (int)a1;
 	void *val = (void *)a2;
 	socklen_t val_len = (socklen_t)a3;
+	int level = (int)a4;
 	int r;
 
 	if (slot < 0 || slot >= MPTCP_PAIR_POOL_SIZE)
@@ -3926,15 +3928,9 @@ static long syz_mptcp_setsockopt_fuzz(volatile long a0, volatile long a1,
 	if (!pair->in_use)
 		return -1;
 
-	/* Never let the fuzzer setsockopt(MPTCP_KCOV_HANDLE): that
-	 * optname is the harness's kcov instrumentation handle, not a
-	 * real MPTCP sockopt.  A fuzzer-controlled value corrupts
-	 * msk->kcov_remote_handle and trips a kcov WARN once a wrapped
-	 * gate fires.  The mptcp_sockopt_name syzlang enum already
-	 * omits 5; this guards against flag-mutation producing it. */
-	if (optname == MPTCP_KCOV_HANDLE) {
-		debug("syz_mptcp_setsockopt_fuzz: refusing optname=%d "
-		      "(MPTCP_KCOV_HANDLE -- harness kcov plumbing)\n",
+	if (level == SOL_MPTCP && optname == MPTCP_KCOV_HANDLE) {
+		debug("syz_mptcp_setsockopt_fuzz: refusing SOL_MPTCP "
+		      "optname=%d (MPTCP_KCOV_HANDLE -- harness plumbing)\n",
 		      optname);
 		return -1;
 	}
@@ -3947,17 +3943,17 @@ static long syz_mptcp_setsockopt_fuzz(volatile long a0, volatile long a1,
 	/* Try on both client and server-accepted msk fds; the kernel
 	 * may validate differently depending on socket state. */
 	if (pair->client_msk_fd >= 0) {
-		r = setsockopt(pair->client_msk_fd, SOL_MPTCP, optname,
+		r = setsockopt(pair->client_msk_fd, level, optname,
 			       val, val_len);
 		(void)r;
 	}
 	if (pair->server_msk_fd >= 0) {
-		r = setsockopt(pair->server_msk_fd, SOL_MPTCP, optname,
+		r = setsockopt(pair->server_msk_fd, level, optname,
 			       val, val_len);
 		(void)r;
 	}
-	debug("syz_mptcp_setsockopt_fuzz: slot=%ld optname=%d len=%u done\n",
-	      slot, optname, val_len);
+	debug("syz_mptcp_setsockopt_fuzz: slot=%ld level=%d optname=%d "
+	      "len=%u done\n", slot, level, optname, val_len);
 	return 0;
 }
 #endif
@@ -4101,6 +4097,54 @@ static long syz_mptcp_pm_opt_mut(volatile long a0, volatile long a1)
 	BRF_ATOMIC_STORE(&brf_nfq_mut_fired_pmopt, 0);
 	BRF_ATOMIC_STORE(&brf_nfq_pending_pm_opt_mut, mut);
 	debug("syz_mptcp_pm_opt_mut: slot=%ld armed mut=%d\n", slot, mut);
+	return 0;
+}
+#endif
+
+#if SYZ_EXECUTOR || __NR_syz_mptcp_getsockopt_fuzz
+/*
+ * gap 4: getsockopt on the client + server msk with a fuzzer-
+ * controlled level, optname and optlen.  Exercises the MPTCP
+ * getsockopt handlers (mptcp_getsockopt_sol_mptcp: MPTCP_INFO,
+ * MPTCP_SUBFLOW_ADDRS, MPTCP_FULL_INFO, ...) and the SOL_TCP /
+ * SOL_SOCKET getsockopt paths an MPTCP socket routes.  A fuzzed
+ * optlen probes the handlers' copy-length / truncation logic
+ * (info-leak class).  optlen is capped to the local buffer so a
+ * huge fuzzer value cannot overflow the executor.
+ */
+static long syz_mptcp_getsockopt_fuzz(volatile long a0, volatile long a1,
+				      volatile long a2, volatile long a3)
+{
+	struct brf_mptcp_pair_state *pair;
+	long slot = a0;
+	int level = (int)a1;
+	int optname = (int)a2;
+	long want = a3;
+	char buf[512];
+
+	if (slot < 0 || slot >= MPTCP_PAIR_POOL_SIZE) {
+		debug("syz_mptcp_getsockopt_fuzz: slot %ld out of range\n", slot);
+		return -1;
+	}
+	pair = &brf_mptcp_pair_pool[slot];
+	if (!pair->in_use) {
+		debug("syz_mptcp_getsockopt_fuzz: slot %ld not in use\n", slot);
+		return -1;
+	}
+	if (pair->client_msk_fd >= 0) {
+		socklen_t optlen = (want < 0 || want > (long)sizeof(buf))
+				   ? (socklen_t)sizeof(buf) : (socklen_t)want;
+		(void)getsockopt(pair->client_msk_fd, level, optname,
+				 buf, &optlen);
+	}
+	if (pair->server_msk_fd >= 0) {
+		socklen_t optlen = (want < 0 || want > (long)sizeof(buf))
+				   ? (socklen_t)sizeof(buf) : (socklen_t)want;
+		(void)getsockopt(pair->server_msk_fd, level, optname,
+				 buf, &optlen);
+	}
+	debug("syz_mptcp_getsockopt_fuzz: slot=%ld level=%d optname=%d "
+	      "want=%ld done\n", slot, level, optname, want);
 	return 0;
 }
 #endif
