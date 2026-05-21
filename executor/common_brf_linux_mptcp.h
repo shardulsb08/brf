@@ -43,6 +43,9 @@
 #define MPTCP_MAP_OFF_BY_ONE         2
 #define MPTCP_MAP_INFINITE           3
 #define MPTCP_MAP_HOLE               4
+/* gap 2 Step 2: corrupt the DSS data checksum -> MAPPING_BAD_CSUM ->
+ * MP_FAIL on a csum-enabled connection. */
+#define MPTCP_MAP_BAD_CSUM           5
 
 #define MPTCP_CTL_FAIL               0
 #define MPTCP_CTL_FASTCLOSE          1
@@ -593,6 +596,18 @@ static void brf_nfq_apply_map_mut(uint8_t *opt, int mut_type)
 			v = htonl(ntohl(v) - 0x100);
 			memcpy(opt + 8, &v, 4);
 		}
+		break;
+	case MPTCP_MAP_BAD_CSUM:
+		/* gap 2 Step 2: corrupt the DSS data checksum -- the last
+		 * 2 bytes of the option when csum mode is on.  The worker
+		 * recomputes the *TCP* checksum afterwards, so the segment
+		 * passes the TCP layer; only the *MPTCP* DSS csum is wrong.
+		 * On a csum-enabled connection validate_data_csum() then
+		 * returns MAPPING_BAD_CSUM -> send_mp_fail -> MP_FAIL.
+		 * (On a csum-off connection there is no csum field; this
+		 * just perturbs a trailing mapping byte.) */
+		if (opt_len >= 8)
+			opt[opt_len - 2] ^= 0x01;
 		break;
 	default:
 		break;

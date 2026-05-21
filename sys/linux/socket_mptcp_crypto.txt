@@ -160,7 +160,10 @@ mptcp_pair_state_t {
 mptcp_init_flags = MPTCP_INIT_CSUM_ON, MPTCP_INIT_CSUM_OFF, MPTCP_INIT_DENY_JOIN_ID0
 mptcp_nonce_mut = MPTCP_NONCE_NORMAL, MPTCP_NONCE_ZERO, MPTCP_NONCE_FLIP_HIGH, MPTCP_NONCE_FLIP_LOW, MPTCP_NONCE_REPLAY
 mptcp_hmac_mut = MPTCP_HMAC_NORMAL, MPTCP_HMAC_ZERO, MPTCP_HMAC_BIT_FLIP, MPTCP_HMAC_TRUNCATE, MPTCP_HMAC_SWAP
-mptcp_map_mut = MPTCP_MAP_NORMAL, MPTCP_MAP_STALE_SEQ, MPTCP_MAP_OFF_BY_ONE, MPTCP_MAP_INFINITE, MPTCP_MAP_HOLE
+# MPTCP_MAP_BAD_CSUM (gap 2 Step 2): corrupt the DSS data checksum.  On a
+# csum-enabled pair -> MAPPING_BAD_CSUM -> MP_FAIL emission; pair the
+# fuzzer arms it against MPTCP_INIT_CSUM_ON pairs to reach that path.
+mptcp_map_mut = MPTCP_MAP_NORMAL, MPTCP_MAP_STALE_SEQ, MPTCP_MAP_OFF_BY_ONE, MPTCP_MAP_INFINITE, MPTCP_MAP_HOLE, MPTCP_MAP_BAD_CSUM
 # 0-2: clean close/abort triggers.  3-7 (gap 2 part b): the close also
 # has the NFQUEUE worker mutate the emitted control option -- 3-5 mutate
 # MP_RST (reason / transient bit / option length), 6-7 mutate

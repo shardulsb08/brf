@@ -426,16 +426,33 @@ drives the kernel into the state that emits each one:
   in `mptcp_established_options_rst()`; a fastclose RST carries it
   alongside MP_FASTCLOSE (options.c:863-867).
 - **MP_FAIL** -- `subflow->send_mp_fail`, set on a bad MPTCP DSS
-  checksum (`MAPPING_BAD_CSUM`) on a csum-enabled subflow
-  (subflow.c:1418).
+  checksum (`MAPPING_BAD_CSUM`, subflow.c:1418).  This is a
+  *data-path* event, not a close -- so it is **not** a
+  `send_control` option.  Step 2 implements it as a
+  `drive_traffic` DSS mutation (`MPTCP_MAP_BAD_CSUM`, Section 5.3).
 
 Step 1 (emit) wires CTL_FASTCLOSE / CTL_RST to the two fastclose
-trigger conditions; CTL_FAIL stays a graceful close until Step 2
-adds the bad-csum path.  Step 1 is emission only -- bug-finding
-comes from part (b): NFQUEUE wire-mutation of the emitted option
-bytes (RST reason/transient, FASTCLOSE key, FAIL seq, lengths) so
-the peer kernel's parser sees malformed control options.  Emit
-without mutate is the "false coverage" trap, not the end state.
+trigger conditions.  CTL_FAIL stays a plain graceful close -- it
+is honest close-path coverage (`__mptcp_wr_shutdown` / DATA_FIN)
+and, despite the name, does not emit MP_FAIL (the audit's
+"MP_FAIL via send_control" framing was mechanically wrong).
+Step 1 is emission only -- bug-finding comes from part (b):
+NFQUEUE wire-mutation of the emitted option bytes (RST
+reason/transient, FASTCLOSE key, option lengths) so the peer
+kernel's parser sees malformed control options.  Emit without
+mutate is the "false coverage" trap, not the end state.
+
+**Step 2 (MP_FAIL).**  `drive_traffic` gains `MPTCP_MAP_BAD_CSUM`,
+which corrupts the DSS data-checksum field (the last 2 bytes of
+the option).  On an `MPTCP_INIT_CSUM_ON` pair this drives
+`validate_data_csum()` to `MAPPING_BAD_CSUM`; on the MPC subflow
+(with `valid_csum_seen` set by prior traffic / the pair_init
+priming round-trip) that reaches `mptcp_subflow_fail()` and
+MP_FAIL goes on the wire.  On a *joined* subflow the same
+`MAPPING_BAD_CSUM` instead trips `WARN_ON_ONCE(ssk != msk->first)`
+in `mptcp_subflow_fail()` -- left as fuzz surface, not designed
+around (a corrupt csum on a joined subflow is a legitimate wire
+event; whether that WARN is a real defect is for triage).
 
 ## 6. Injection mechanism choice
 
