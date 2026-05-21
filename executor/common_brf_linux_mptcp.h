@@ -3060,43 +3060,42 @@ static long syz_mptcp_drive_traffic(volatile long a0, volatile long a1,
 
 #if SYZ_EXECUTOR || __NR_syz_mptcp_send_control
 /*
- * v04 C3: emit an MPTCP control event by closing the chosen socket with
- * the mechanism that triggers the requested kind of control packet.
- * The kernel does all the wire-side work -- we just pick which fd to
- * close and how.
+ * Phase 2 gap 2, Step 1 (emit): drive the kernel into the close/abort
+ * paths that put MPTCP control suboptions on the wire.  MPTCP control
+ * suboptions are emitted by the kernel, gated on per-subflow flags --
+ * never by raw userspace injection -- so the harness creates the
+ * trigger condition and lets the kernel do the wire-side work.
  *
- *   suboption == MPTCP_CTL_RST       -> SO_LINGER timeout=0 + close()
- *                                       => RST on wire (kernel adds
- *                                          MP_RST option if subflow is
- *                                          still in MPTCP state).
- *                                          Exercises subflow_reset,
- *                                          mptcp_subflow_drop_ctx,
- *                                          mptcp_pm_subflow_check_next.
- *   suboption == MPTCP_CTL_FASTCLOSE -> shutdown(SHUT_RDWR) + close()
- *                                       => graceful close, MPTCP emits
- *                                          MP_FASTCLOSE if there's
- *                                          unacked data or in specific
- *                                          state.  Exercises
- *                                          mptcp_do_fastclose,
- *                                          __mptcp_destroy_sock cleanup
- *                                          path, mptcp_close_wake_up.
- *   suboption == MPTCP_CTL_FAIL      -> close() only
- *                                       => normal FIN exchange.
- *                                          Exercises mptcp_shutdown,
- *                                          mptcp_check_send_data_fin,
- *                                          mptcp_close_ssk.
+ *   MPTCP_CTL_FASTCLOSE -> SO_LINGER{1,0} close of the client msk.
+ *       Hits __mptcp_close() condition 3 (SO_LINGER && !lingertime,
+ *       protocol.c) -> mptcp_do_fastclose() -> subflow->send_fastclose.
+ *       The resulting RST carries MP_FASTCLOSE *and* MP_RST
+ *       (mptcp_established_options_rst emits MP_RST on any
+ *       MPTCP-subflow RST -- options.c:863-867).
+ *   MPTCP_CTL_RST       -> close the client msk with unread rx data
+ *       queued.  Hits __mptcp_close() condition 1 (mptcp_data_avail())
+ *       -> mptcp_do_fastclose() via a different branch.  Same wire
+ *       options as CTL_FASTCLOSE, but exercises mptcp_data_avail() and
+ *       the rx-queue purge -- distinct coverage.
+ *   MPTCP_CTL_FAIL      -> plain close (graceful FIN / DATA_FIN).
+ *       Does NOT yet emit MP_FAIL: real MP_FAIL needs a bad MPTCP DSS
+ *       checksum on a csum-enabled subflow -- that is gap 2 Step 2.
+ *       For now this still covers the graceful __mptcp_wr_shutdown /
+ *       DATA_FIN path.
  *
- * subflow_id selects which fd to close:
- *   subflow_id <= 0 or out of range  -> client_msk_fd (whole MPTCP
- *                                       connection from client side)
- *   subflow_id in [0, subflow_count) -> that subflow's tcp_subflow_fd
- *                                       (tears down just the subflow,
- *                                        leaving the main connection)
+ * Step 1 is emission only.  The bug-finding value comes from gap 2
+ * part (b): NFQUEUE wire-mutation of the emitted option bytes
+ * (MP_RST reason / transient bit, MP_FASTCLOSE key, option lengths)
+ * so the peer kernel's option parser sees malformed control options.
+ * Emit-without-mutate is the "false coverage" trap and is not the
+ * end state.
  *
- * After close, the corresponding fd in pair state is set to -1 so the
- * subsequent pair_close() doesn't double-close.  These close paths are
- * historically the most bug-fertile area of MPTCP (every recent CVE
- * has touched mptcp_close / __mptcp_destroy_sock / mptcp_do_fastclose).
+ * subflow_id selects the target: <= 0 or out of range -> client msk;
+ * otherwise the per-subflow TCP fd (not tracked yet -> -1).  After
+ * the close the fd is set to -1 so pair_close() does not double
+ * close.  These close/abort paths are the most bug-fertile area of
+ * MPTCP -- every recent CVE has touched mptcp_close /
+ * __mptcp_destroy_sock / mptcp_do_fastclose.
  */
 static long syz_mptcp_send_control(volatile long a0, volatile long a1,
 				   volatile long a2)
@@ -3135,17 +3134,31 @@ static long syz_mptcp_send_control(volatile long a0, volatile long a1,
 	}
 
 	switch (suboption) {
-	case MPTCP_CTL_RST:
+	case MPTCP_CTL_FASTCLOSE:
+		/* SO_LINGER with l_linger == 0: __mptcp_close() condition 3
+		 * -> mptcp_do_fastclose().  RST carries MP_FASTCLOSE + MP_RST. */
 		ling.l_onoff = 1;
 		ling.l_linger = 0;
 		setsockopt(fd, SOL_SOCKET, SO_LINGER, &ling, sizeof(ling));
 		close(fd);
 		break;
-	case MPTCP_CTL_FASTCLOSE:
-		shutdown(fd, SHUT_RDWR);
+	case MPTCP_CTL_RST: {
+		/* Reach mptcp_do_fastclose() via __mptcp_close() condition 1
+		 * (mptcp_data_avail()) instead: leave unread rx data on the
+		 * client msk, then close it.  Same wire options as
+		 * CTL_FASTCLOSE, different path into the fastclose machinery. */
+		char b[8] = "rstdata";
+		if (pair->server_msk_fd >= 0)
+			(void)send(pair->server_msk_fd, b, sizeof(b),
+				   MSG_DONTWAIT | MSG_NOSIGNAL);
+		usleep(50000);	/* let the bytes reach the client rx queue */
 		close(fd);
 		break;
+	}
 	case MPTCP_CTL_FAIL:
+		/* Graceful close (FIN / DATA_FIN).  Does NOT emit MP_FAIL --
+		 * that needs a bad MPTCP DSS checksum on a csum-enabled
+		 * subflow (gap 2 Step 2).  Still covers __mptcp_wr_shutdown. */
 		close(fd);
 		break;
 	default:

@@ -411,9 +411,31 @@ Steps in C:
 
 ### 5.4 syz_mptcp_send_control and syz_mptcp_pair_close
 
-Straightforward.  `send_control` crafts a single MPTCP option
-suboption with the requested type and sends it.  `pair_close`
-closes all fds and clears the pool slot.
+`pair_close` closes all fds and clears the pool slot.
+
+`send_control` -- **revised 2026-05-21 (Phase 2 gap 2).**  The
+original "craft an option and send it" sketch was never how MPTCP
+works: the control suboptions are emitted by the kernel, gated on
+per-subflow flags, never by raw injection.  The harness instead
+drives the kernel into the state that emits each one:
+
+- **MP_FASTCLOSE** -- `subflow->send_fastclose`, set by
+  `mptcp_do_fastclose()`.  Trigger: `SO_LINGER{1,0}` close, or a
+  close with unread rx data (`__mptcp_close()` conditions 3 / 1).
+- **MP_RST** -- emitted on any MPTCP-subflow RST, unconditionally
+  in `mptcp_established_options_rst()`; a fastclose RST carries it
+  alongside MP_FASTCLOSE (options.c:863-867).
+- **MP_FAIL** -- `subflow->send_mp_fail`, set on a bad MPTCP DSS
+  checksum (`MAPPING_BAD_CSUM`) on a csum-enabled subflow
+  (subflow.c:1418).
+
+Step 1 (emit) wires CTL_FASTCLOSE / CTL_RST to the two fastclose
+trigger conditions; CTL_FAIL stays a graceful close until Step 2
+adds the bad-csum path.  Step 1 is emission only -- bug-finding
+comes from part (b): NFQUEUE wire-mutation of the emitted option
+bytes (RST reason/transient, FASTCLOSE key, FAIL seq, lengths) so
+the peer kernel's parser sees malformed control options.  Emit
+without mutate is the "false coverage" trap, not the end state.
 
 ## 6. Injection mechanism choice
 
