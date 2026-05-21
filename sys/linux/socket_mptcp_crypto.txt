@@ -128,17 +128,20 @@ syz_mptcp_diag(family flags[mptcp_diag_family], states int32, ext int8)
 # AF_INET = 2, AF_INET6 = 10
 mptcp_diag_family = 2, 10
 
-# syz_mptcp_setsockopt_fuzz: arbitrary setsockopt on SOL_MPTCP with
-# fuzzer-controlled optname and payload.  Exercises validation
-# branches in net/mptcp/sockopt.c gated on specific optnames the
-# other pseudo-syscalls don't reach (MPTCP_FULL_INFO=4,
-# MPTCP_TCPINFO=2, MPTCP_SUBFLOW_ADDRS=3, MPTCP_DEBUG_KEYS=6,
-# MPTCP_CHKSUM=5, etc.).
+# syz_mptcp_setsockopt_fuzz: setsockopt on SOL_MPTCP with a
+# fuzzer-controlled optname + payload.  optname 5 is excluded from
+# the enum below (and hard-rejected in the executor): in the
+# BRF-patched kernel optname 5 is MPTCP_KCOV_HANDLE, the harness's
+# own kcov plumbing -- fuzzing it overwrites msk->kcov_remote_handle
+# with garbage and trips kcov_check_handle()'s WARN.  The remaining
+# optnames are getsockopt names, so SOL_MPTCP setsockopt returns
+# -EOPNOTSUPP; real setsockopt surface needs a level arg (gap 3).
 syz_mptcp_setsockopt_fuzz(pair mptcp_pair, optname flags[mptcp_sockopt_name], val ptr[in, array[int8]], val_len bytesize[val])
 
-# MPTCP_INFO=1, MPTCP_TCPINFO=2, MPTCP_SUBFLOW_ADDRS=3,
-# MPTCP_FULL_INFO=4, MPTCP_CHKSUM=5, MPTCP_DEBUG_KEYS=6, MPTCP_PM_LIST=7
-mptcp_sockopt_name = 1, 2, 3, 4, 5, 6, 7
+# 1 MPTCP_INFO, 2 MPTCP_TCPINFO, 3 MPTCP_SUBFLOW_ADDRS,
+# 4 MPTCP_FULL_INFO, 6 MPTCP_DEBUG_KEYS, 7 MPTCP_PM_LIST.
+# 5 (MPTCP_KCOV_HANDLE) is intentionally omitted -- see above.
+mptcp_sockopt_name = 1, 2, 3, 4, 6, 7
 
 # Out-param struct.  Mirrors `struct brf_mptcp_pair_state_out` in
 # executor/common_brf_linux_mptcp.h.  Field order and sizes must

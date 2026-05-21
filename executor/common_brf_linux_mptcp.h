@@ -3666,12 +3666,17 @@ static long syz_mptcp_diag(volatile long a0, volatile long a1,
 
 #if SYZ_EXECUTOR || __NR_syz_mptcp_setsockopt_fuzz
 /*
- * v08: setsockopt on SOL_MPTCP with fuzzer-controlled optname and
- * payload.  Exercises net/mptcp/sockopt.c validation branches for
- * optnames the targeted pseudo-syscalls don't reach (MPTCP_FULL_INFO,
- * MPTCP_TCPINFO, MPTCP_SUBFLOW_ADDRS, MPTCP_CHKSUM, etc.).  Errors
- * are expected for many optname+payload combos; the call counts as
- * "exercise the validation path" regardless of return value.
+ * v08: setsockopt on SOL_MPTCP with a fuzzer-controlled optname and
+ * payload.  optname MPTCP_KCOV_HANDLE (5) is rejected up front: it
+ * is the harness's own kcov instrumentation plumbing, not a real
+ * MPTCP sockopt.  A fuzzer-controlled value there overwrites
+ * msk->kcov_remote_handle with garbage, which then trips
+ * kcov_check_handle()'s WARN_ON in kcov_remote_start_prealloc()
+ * (kernel/kcov.c:971).  optname 5 is also dropped from the
+ * mptcp_sockopt_name syzlang enum; this is the executor backstop.
+ * The remaining SOL_MPTCP optnames are getsockopt names, so
+ * setsockopt returns -EOPNOTSUPP -- real setsockopt surface needs
+ * a level argument (audit backlog gap 3, a later change).
  */
 static long syz_mptcp_setsockopt_fuzz(volatile long a0, volatile long a1,
 				      volatile long a2, volatile long a3)
@@ -3688,6 +3693,19 @@ static long syz_mptcp_setsockopt_fuzz(volatile long a0, volatile long a1,
 	pair = &brf_mptcp_pair_pool[slot];
 	if (!pair->in_use)
 		return -1;
+
+	/* Never let the fuzzer setsockopt(MPTCP_KCOV_HANDLE): that
+	 * optname is the harness's kcov instrumentation handle, not a
+	 * real MPTCP sockopt.  A fuzzer-controlled value corrupts
+	 * msk->kcov_remote_handle and trips a kcov WARN once a wrapped
+	 * gate fires.  The mptcp_sockopt_name syzlang enum already
+	 * omits 5; this guards against flag-mutation producing it. */
+	if (optname == MPTCP_KCOV_HANDLE) {
+		debug("syz_mptcp_setsockopt_fuzz: refusing optname=%d "
+		      "(MPTCP_KCOV_HANDLE -- harness kcov plumbing)\n",
+		      optname);
+		return -1;
+	}
 
 	/* Cap payload size; setsockopt with huge val_len gets rejected
 	 * before validation anyway and burns time we don't need to burn. */
