@@ -79,6 +79,13 @@
 #define MPTCP_SYSCTL_CLOSE_TIMEOUT      5
 #define MPTCP_SYSCTL_BLACKHOLE_TIMEOUT  6
 #define MPTCP_SYSCTL_SYN_RETRANS        7
+/* gap 8: tcp_syncookies (net.ipv4) gates the MP_JOIN syncookie path. */
+#define MPTCP_SYSCTL_TCP_SYNCOOKIES     8
+/* gap 9: misc socket operations on a pair's msk fd. */
+#define MPTCP_OP_DISCONNECT             0
+#define MPTCP_OP_POLL                   1
+#define MPTCP_OP_IOCTL                  2
+#define MPTCP_OP_SHUTDOWN               3
 
 // ---------- MPTCP uapi fallbacks ----------
 // Older distro headers won't have these; match the patched kernel.
@@ -4198,6 +4205,12 @@ static long syz_mptcp_set_sysctl(volatile long a0, volatile long a1,
 	case MPTCP_SYSCTL_SYN_RETRANS:
 		path = "/proc/sys/net/mptcp/syn_retrans_before_tcp_fallback";
 		break;
+	case MPTCP_SYSCTL_TCP_SYNCOOKIES:
+		/* gap 8: not an MPTCP sysctl, but tcp_syncookies in the
+		 * netns gates the MP_JOIN syncookie path -- a value of 2
+		 * forces every inbound SYN (incl. MP_JOIN) through it. */
+		path = "/proc/sys/net/ipv4/tcp_syncookies";
+		break;
 	default:
 		debug("syz_mptcp_set_sysctl: unknown which=%d\n", which);
 		return -1;
@@ -4218,6 +4231,75 @@ static long syz_mptcp_set_sysctl(volatile long a0, volatile long a1,
 	close(fd);
 	debug("syz_mptcp_set_sysctl: which=%d wrote %zu bytes to %s\n",
 	      which, val_len, path);
+	return 0;
+}
+#endif
+
+#if SYZ_EXECUTOR || __NR_syz_mptcp_sock_op
+/*
+ * gap 9: miscellaneous socket operations on a pair's client msk fd --
+ * surface the targeted pseudo-syscalls otherwise never touch:
+ *   DISCONNECT  connect(AF_UNSPEC) -> mptcp_disconnect
+ *   POLL        poll()             -> mptcp_poll
+ *   IOCTL       ioctl()            -> mptcp_ioctl (+ generic sock ioctl)
+ *   SHUTDOWN    shutdown()         -> mptcp_shutdown
+ * arg is fuzzer-controlled: the poll events mask, the ioctl request,
+ * or the shutdown `how`.  The ioctl output buffer is oversized so a
+ * fuzzed request that writes a struct cannot overflow the executor.
+ */
+static long syz_mptcp_sock_op(volatile long a0, volatile long a1,
+			      volatile long a2)
+{
+	struct brf_mptcp_pair_state *pair;
+	long slot = a0;
+	int op = (int)a1;
+	int arg = (int)a2;
+	int fd;
+
+	if (slot < 0 || slot >= MPTCP_PAIR_POOL_SIZE) {
+		debug("syz_mptcp_sock_op: slot %ld out of range\n", slot);
+		return -1;
+	}
+	pair = &brf_mptcp_pair_pool[slot];
+	if (!pair->in_use) {
+		debug("syz_mptcp_sock_op: slot %ld not in use\n", slot);
+		return -1;
+	}
+	fd = pair->client_msk_fd;
+	if (fd < 0)
+		return -1;
+
+	switch (op) {
+	case MPTCP_OP_DISCONNECT: {
+		struct sockaddr sa;
+		memset(&sa, 0, sizeof(sa));
+		sa.sa_family = AF_UNSPEC;
+		(void)connect(fd, &sa, sizeof(sa));
+		break;
+	}
+	case MPTCP_OP_POLL: {
+		struct pollfd pfd;
+		pfd.fd = fd;
+		pfd.events = (short)arg;
+		pfd.revents = 0;
+		(void)poll(&pfd, 1, 0);
+		break;
+	}
+	case MPTCP_OP_IOCTL: {
+		char iobuf[256];
+		memset(iobuf, 0, sizeof(iobuf));
+		(void)ioctl(fd, (unsigned int)arg, iobuf);
+		break;
+	}
+	case MPTCP_OP_SHUTDOWN:
+		(void)shutdown(fd, arg & 3);
+		break;
+	default:
+		debug("syz_mptcp_sock_op: unknown op=%d\n", op);
+		return -1;
+	}
+	debug("syz_mptcp_sock_op: slot=%ld op=%d arg=%d done\n",
+	      slot, op, arg);
 	return 0;
 }
 #endif

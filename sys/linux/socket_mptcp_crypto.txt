@@ -168,7 +168,15 @@ mptcp_sockopt_level = 0, 1, 6, 41, 284
 # excluded -- changing them would break the running harness.
 syz_mptcp_set_sysctl(which flags[mptcp_sysctl], value ptr[in, array[int8]], value_len bytesize[value])
 
-mptcp_sysctl = MPTCP_SYSCTL_ADD_ADDR_TIMEOUT, MPTCP_SYSCTL_CHECKSUM, MPTCP_SYSCTL_ALLOW_JOIN, MPTCP_SYSCTL_STALE_LOSS, MPTCP_SYSCTL_SCHEDULER, MPTCP_SYSCTL_CLOSE_TIMEOUT, MPTCP_SYSCTL_BLACKHOLE_TIMEOUT, MPTCP_SYSCTL_SYN_RETRANS
+mptcp_sysctl = MPTCP_SYSCTL_ADD_ADDR_TIMEOUT, MPTCP_SYSCTL_CHECKSUM, MPTCP_SYSCTL_ALLOW_JOIN, MPTCP_SYSCTL_STALE_LOSS, MPTCP_SYSCTL_SCHEDULER, MPTCP_SYSCTL_CLOSE_TIMEOUT, MPTCP_SYSCTL_BLACKHOLE_TIMEOUT, MPTCP_SYSCTL_SYN_RETRANS, MPTCP_SYSCTL_TCP_SYNCOOKIES
+
+# syz_mptcp_sock_op (gap 9): miscellaneous operations on a pair's msk
+# fd -- DISCONNECT (connect AF_UNSPEC -> mptcp_disconnect), POLL
+# (mptcp_poll), IOCTL (mptcp_ioctl), SHUTDOWN (mptcp_shutdown).  arg is
+# the fuzzed poll events mask / ioctl request / shutdown how.
+syz_mptcp_sock_op(pair mptcp_pair, op flags[mptcp_sock_op], arg int32)
+
+mptcp_sock_op = MPTCP_OP_DISCONNECT, MPTCP_OP_POLL, MPTCP_OP_IOCTL, MPTCP_OP_SHUTDOWN
 
 # Out-param struct.  Mirrors `struct brf_mptcp_pair_state_out` in
 # executor/common_brf_linux_mptcp.h.  Field order and sizes must
