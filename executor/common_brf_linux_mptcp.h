@@ -135,6 +135,10 @@ struct mptcp_debug_keys {
 #include <linux/netfilter/nfnetlink.h>
 #include <linux/netfilter/nfnetlink_queue.h>
 
+/* poll() / struct pollfd for syz_mptcp_sock_op (gap 9) -- not in the
+ * executor's default header set. */
+#include <poll.h>
+
 #if __has_include(<linux/mptcp_pm.h>)
 #include <linux/mptcp_pm.h>
 #else
