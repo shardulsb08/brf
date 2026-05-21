@@ -1,7 +1,7 @@
 # MPTCP runtime coverage for the MP_JOIN harness
 
 **Status:** patches 0001-0003 added 2026-05-15; patches 0004-0005
-added 2026-05-21.  Patches were authored as real commits on the kernel
+added 2026-05-21; patch 0006 added 2026-05-22.  Patches were authored as real commits on the kernel
 tree's `mptcp_brf_fuzz_base` branch, then exported with `git
 format-patch` -- they should apply cleanly against the same base
 (`mptcp/export`).  If the upstream base has moved, `git am --3way`
@@ -27,7 +27,7 @@ text below are informal iteration markers, not directory names.
 
 ## What this series adds
 
-Five patches:
+Six patches:
 
 1. **`MPTCP_KCOV_HANDLE` setsockopt + per-msk scratch area +
    kcov_owner ownership marker**, CONFIG_KCOV-gated.  User sets a
@@ -82,6 +82,19 @@ Five patches:
    per-task kcov already records the code -- no coverage lost).
    Added 2026-05-21.
 
+6. **kcov scratch-area use-after-free fix.**  A fuzz run oopsed in
+   `kcov_remote_start_prealloc` writing into a `vfree()`'d area.
+   Patch 1's per-msk area had three lifetime holes: accepted msks
+   memcpy-inherited the area pointer via `sk_clone_lock()` and
+   could outlive the owner; the area was freed synchronously,
+   racing in-flight softirq option parsing; and
+   `BRF_MPTCP_KCOV_START` read the area pointer twice.  patch 6
+   clears the inherited kcov fields in `mptcp_sk_clone_init()`
+   (every area is now single-owner), frees via `kvfree_rcu()`
+   (allocating with `kvmalloc()` to match) so an in-flight
+   softirq's RCU grace period elapses before the free, and
+   snapshots the area pointer once in the macro.  Added 2026-05-22.
+
 ## Prerequisites
 
 Apply **before** this series:
@@ -114,6 +127,7 @@ git am < $BRF/kernel_patches/mptcp_kcov/0002-mptcp-instrument-MP_JOIN-validity-g
 git am < $BRF/kernel_patches/mptcp_kcov/0003-mptcp-add-MPTCP_DEBUG_KEYS-getsockopt-for-test-harne.patch
 git am < $BRF/kernel_patches/mptcp_kcov/0004-mptcp-extend-kcov-instrumentation-to-the-option-pars.patch
 git am < $BRF/kernel_patches/mptcp_kcov/0005-mptcp-restrict-BRF-kcov-instrumentation-to-softirq-c.patch
+git am < $BRF/kernel_patches/mptcp_kcov/0006-mptcp-fix-use-after-free-of-the-BRF-kcov-scratch-are.patch
 ```
 
 If a patch fails to apply (e.g. after the upstream base moves),
