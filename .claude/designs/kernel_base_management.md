@@ -21,24 +21,32 @@ where its kernel base comes from.
                               |
                               | fetch + fast-forward
                               v
-                    LOCAL TRACKING BRANCHES
+                    LOCAL FUZZ-BASE BRANCHES
    ----------------------------------------------------
-   mptcp_brf_fuzz_base   <- mirrors mptcp/export
-   quic_brf_fuzz_base    <- mirrors lxin's QUIC tip (when QUIC harness starts)
-   tlshd_brf_fuzz_base   <- mirrors net-next or stable (when tlshd harness starts)
+   each branch = upstream base + our kcov patch series git-am'd on
+   top; reconstructable from brf/kernel_patches/ at any time
+   mptcp_brf_fuzz_base   <- mptcp/export       (active)
+   quic_brf_fuzz_base    <- lxin's QUIC tip    (future)
+   tlshd_brf_fuzz_base   <- net-next or stable (future)
                               |
-                              | apply our patches
+                              | build
                               v
                     BUILT KERNEL FOR FUZZING
    ----------------------------------------------------
-   ${base} + brf/kernel_patches/<harness>_kcov/*.patch
+   the fuzz-base branch, compiled
 ```
 
 Three principles:
 
-1. **The tracking branch is a pure mirror.** No local commits.  When
-   upstream moves, we fast-forward (or hard-reset, since there's
-   nothing local to preserve).
+1. **The fuzz-base branch is `upstream base + our patch series`,
+   and is fully reconstructable.** It is *not* a pure mirror -- it
+   carries our kcov patch commits (and any deliberately recorded
+   cherry-picked fix).  What keeps it disposable is not the absence
+   of commits but that every commit on it is reconstructable: the
+   patch series is checked into `brf/kernel_patches/`, which is the
+   source of truth.  When upstream moves, hard-reset to the new
+   upstream and re-apply the series with `git am` -- nothing unique
+   to the branch is lost.
 2. **Our kernel-side patches live in the BRF repo**, not in the
    kernel tree.  They are applied at build time, exactly like
    `bpf_kcov`.  This means the kernel tree stays
@@ -68,15 +76,20 @@ git fetch mptcp                     # for MPTCP work
 git fetch lxin                      # for QUIC work
 git fetch origin                    # for mainline reference
 
-# 2. Switch to the tracking branch and fast-forward
+# 2. Switch to the fuzz-base branch and reset to the new upstream.
+#    This drops the current patch commits -- safe, because they are
+#    reconstructable from brf/kernel_patches/ (re-applied in step 3).
 git checkout mptcp_brf_fuzz_base
-git reset --hard mptcp/export       # safe: no local commits
+git reset --hard mptcp/export
 
-# 3. Record the snapshot reference (for any bug report or campaign)
+# 3. Re-apply our kcov patch series on top (see "Applying our
+#    patches" below for the exact git am sequence).
+
+# 4. Record the snapshot reference (for any bug report or campaign)
 git describe --tags                 # closest upstream tag, e.g.
                                     #   export/20260515T083717
 
-# 4. Rebuild the kernel for the dev_env VM
+# 5. Rebuild the kernel for the dev_env VM
 #    (this step is build-system-specific; the relevant scripts are
 #    in /mnt/work_4gb/Dev/mpiric_kernel_dev_env/)
 ```
@@ -175,12 +188,26 @@ own trees.
 
 ## Branch hygiene
 
-- Never commit on a `*_brf_fuzz_base` branch.  If a change is needed,
-  it lives as a patch series in `brf/kernel_patches/`, not as a
-  local commit on the tracking branch.
-- If a tracking branch accidentally accumulates local commits
-  (e.g., from a stray `git commit -am`), surface immediately and
-  decide: cherry-pick into a patch series or discard.
+- **Committing on a `*_brf_fuzz_base` branch is normal and
+  expected.**  It is where the kcov patch series is authored, and
+  `git format-patch` needs commits to export.  The workflow is:
+  develop the change as a commit on the branch, then
+  `git format-patch` it into `brf/kernel_patches/<harness>_kcov/`.
+  (The earlier rule here -- "never commit on a `*_brf_fuzz_base`
+  branch" -- was wrong: it contradicted both the branch's actual
+  use and the `git am` step in "Applying our patches" above.  The
+  branch has carried the patch commits since it was created.)
+- The real invariant is **export, not abstinence**: every commit on
+  the branch must be reconstructable -- either an exported patch in
+  `brf/kernel_patches/`, or a deliberately recorded cherry-pick
+  (e.g. the upstream `mptcp: pm: fix memory leak ...` fix carried on
+  `mptcp_brf_fuzz_base`, noted in the task brief).  A commit that
+  exists only on the branch and nowhere else is the actual hygiene
+  violation.
+- If the branch carries a commit that is NOT yet exported to
+  `brf/kernel_patches/` (e.g. from a quick `git commit` mid-
+  iteration), surface it and either `git format-patch` it out or
+  discard it -- do not leave it un-exported.
 - Untracked files in the kernel tree (`.cfg` files, scratch scripts,
   patch dumps) are fine; they don't interfere with branch hygiene.
 
