@@ -1,0 +1,91 @@
+From 7ceb647f753f6417fc1a8d7a791a846afdbe2f4a Mon Sep 17 00:00:00 2001
+From: Shardul Bankar <shardul.b@mpiricsoftware.com>
+Date: Thu, 21 May 2026 08:18:32 +0530
+Subject: [PATCH] mptcp: restrict BRF kcov instrumentation to softirq context
+
+A fuzz run on the BRF MPTCP harness hit:
+
+  WARNING: kernel/kcov.c:971 at kcov_remote_start_prealloc
+   mptcp_incoming_options       net/mptcp/options.c:1195
+   tcp_data_queue / tcp_rcv_established / tcp_v6_do_rcv
+   sk_backlog_rcv / __release_sock / release_sock
+   __mptcp_push_pending / mptcp_sendmsg / __sys_sendto
+
+kcov_remote_start() warns when it is called in process context
+from a task that already has kcov enabled (the WARN_ON at
+kernel/kcov.c:971).
+
+The BRF kcov wraps -- the MP_JOIN validity gates from "mptcp:
+instrument MP_JOIN validity gates with kcov" and the option
+parser from "mptcp: extend kcov instrumentation to the option
+parser" -- assumed their call sites run only in softirq.  That
+holds for the inbound-packet softirq path, but the same MPTCP RX
+code also runs in process context: release_sock() drains the
+socket backlog inline, in the context of whatever syscall held
+and dropped the socket lock (here sendto()).  The syz-executor
+task has kcov enabled, so kcov_remote_start_prealloc() warns,
+and syzkaller treats the WARNING as a crash.
+
+Guard BRF_MPTCP_KCOV_START / _STOP with in_serving_softirq() so
+the kcov_remote section is entered only in genuine softirq
+context.  In process context the calling task's own per-task
+kcov already records this code, so the remote section was never
+needed there -- the guard removes the warning and loses no
+coverage.  Because the guard lives in the shared macros it also
+covers the three MP_JOIN gates, which have the same latent
+exposure on the backlog path.
+
+start and stop evaluate in_serving_softirq() over the same
+synchronous region, so they stay balanced.
+
+Assisted-by: Claude:claude-opus-4-7
+Signed-off-by: Shardul Bankar <shardul.b@mpiricsoftware.com>
+---
+ net/mptcp/protocol.h | 15 +++++++++++++--
+ 1 file changed, 13 insertions(+), 2 deletions(-)
+
+diff --git a/net/mptcp/protocol.h b/net/mptcp/protocol.h
+index 8367ea768375e..409c960c80374 100644
+--- a/net/mptcp/protocol.h
++++ b/net/mptcp/protocol.h
+@@ -1449,6 +1449,15 @@ static inline void mptcp_join_cookie_init(void) {}
+  * subflows of the msk so concurrent gates race.  See the
+  * comment on kcov_coverage_area in struct mptcp_sock and the
+  * design doc kernel_base_management.md (sibling brf repo).
++ *
++ * Fires only in softirq context.  kcov_remote_start() WARNs
++ * (kernel/kcov.c) when called in process context from a task
++ * that already has kcov enabled -- and the wrapped MPTCP RX
++ * paths also run in process context, draining the socket
++ * backlog from release_sock() inside a syscall.  There the
++ * calling task's own per-task kcov already records this code,
++ * so the remote section is both unnecessary and unsafe;
++ * in_serving_softirq() gates it.
+  */
+ #define BRF_MPTCP_KCOV_START(__msk)					\
+ 	do {								\
+@@ -1457,7 +1466,8 @@ static inline void mptcp_join_cookie_init(void) {}
+ 		if (!__m)						\
+ 			break;						\
+ 		__h = READ_ONCE(__m->kcov_remote_handle);		\
+-		if (__h && __m->kcov_coverage_area)			\
++		if (__h && __m->kcov_coverage_area &&			\
++		    in_serving_softirq())				\
+ 			kcov_remote_start_prealloc(__h,			\
+ 				__m->kcov_coverage_area,		\
+ 				__m->kcov_area_size);			\
+@@ -1466,7 +1476,8 @@ static inline void mptcp_join_cookie_init(void) {}
+ 	do {								\
+ 		struct mptcp_sock *__m = (__msk);			\
+ 		if (__m && READ_ONCE(__m->kcov_remote_handle) &&	\
+-		    __m->kcov_coverage_area)				\
++		    __m->kcov_coverage_area &&				\
++		    in_serving_softirq())				\
+ 			kcov_remote_stop_prealloc();			\
+ 	} while (0)
+ #else
+
+base-commit: 45f8d3880bef68894da93097995e546a1204bbea
+-- 
+2.34.1
+

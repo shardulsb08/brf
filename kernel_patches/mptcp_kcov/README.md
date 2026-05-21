@@ -1,7 +1,7 @@
 # MPTCP runtime coverage for the MP_JOIN harness
 
-**Status:** patches 0001-0003 added 2026-05-15; patch 0004 added
-2026-05-21.  Patches were authored as real commits on the kernel
+**Status:** patches 0001-0003 added 2026-05-15; patches 0004-0005
+added 2026-05-21.  Patches were authored as real commits on the kernel
 tree's `mptcp_brf_fuzz_base` branch, then exported with `git
 format-patch` -- they should apply cleanly against the same base
 (`mptcp/export`).  If the upstream base has moved, `git am --3way`
@@ -27,7 +27,7 @@ text below are informal iteration markers, not directory names.
 
 ## What this series adds
 
-Four patches:
+Five patches:
 
 1. **`MPTCP_KCOV_HANDLE` setsockopt + per-msk scratch area +
    kcov_owner ownership marker**, CONFIG_KCOV-gated.  User sets a
@@ -68,6 +68,20 @@ Four patches:
    Covers ADD_ADDR / RM_ADDR / MP_PRIO / MP_FAIL / MP_RST / DSS
    option parsing, which runs in softirq.  Added 2026-05-21.
 
+5. **kcov softirq-context guard.**  The `BRF_MPTCP_KCOV_*` macros
+   call `kcov_remote_start()`, which WARNs (`kernel/kcov.c`) when
+   called in process context from a task that already has kcov
+   enabled.  The wrapped MPTCP RX paths -- the option parser and
+   the MP_JOIN gates -- run not only in softirq but also in
+   process context: `release_sock()` drains the socket backlog
+   inline inside whatever syscall held the lock.  A fuzz run hit
+   the WARNING via `mptcp_incoming_options` on the `sendto` ->
+   `release_sock` path.  patch 5 guards the macros with
+   `in_serving_softirq()` so the remote section is taken only in
+   real softirq context (in process context the task's own
+   per-task kcov already records the code -- no coverage lost).
+   Added 2026-05-21.
+
 ## Prerequisites
 
 Apply **before** this series:
@@ -99,6 +113,7 @@ git am < $BRF/kernel_patches/mptcp_kcov/0001-mptcp-add-kcov_remote_handle-fields
 git am < $BRF/kernel_patches/mptcp_kcov/0002-mptcp-instrument-MP_JOIN-validity-gates-with-kcov.patch
 git am < $BRF/kernel_patches/mptcp_kcov/0003-mptcp-add-MPTCP_DEBUG_KEYS-getsockopt-for-test-harne.patch
 git am < $BRF/kernel_patches/mptcp_kcov/0004-mptcp-extend-kcov-instrumentation-to-the-option-pars.patch
+git am < $BRF/kernel_patches/mptcp_kcov/0005-mptcp-restrict-BRF-kcov-instrumentation-to-softirq-c.patch
 ```
 
 If a patch fails to apply (e.g. after the upstream base moves),
