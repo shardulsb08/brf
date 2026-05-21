@@ -351,6 +351,7 @@ var syzkallSupport = map[string]func(*prog.Syscall, *prog.Target, string) (bool,
 	"syz_mptcp_pm_set_limits":     alwaysSupported,
 	"syz_mptcp_diag":              alwaysSupported,
 	"syz_mptcp_setsockopt_fuzz":   alwaysSupported,
+	"syz_mptcp_pm_get_addr":       alwaysSupported,
 }
 
 func isSupportedSyzkall(c *prog.Syscall, target *prog.Target, sandbox string) (bool, string) {

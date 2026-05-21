@@ -3879,4 +3879,110 @@ static long syz_mptcp_setsockopt_fuzz(volatile long a0, volatile long a1,
 }
 #endif
 
+#if SYZ_EXECUTOR || __NR_syz_mptcp_pm_get_addr
+/*
+ * gap 5: dump the path-manager address list via MPTCP_PM_CMD_GET_ADDR
+ * with NLM_F_DUMP.  mptcp_pm_dump_addr() dispatches on the TOKEN attr:
+ *   with_token == 1 -> mptcp_userspace_pm_dump_addr: walks this msk's
+ *                      userspace_pm_local_addr_list -- the exact list
+ *                      behind the findings/001 alloc-during-teardown
+ *                      race.  Race target: pm_remove / pair_close.
+ *   with_token == 0 -> mptcp_pm_nl_dump_addr: walks the kernel PM's
+ *                      pernet->local_addr_list.  Race target:
+ *                      pm_kernel_del_addr / pm_kernel_flush_addrs.
+ * A netlink dump produces multiple messages ending in NLMSG_DONE;
+ * each recv() drives the kernel's dumpit callback another step, so we
+ * drain to NLMSG_DONE to walk the whole list (widest race window).
+ */
+static int brf_mptcp_genl_get_addr(uint32_t token, int with_token)
+{
+	char buf[4096];
+	struct nlmsghdr *nlh = (struct nlmsghdr *)buf;
+	struct genlmsghdr *ghdr;
+	char *p;
+	int i;
+
+	memset(buf, 0, sizeof(buf));
+	nlh->nlmsg_type  = brf_mptcp_pm_family_id;
+	nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP;
+	nlh->nlmsg_seq   = 7;
+	nlh->nlmsg_pid   = 0;
+	ghdr = (struct genlmsghdr *)NLMSG_DATA(nlh);
+	ghdr->cmd     = MPTCP_PM_CMD_GET_ADDR;
+	ghdr->version = MPTCP_PM_VER;
+
+	p = (char *)NLMSG_DATA(nlh) + NLMSG_ALIGN(sizeof(*ghdr));
+	if (with_token) {
+		struct nlattr *attr = (struct nlattr *)p;
+		attr->nla_type = MPTCP_PM_ATTR_TOKEN;
+		attr->nla_len  = NLA_HDRLEN + sizeof(token);
+		memcpy((char *)attr + NLA_HDRLEN, &token, sizeof(token));
+		p += NLA_ALIGN(attr->nla_len);
+	}
+	nlh->nlmsg_len = p - buf;
+
+	if (send(brf_mptcp_genl_sock, buf, nlh->nlmsg_len, 0) < 0) {
+		debug("pm_get_addr: send: %s\n", strerror(errno));
+		return -1;
+	}
+	/* Drain the dump: recv until NLMSG_DONE / NLMSG_ERROR.  Bounded
+	 * so a misbehaving kernel cannot hang the executor. */
+	for (i = 0; i < 64; i++) {
+		ssize_t n = recv(brf_mptcp_genl_sock, buf, sizeof(buf), 0);
+		struct nlmsghdr *r;
+		int rem, done = 0;
+
+		if (n < 0) {
+			debug("pm_get_addr: recv: %s\n", strerror(errno));
+			return -1;
+		}
+		rem = (int)n;
+		for (r = (struct nlmsghdr *)buf; NLMSG_OK(r, rem);
+		     r = NLMSG_NEXT(r, rem)) {
+			if (r->nlmsg_type == NLMSG_DONE ||
+			    r->nlmsg_type == NLMSG_ERROR) {
+				done = 1;
+				break;
+			}
+		}
+		if (done)
+			break;
+	}
+	return 0;
+}
+
+/*
+ * gap 5: syz_mptcp_pm_get_addr -- exercise the GET_ADDR dump path and
+ * its dump-vs-teardown race surface.  a0 = pair slot, a1 = with_token
+ * (0 -> kernel-PM netns dump, 1 -> userspace-PM per-msk dump).
+ */
+static long syz_mptcp_pm_get_addr(volatile long a0, volatile long a1)
+{
+	struct brf_mptcp_pair_state *pair;
+	long slot = a0;
+	int with_token = (int)(a1 & 1);
+
+	if (slot < 0 || slot >= MPTCP_PAIR_POOL_SIZE) {
+		debug("syz_mptcp_pm_get_addr: slot %ld out of range\n", slot);
+		return -1;
+	}
+	pair = &brf_mptcp_pair_pool[slot];
+	if (!pair->in_use) {
+		debug("syz_mptcp_pm_get_addr: slot %ld not in use\n", slot);
+		return -1;
+	}
+	if (brf_mptcp_ensure_executor_setup() < 0)
+		return -1;
+
+	if (brf_mptcp_genl_get_addr(pair->token, with_token) < 0) {
+		debug("syz_mptcp_pm_get_addr: slot=%ld with_token=%d failed\n",
+		      slot, with_token);
+		return -1;
+	}
+	debug("syz_mptcp_pm_get_addr: slot=%ld with_token=%d done\n",
+	      slot, with_token);
+	return 0;
+}
+#endif
+
 #endif // BRF_COMMON_LINUX_MPTCP_H

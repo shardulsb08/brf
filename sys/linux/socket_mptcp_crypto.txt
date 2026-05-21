@@ -65,6 +65,14 @@ syz_mptcp_pm_announce(pair mptcp_pair, addr_id int8, addr int32be, port int16)
 # findings/001_mptcp_pm_destroy_race/.
 syz_mptcp_pm_remove(pair mptcp_pair, addr_id int8)
 
+# syz_mptcp_pm_get_addr (gap 5): dump the path-manager address list via
+# MPTCP_PM_CMD_GET_ADDR + NLM_F_DUMP.  with_token=1 dumps this msk's
+# userspace-PM addr list (mptcp_userspace_pm_dump_addr -- the list
+# behind findings/001); with_token=0 dumps the kernel PM's netns list
+# (mptcp_pm_nl_dump_addr).  A list-walking dump raced against pm_remove
+# / pm_kernel_flush_addrs is the dump-vs-teardown surface.
+syz_mptcp_pm_get_addr(pair mptcp_pair, with_token int8[0:1])
+
 # syz_mptcp_pm_subflow_destroy: tell the kernel to tear down a
 # specific subflow on this msk.  Sibling of join_subflow's
 # SUBFLOW_CREATE; exercises mptcp_pm_nl_subflow_destroy_doit and
