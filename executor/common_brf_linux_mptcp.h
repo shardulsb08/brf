@@ -47,6 +47,13 @@
 #define MPTCP_CTL_FAIL               0
 #define MPTCP_CTL_FASTCLOSE          1
 #define MPTCP_CTL_RST                2
+/* gap 2 part (b): mutating control suboptions.  3-5 mutate the MP_RST
+ * option, 6-7 the MP_FASTCLOSE option, on the fastclose RST. */
+#define MPTCP_CTL_RST_REASON         3
+#define MPTCP_CTL_RST_TRANSIENT      4
+#define MPTCP_CTL_RST_BADLEN         5
+#define MPTCP_CTL_FASTCLOSE_KEY      6
+#define MPTCP_CTL_FASTCLOSE_BADLEN   7
 
 // ---------- MPTCP uapi fallbacks ----------
 // Older distro headers won't have these; match the patched kernel.
@@ -171,6 +178,14 @@ static volatile int brf_nfq_mut_fired_hmac    = 0;
 static volatile int brf_nfq_mut_fired_nonce   = 0;
 static volatile int brf_nfq_mut_fired_map     = 0;
 static volatile int brf_nfq_mut_fired         = 0;  /* OR of the three */
+/* gap 2 part (b): control-option (MP_RST / MP_FASTCLOSE) mutation.
+ * pending_ctl_mut holds a mutating MPTCP_CTL_* value (3..7) or 0 for
+ * none; the worker mutates the matching option on the next egress RST.
+ * rst_reason_rot rotates the injected MP_RST reason byte so the fuzzer
+ * covers the reason space across successive calls. */
+static volatile int brf_nfq_pending_ctl_mut   = 0;
+static volatile int brf_nfq_mut_fired_ctl     = 0;
+static volatile unsigned char brf_nfq_rst_reason_rot = 0;
 static volatile int brf_nfq_worker_stop       = 0;
 static pthread_t    brf_nfq_worker_thread;
 static int          brf_nfq_worker_started   = 0;
@@ -434,6 +449,68 @@ static inline uint8_t *brf_nfq_find_mp_join_ack(uint8_t *tcp_seg, int tcp_hlen)
 static inline uint8_t *brf_nfq_find_mp_join_syn(uint8_t *tcp_seg, int tcp_hlen)
 {
 	return brf_nfq_find_mp_join_option(tcp_seg, tcp_hlen, 12);
+}
+
+/* Find an MPTCP suboption by subtype (high nibble of option byte 2),
+ * regardless of length.  Used for the control options on a fastclose
+ * RST: MP_RST (subtype 8) and MP_FASTCLOSE (subtype 7). */
+static uint8_t *brf_nfq_find_mptcp_subopt(uint8_t *tcp_seg, int tcp_hlen,
+					  uint8_t subtype)
+{
+	int optlen = tcp_hlen - (int)sizeof(struct tcphdr);
+	uint8_t *opts = tcp_seg + sizeof(struct tcphdr);
+	int i = 0;
+	while (i < optlen) {
+		uint8_t kind = opts[i];
+		if (kind == 0)
+			break;
+		if (kind == 1) {
+			i++;
+			continue;
+		}
+		if (i + 1 >= optlen)
+			break;
+		uint8_t len = opts[i + 1];
+		if (len < 2 || i + len > optlen)
+			break;
+		if (kind == 30 && len >= 3 && (opts[i + 2] >> 4) == subtype)
+			return &opts[i];
+		i += len;
+	}
+	return NULL;
+}
+
+/* Apply a control-option mutation (gap 2 part b) to an MP_RST or
+ * MP_FASTCLOSE option located on an egress RST.  `opt` points at the
+ * option's kind byte.
+ *   MP_RST       layout: [30][4][0x80|T][reason]
+ *   MP_FASTCLOSE layout: [30][12][0x70][0][rcvr_key:8]
+ * BADLEN rewrites only the length field, leaving the bytes intact, so
+ * the kernel option parser sees a length that disagrees with the
+ * subtype -- exercising its length-validation paths. */
+static void brf_nfq_apply_ctl_mut(uint8_t *opt, int mut)
+{
+	switch (mut) {
+	case MPTCP_CTL_RST_REASON:
+		/* byte 3 is the 8-bit reset reason (0..6 defined); rotate
+		 * it across the byte space over successive calls. */
+		opt[3] = brf_nfq_rst_reason_rot++;
+		break;
+	case MPTCP_CTL_RST_TRANSIENT:
+		opt[2] ^= 0x01;		/* flip the transient (T) bit */
+		break;
+	case MPTCP_CTL_RST_BADLEN:
+		opt[1] = 3;		/* claim 3 bytes for a 4-byte option */
+		break;
+	case MPTCP_CTL_FASTCLOSE_KEY:
+		opt[4] ^= 0x01;		/* corrupt the 8-byte receiver key */
+		break;
+	case MPTCP_CTL_FASTCLOSE_BADLEN:
+		opt[1] = 8;		/* claim 8 bytes for a 12-byte option */
+		break;
+	default:
+		break;
+	}
 }
 
 /* Find DSS option (kind=30, subtype=2).  Variable length depending on
@@ -756,6 +833,30 @@ static void *brf_nfq_worker_loop(void *arg)
 							applied_what = "MP_JOIN SYN nonce";
 							BRF_ATOMIC_STORE(
 								&brf_nfq_mut_fired_nonce, 1);
+						}
+					}
+					/* gap 2 part (b): RST egress -- mutate the
+					 * MP_RST / MP_FASTCLOSE option on the
+					 * fastclose RST. */
+					if (!applied_mut && tcp->rst &&
+					    !BRF_ATOMIC_LOAD(&brf_nfq_mut_fired_ctl)) {
+						int cm = BRF_ATOMIC_LOAD(
+							&brf_nfq_pending_ctl_mut);
+						/* RST muts 3..5 -> MP_RST
+						 * (subtype 8); FASTCLOSE muts
+						 * 6..7 -> subtype 7. */
+						uint8_t st = cm <= MPTCP_CTL_RST_BADLEN
+							     ? 8 : 7;
+						uint8_t *o = cm ?
+							brf_nfq_find_mptcp_subopt(
+								(uint8_t *)tcp,
+								tcp_hlen, st) : NULL;
+						if (o) {
+							brf_nfq_apply_ctl_mut(o, cm);
+							applied_mut = cm;
+							applied_what = "control option";
+							BRF_ATOMIC_STORE(
+								&brf_nfq_mut_fired_ctl, 1);
 						}
 					}
 				}
@@ -3155,6 +3256,26 @@ static long syz_mptcp_send_control(volatile long a0, volatile long a1,
 		close(fd);
 		break;
 	}
+	case MPTCP_CTL_RST_REASON:
+	case MPTCP_CTL_RST_TRANSIENT:
+	case MPTCP_CTL_RST_BADLEN:
+	case MPTCP_CTL_FASTCLOSE_KEY:
+	case MPTCP_CTL_FASTCLOSE_BADLEN:
+		/* gap 2 part (b): arm the NFQUEUE worker to wire-mutate the
+		 * MP_RST / MP_FASTCLOSE option on the fastclose RST, then
+		 * trigger a fastclose.  The SO_LINGER RST carries both
+		 * options regardless of which the mutation targets. */
+		if (brf_mptcp_ensure_nfq_setup() < 0)
+			return -1;
+		BRF_ATOMIC_STORE(&brf_nfq_mut_fired_ctl, 0);
+		BRF_ATOMIC_STORE(&brf_nfq_pending_ctl_mut, suboption);
+		ling.l_onoff = 1;
+		ling.l_linger = 0;
+		setsockopt(fd, SOL_SOCKET, SO_LINGER, &ling, sizeof(ling));
+		close(fd);
+		usleep(50000);	/* let the worker intercept + mutate the RST */
+		BRF_ATOMIC_STORE(&brf_nfq_pending_ctl_mut, 0);
+		break;
 	case MPTCP_CTL_FAIL:
 		/* Graceful close (FIN / DATA_FIN).  Does NOT emit MP_FAIL --
 		 * that needs a bad MPTCP DSS checksum on a csum-enabled
