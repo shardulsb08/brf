@@ -30,7 +30,9 @@ rename — citation discipline applies.
 
 - **Stage 0** — kernel prerequisites — **DONE**.
 - **Stage A** — generator scoping + design — **DONE** (this doc).
-- **Stage B/C/D** — pending.
+- **Stage B** — fixed-scheduler floor — **DONE** (2026-05-22; the
+  smoke test passes — see `executor/bpf_progs/README.md`).
+- **Stage C/D** — pending.
 
 ## What it is
 
@@ -108,7 +110,11 @@ struct, 2-4 callbacks, a known kfunc set, a small known context
 (`struct mptcp_sock *`).  That reuses BRF's body generator
 wholesale; the new code is table entries + one scaffold branch.
 
-### Stage B — load plumbing + the lite floor (~days)
+### Stage B — load plumbing + the lite floor (DONE 2026-05-22)
+
+Implemented in `executor/bpf_progs/` (`mptcp_sched.bpf.c` +
+`test_mptcp_bpf_sched.c`); build/run procedure and verified
+output in `executor/bpf_progs/README.md`.  Original plan:
 
 - Hand-write one fixed `mptcp_sched.bpf.c` — a minimal valid
   scheduler (`get_send`/`get_retrans` returning a subflow), with
