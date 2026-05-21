@@ -68,6 +68,17 @@
 #define MPTCP_PM_OPT_RM_BADLEN       5
 #define MPTCP_PM_OPT_PRIO_BACKUP     6
 #define MPTCP_PM_OPT_PRIO_ID         7
+/* gap 6: per-netns MPTCP sysctls the fuzzer may write (safe subset --
+ * enabled / pm_type / path_manager excluded, they would break the
+ * running harness). */
+#define MPTCP_SYSCTL_ADD_ADDR_TIMEOUT   0
+#define MPTCP_SYSCTL_CHECKSUM           1
+#define MPTCP_SYSCTL_ALLOW_JOIN         2
+#define MPTCP_SYSCTL_STALE_LOSS         3
+#define MPTCP_SYSCTL_SCHEDULER          4
+#define MPTCP_SYSCTL_CLOSE_TIMEOUT      5
+#define MPTCP_SYSCTL_BLACKHOLE_TIMEOUT  6
+#define MPTCP_SYSCTL_SYN_RETRANS        7
 
 // ---------- MPTCP uapi fallbacks ----------
 // Older distro headers won't have these; match the patched kernel.
@@ -4145,6 +4156,68 @@ static long syz_mptcp_getsockopt_fuzz(volatile long a0, volatile long a1,
 	}
 	debug("syz_mptcp_getsockopt_fuzz: slot=%ld level=%d optname=%d "
 	      "want=%ld done\n", slot, level, optname, want);
+	return 0;
+}
+#endif
+
+#if SYZ_EXECUTOR || __NR_syz_mptcp_set_sysctl
+/*
+ * gap 6: write a fuzzer-controlled value to a per-netns MPTCP sysctl.
+ * Exercises the sysctl write handlers and -- for `scheduler` -- the
+ * mptcp_sched_find() name lookup.  Only the safe knobs are exposed:
+ * `enabled`, `pm_type` and `path_manager` are deliberately excluded
+ * (changing them would break the running harness -- MPTCP off, or a
+ * switch away from the userspace path manager the genl pseudo-
+ * syscalls depend on).
+ */
+static long syz_mptcp_set_sysctl(volatile long a0, volatile long a1,
+				 volatile long a2)
+{
+	int which = (int)a0;
+	const char *val = (const char *)a1;
+	size_t val_len = (size_t)a2;
+	const char *path;
+	char buf[256];
+	int fd;
+
+	switch (which) {
+	case MPTCP_SYSCTL_ADD_ADDR_TIMEOUT:
+		path = "/proc/sys/net/mptcp/add_addr_timeout"; break;
+	case MPTCP_SYSCTL_CHECKSUM:
+		path = "/proc/sys/net/mptcp/checksum_enabled"; break;
+	case MPTCP_SYSCTL_ALLOW_JOIN:
+		path = "/proc/sys/net/mptcp/allow_join_initial_addr_port"; break;
+	case MPTCP_SYSCTL_STALE_LOSS:
+		path = "/proc/sys/net/mptcp/stale_loss_cnt"; break;
+	case MPTCP_SYSCTL_SCHEDULER:
+		path = "/proc/sys/net/mptcp/scheduler"; break;
+	case MPTCP_SYSCTL_CLOSE_TIMEOUT:
+		path = "/proc/sys/net/mptcp/close_timeout"; break;
+	case MPTCP_SYSCTL_BLACKHOLE_TIMEOUT:
+		path = "/proc/sys/net/mptcp/blackhole_timeout"; break;
+	case MPTCP_SYSCTL_SYN_RETRANS:
+		path = "/proc/sys/net/mptcp/syn_retrans_before_tcp_fallback";
+		break;
+	default:
+		debug("syz_mptcp_set_sysctl: unknown which=%d\n", which);
+		return -1;
+	}
+
+	if (val_len > sizeof(buf) - 1)
+		val_len = sizeof(buf) - 1;
+	memcpy(buf, val, val_len);
+	buf[val_len] = '\0';
+
+	fd = open(path, O_WRONLY);
+	if (fd < 0) {
+		debug("syz_mptcp_set_sysctl: open %s: %s\n",
+		      path, strerror(errno));
+		return -1;
+	}
+	(void)write(fd, buf, val_len);
+	close(fd);
+	debug("syz_mptcp_set_sysctl: which=%d wrote %zu bytes to %s\n",
+	      which, val_len, path);
 	return 0;
 }
 #endif

@@ -162,6 +162,14 @@ syz_mptcp_getsockopt_fuzz(pair mptcp_pair, level flags[mptcp_sockopt_level], opt
 # SOL_IP=0, SOL_SOCKET=1, SOL_TCP=6, SOL_IPV6=41, SOL_MPTCP=284
 mptcp_sockopt_level = 0, 1, 6, 41, 284
 
+# syz_mptcp_set_sysctl (gap 6): write a fuzzer-controlled value to a
+# per-netns MPTCP sysctl.  Exercises the sysctl write handlers and the
+# `scheduler` name lookup.  enabled / pm_type / path_manager are
+# excluded -- changing them would break the running harness.
+syz_mptcp_set_sysctl(which flags[mptcp_sysctl], value ptr[in, array[int8]], value_len bytesize[value])
+
+mptcp_sysctl = MPTCP_SYSCTL_ADD_ADDR_TIMEOUT, MPTCP_SYSCTL_CHECKSUM, MPTCP_SYSCTL_ALLOW_JOIN, MPTCP_SYSCTL_STALE_LOSS, MPTCP_SYSCTL_SCHEDULER, MPTCP_SYSCTL_CLOSE_TIMEOUT, MPTCP_SYSCTL_BLACKHOLE_TIMEOUT, MPTCP_SYSCTL_SYN_RETRANS
+
 # Out-param struct.  Mirrors `struct brf_mptcp_pair_state_out` in
 # executor/common_brf_linux_mptcp.h.  Field order and sizes must
 # match exactly.
