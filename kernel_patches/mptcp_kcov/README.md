@@ -115,7 +115,9 @@ Seven patches:
    to a comment).  This is the handle-validity WARN at
    `kcov.c:971`, distinct from the `in_task()`/kcov-enabled WARN
    at `kcov.c:983` that patch 5's `in_serving_softirq()` guard
-   addresses.  Added 2026-05-22.
+   addresses.  Added 2026-05-22; **VM-verified 2026-05-23** —
+   zero `kcov_remote_start_prealloc` WARNING occurrences in
+   `run_20260522_232150` on the patched kernel.
 
 ## Prerequisites
 

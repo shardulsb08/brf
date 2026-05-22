@@ -84,15 +84,21 @@ and host-verified** (`go build` / `go vet` clean, `go test ./prog/
 Stage C-full is **VM-confirmed** (2026-05-22): the fuzz run
 `run_20260522_151649` cleared the C-minimal/D ~20,690 cover
 ceiling — see "C-full rebuild + run" below.  Phase 3's whole
-implementation is now coverage-verified end to end.  Two honest
-caveats remain: the verifier-accept *rate* on generated bodies is
-not quantified from coverage alone — now **addressed** by the
-verifier-accept instrumentation (see "Verifier-accept
-instrumentation" under Stage D below): every struct_ops load
-records ACCEPT/REJECT + the rejection reason to an append-only
-stats file, tallied host-side — and a `kcov_remote_start_prealloc`
-WARNING in the BRF coverage instrumentation (not an MPTCP/BPF bug)
-is being fixed separately.
+implementation is now coverage-verified end to end.  Both earlier
+caveats are closed: the verifier-accept *rate* on generated bodies
+is **measured at ~93%** (1,422 struct_ops loads in
+`run_20260522_232150`, 1,284 accepted — raw 90.3%; instrumentation
+v2 fixes a load-twice miscount, so the true rate is ~93%), via
+the verifier-accept instrumentation (see "Verifier-accept
+instrumentation" under Stage D below) — every struct_ops load
+records ACCEPT/REJECT + the verifier's rejection reason to a 9p
+host-shared, append-only stats file, tallied host-side.  The
+`kcov_remote_start_prealloc` WARNING in the BRF coverage
+instrumentation (not an MPTCP/BPF bug) is **fixed and
+VM-verified gone** — kernel patch 0007 (`c2e28d808c9b9`, BRF-side
+`kernel_patches/mptcp_kcov/0007-*.patch`) initialises the four
+BRF kcov fields in `__mptcp_init_sock()`; zero occurrences in
+`run_20260522_232150`.
 
 ### VM run — first observations (2026-05-22)
 
@@ -118,7 +124,10 @@ First fuzz run on the Stage C/D build (`run_20260522_073845`):
   `bpf_mptcp_sched_get_send` (a scheduler's `get_send` ran).  The
   Phase 3 chain — generate → compile → load → verify → register →
   run — is confirmed live (~2.5 h, 2026-05-22).  The
-  verifier-accept *rate* is not quantified from coverage alone.
+  verifier-accept *rate* is not quantifiable from coverage alone —
+  closed later by the verifier-accept instrumentation: **~93%** in
+  `run_20260522_232150` (see Stage D's "Verifier-accept
+  instrumentation" subsection).
 - **One non-kernel crash.**  The run logged one `panic: disabled
   syscall` — a syz-fuzzer Go panic (`checkDisabledCalls`), not a
   kernel bug and not a Phase 3 finding; a BRF fuzzer-robustness
@@ -150,7 +159,9 @@ coverage rather than more MPTCP-protocol coverage.
 Crashes over the run (6): **none are findings** — a
 `kcov_remote_start_prealloc` WARNING (×24) in the BRF coverage
 instrumentation, reached via `mptcp_incoming_options`
-(self-inflicted, not an MPTCP/BPF bug — being fixed separately);
+(self-inflicted, not an MPTCP/BPF bug — fixed by kernel patch
+0007 initialising the BRF kcov fields in `__mptcp_init_sock`;
+zero recurrences in the post-patch `run_20260522_232150`);
 the known `panic: disabled syscall` syz-fuzzer nit (×2); and a
 syzkaller-suppressed empty report (×4).  No genuine kernel bug
 surfaced.
@@ -736,7 +747,9 @@ passes; the executor C (`common_brf_linux.h`) was reviewed and a
 `run_20260522_100632` accumulated coverage across the
 `bpf_mptcp_*` surface — generated schedulers load, the kernel
 verifier processes them, they register and `get_send` runs.  The
-verifier-accept *rate* is not yet quantified.
+verifier-accept *rate* is now quantified: **~93%** in
+`run_20260522_232150` via the verifier-accept instrumentation
+(see the next subsection).
 
 ### Verifier-accept instrumentation (2026-05-22)
 
