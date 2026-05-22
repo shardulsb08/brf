@@ -531,8 +531,18 @@ MPTCP kfuncs callable only from such a program.  Phase 3 makes BRF
   LLVM build is needed — BRF only ever wanted a *recent* stock
   clang (confirmed from the fork README / `setup_brf.sh`).
   **Needs a BRF rebuild to take effect.**
-- **vmlinux.h** — must be regenerated from the now-BTF-enabled
-  kernel into `/mnt/brf_work_dir` (a Stage B step — see below).
+- **vmlinux.h** — regenerated from the now-BTF-enabled kernel into
+  `/mnt/brf_work_dir`.  As of 2026-05-23 BRF does this itself:
+  `regenerateVmlinuxH` (`prog/brf.go`) runs `bpftool btf dump file
+  /sys/kernel/btf/vmlinux format c` once per run (a `sync.Once`,
+  in `genSeedBpfProg`'s work-dir setup path, before the first
+  `compileBpfProg`) and writes the result to `<workdir>/vmlinux.h`.
+  `/sys/kernel/btf/vmlinux` is the running kernel's own BTF, so the
+  header always matches the kernel the executor loads into and can
+  never go stale on a kernel rebuild.  Best-effort: if `bpftool` is
+  absent or the dump fails it logs and leaves any existing
+  `vmlinux.h` untouched — generation never aborts.  **This needs
+  `bpftool` in the fuzzing-guest image.**
 
 ## How BRF's program generator works (Stage A finding)
 
@@ -765,19 +775,53 @@ Record format, one line each:
 
 **VI2 — verifier-log capture**
 (`executor/common_brf_linux.h`).  A `libbpf_set_print` callback
-(`brf_verif_libbpf_print`) buffers libbpf's most recent
-`LIBBPF_WARN` message into a file-scope static; on a struct_ops
-`bpf_object__load` failure that buffer holds the verifier's
-rejection text.  The callback is installed once, lazily, on the
-first struct_ops load.  `brf_verif_record` folds the first line of
-the captured text into the `REJECT` record (`brf_verif_sanitize`
-strips newlines / control chars and caps the length at 320 bytes
-so the whole record stays bounded and one line).  The
-`libbpf_set_print` route was chosen over `bpf_object__open`'s
-`kernel_log_buf` open-opts: `syz_bpf_prog_open` (a separate
-function) does the open, so the open-opts route would mean
-threading a buffer across functions, whereas the print callback is
-a single self-contained install with no change to the open path.
+(`brf_verif_libbpf_print`) captures the WARN-level messages of a
+struct_ops `bpf_object__load`; on a load failure those messages
+hold the verifier's rejection text.  The callback is installed
+once, lazily, on the first struct_ops load.  `brf_verif_record`
+folds the rejection line into the `REJECT` record
+(`brf_verif_sanitize` strips newlines / control chars and caps the
+length at 320 bytes so the whole record stays bounded and one
+line).  The `libbpf_set_print` route was chosen over
+`bpf_object__open`'s `kernel_log_buf` open-opts: `syz_bpf_prog_open`
+(a separate function) does the open, so the open-opts route would
+mean threading a buffer across functions, whereas the print
+callback is a single self-contained install with no change to the
+open path.
+
+**VI2 instrumentation v2 (2026-05-23) — accumulate, then pick the
+informative line.**  The original VI2 callback `vsnprintf`-ed each
+WARN message into a single buffer, *overwriting* — so on a load
+failure the buffer held libbpf's *last* warning, the generic
+wrapper `libbpf: failed to load object '...'`.  The actual
+rejection reason (the specific `libbpf: prog '...': ...` /
+verifier-log line) is an *earlier* warning and was lost, so
+`brf_verifier_tally.sh`'s histogram degenerated to "100% other".
+Fixed: `brf_verif_libbpf_print` now *appends* every WARN message of
+a load to a larger file-scope accumulator (`brf_verif_log_accum`,
+8 KiB), reset at the start of each struct_ops load.  On a REJECT,
+`brf_verif_pick_reason` walks the accumulator line-by-line and
+picks the most informative line — ranking a specific
+`libbpf: prog '...': ...` line above any other non-generic line
+above any non-empty line, and skipping the generic
+`failed to load object` / `failed to load program` wrapper lines
+(`brf_verif_is_generic_line`).  The chosen line is sanitised and
+truncated to `BRF_VERIF_LOG_MAX` (320 bytes) so each per-record
+`write()` stays bounded and atomic, exactly as before.  Result:
+`REJECT` records carry the verifier's actual reason.
+
+**VI2 instrumentation v2 — stop counting load-twice re-attempts as
+rejects.**  A generated syz-program can call `syz_bpf_prog_load`
+twice on the same already-loaded `bpf_object`; the second
+`bpf_object__load` fails with `libbpf: object '...': load can't be
+attempted twice` — *not* a verifier rejection — and the old
+instrumentation miscounted it (≈ 37 of 138 "rejects" in the real
+run).  Fixed: a parallel array `struct_ops_verif_recorded[]` (index
+`i` tracks object `i`, exactly like `struct_ops_link_list[]` /
+`struct_ops_name_list[]`) marks whether a verifier outcome was
+already recorded for an object; `brf_verif_record` is called only
+on the *first* load of an object, so a re-load never emits a
+second, spurious `REJECT`.
 
 **VI3 — host-side tally script**
 (`executor/bpf_progs/brf_verifier_tally.sh`).  Reads one or more
@@ -827,19 +871,27 @@ egress (mount + path) moved.
 file, not a syz-manager stat line — wiring the rate into
 syz-manager's stats plumbing is noted as future polish.
 
-**Verification status:** **host-reviewed 2026-05-22** — the
-executor C cannot be host-built (the executor build is VM-only),
-so the C change in `common_brf_linux.h` (the VI1/VI2 instrumentation
-plus the VI4 9p-egress mount + per-VM-boot path resolution) was
-self-reviewed for C++-safety (explicit casts, file-scope statics,
-callback signature matching `libbpf_print_fn_t` exactly), bounded
-buffers (`BRF_VERIF_PATH_MAX`), and the no-disturb-on-failure
-property (every mount/open/read failure degrades to the `/tmp`
-fallback or is swallowed).  Human follow-up: rebuild BRF **and**
-restart syz-manager so both the executor change and the config
-change take effect, run the fuzzer, then run `brf_verifier_tally.sh`
-against the accumulated `workdir_v01/brf_verifier_stats/stats.*.log`
-files to read the accept rate and rejection-reason histogram.
+**Verification status:** **host-reviewed 2026-05-22, instrumentation
+v2 host-reviewed 2026-05-23** — the executor C cannot be host-built
+(the executor build is VM-only), so the C changes in
+`common_brf_linux.h` (the VI1/VI2 instrumentation, the VI4 9p-egress
+mount + per-VM-boot path resolution, and the v2
+accumulate-then-pick + load-twice-dedup changes) were self-reviewed
+for C++-safety (explicit casts, file-scope statics, callback
+signature matching `libbpf_print_fn_t` exactly), bounded buffers
+(`BRF_VERIF_PATH_MAX`, `BRF_VERIF_ACCUM_MAX`, `BRF_VERIF_LOG_MAX` —
+the chosen line is always truncated into the bounded record), and
+the no-disturb-on-failure property (every mount/open/read failure
+degrades to the `/tmp` fallback or is swallowed; a full accumulator
+just drops further messages).  The Go-side `regenerateVmlinuxH`
+(Change 3) is host-verified — `go build ./prog/...` / `go vet
+./prog/` clean, `go test ./prog/ -run StructOps` passes.  Human
+follow-up: rebuild BRF **and** restart syz-manager so both the
+executor change and the config change take effect, ensure
+`bpftool` is in the fuzzing-guest image (Change 3 needs it), run
+the fuzzer, then run `brf_verifier_tally.sh` against the
+accumulated `workdir_v01/brf_verifier_stats/stats.*.log` files to
+read the accept rate and rejection-reason histogram.
 
 ## Estimate
 

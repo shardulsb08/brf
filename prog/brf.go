@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/syzkaller/pkg/osutil"
@@ -414,6 +415,72 @@ func (brf *BpfRuntimeFuzzer) pruneWorkDir() {
 	fmt.Printf("✅ BRF Debug: pruneWorkDir: swept down to %d bytes\n", total)
 }
 
+// vmlinuxHOnce guards regenerateVmlinuxH so the running kernel's BTF is
+// dumped exactly once per BRF run, before the first compileBpfProg.
+var vmlinuxHOnce sync.Once
+
+// regenerateVmlinuxH refreshes <workDir>/vmlinux.h from the running
+// kernel's own BTF.  Generated struct_ops programs #include "vmlinux.h";
+// placing it out-of-band lets it go stale on a kernel rebuild, so a
+// generated scheduler can fail to compile against a mismatched header.
+// /sys/kernel/btf/vmlinux is the running kernel's BTF, so a dump of it
+// always matches the kernel the executor loads programs into and can
+// never be stale.
+//
+// Best-effort: if bpftool is absent or the command fails, log it and
+// leave any existing vmlinux.h untouched -- generation must never abort
+// on this.  Run once per run via vmlinuxHOnce, from genSeedBpfProg's
+// work-dir setup path, before the first compileBpfProg.
+//
+// Note: this needs `bpftool` present in the fuzzing-guest image.
+func (brf *BpfRuntimeFuzzer) regenerateVmlinuxH() {
+	const btfPath = "/sys/kernel/btf/vmlinux"
+	dst := filepath.Join(brf.workDir, "vmlinux.h")
+
+	if _, err := exec.LookPath("bpftool"); err != nil {
+		fmt.Printf("⚠️ BRF Debug: regenerateVmlinuxH: bpftool not "+
+			"found, leaving %s as-is: %v\n", dst, err)
+		return
+	}
+	if _, err := os.Stat(btfPath); err != nil {
+		fmt.Printf("⚠️ BRF Debug: regenerateVmlinuxH: %s missing, "+
+			"leaving %s as-is: %v\n", btfPath, dst, err)
+		return
+	}
+
+	cmd := exec.Command("bpftool", "btf", "dump", "file", btfPath,
+		"format", "c")
+	out, err := cmd.Output()
+	if err != nil {
+		fmt.Printf("⚠️ BRF Debug: regenerateVmlinuxH: bpftool btf "+
+			"dump failed, leaving %s as-is: %v\n", dst, err)
+		return
+	}
+	if len(out) == 0 {
+		fmt.Printf("⚠️ BRF Debug: regenerateVmlinuxH: bpftool btf "+
+			"dump produced no output, leaving %s as-is\n", dst)
+		return
+	}
+
+	// Write atomically: a partial vmlinux.h would break every
+	// subsequent compile.  Write a temp file in the same dir, then
+	// rename over the destination.
+	tmp := dst + ".tmp"
+	if err := os.WriteFile(tmp, out, 0644); err != nil {
+		fmt.Printf("⚠️ BRF Debug: regenerateVmlinuxH: write %s "+
+			"failed, leaving %s as-is: %v\n", tmp, dst, err)
+		return
+	}
+	if err := os.Rename(tmp, dst); err != nil {
+		fmt.Printf("⚠️ BRF Debug: regenerateVmlinuxH: rename %s -> "+
+			"%s failed, leaving %s as-is: %v\n", tmp, dst, dst, err)
+		os.Remove(tmp)
+		return
+	}
+	fmt.Printf("✅ BRF Debug: regenerateVmlinuxH: refreshed %s "+
+		"(%d bytes) from %s\n", dst, len(out), btfPath)
+}
+
 func (brf *BpfRuntimeFuzzer) genSeedBpfProg(r *randGen) *BpfProg {
 	fmt.Printf("🔍 BRF Debug: genSeedBpfProg called\n")
 	var opt BrfGenProgOpt
@@ -430,6 +497,13 @@ func (brf *BpfRuntimeFuzzer) genSeedBpfProg(r *randGen) *BpfProg {
 	// back under the cap before generating the next.  Cheap when the
 	// dir is under cap (one ReadDir), so safe to call every time.
 	brf.pruneWorkDir()
+
+	// BRF Phase 3: refresh <workDir>/vmlinux.h from the running
+	// kernel's own BTF, once per run, before the first compileBpfProg.
+	// Generated struct_ops programs #include "vmlinux.h"; regenerating
+	// it here guarantees it matches the running kernel and can never be
+	// stale.  Best-effort -- never aborts generation.
+	vmlinuxHOnce.Do(brf.regenerateVmlinuxH)
 
 	for i := 0; i < opt.genProgAttempt; i++ {
 		fmt.Printf("🔍 BRF Debug: Attempt %d/%d to generate BPF program\n", i+1, opt.genProgAttempt)

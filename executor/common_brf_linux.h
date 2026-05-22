@@ -40,6 +40,18 @@ static struct bpf_object *bpf_object_list[OBJ_LIST_SIZE];
 static struct bpf_link *struct_ops_link_list[OBJ_LIST_SIZE];
 static char struct_ops_name_list[OBJ_LIST_SIZE][BRF_MPTCP_SCHED_NAME_MAX];
 
+/* BRF Phase 3 -- verifier-accept instrumentation, Change 2.
+ *
+ * A generated syz-program can call syz_bpf_prog_load twice on the same
+ * already-loaded bpf_object; the second bpf_object__load fails with
+ * "object '...': load can't be attempted twice" -- which is NOT a
+ * verifier rejection.  This parallel array (index i tracks object i,
+ * exactly like struct_ops_link_list / struct_ops_name_list above)
+ * records whether a verifier outcome has already been emitted for an
+ * object, so a re-load never produces a second, spurious REJECT
+ * record. */
+static char struct_ops_verif_recorded[OBJ_LIST_SIZE];
+
 struct bpf_res {
 	int prog_fds[32];
 	int prog_num;
@@ -227,12 +239,17 @@ static int brf_struct_ops_uniquify_name(struct bpf_map *map, char *out)
  * guarantees such writes from concurrent executor procs interleave
  * atomically, so the file stays line-consistent across the whole run.
  *
- * VI2 -- verifier-log capture: a libbpf_set_print callback buffers
- * libbpf's most recent WARN-level message into a file-scope static.
- * On a struct_ops load failure that buffer holds the verifier's
- * rejection text; its first line is folded into the REJECT record.
- * The callback is installed once, lazily, and is harmless for
- * non-struct_ops loads (the buffer is simply ignored).
+ * VI2 -- verifier-log capture: a libbpf_set_print callback ACCUMULATES
+ * every WARN-level message of a load into a file-scope buffer (libbpf
+ * emits the verifier log and several generic wrapper warnings as
+ * separate WARN messages during one bpf_object__load).  On a
+ * struct_ops load failure brf_verif_pick_reason() scans that buffer
+ * line-by-line and folds the most INFORMATIVE line into the REJECT
+ * record -- skipping the generic "failed to load object/program"
+ * wrapper lines and preferring the specific "libbpf: prog '...': ..."
+ * verifier / map error.  The accumulator is reset at the start of each
+ * struct_ops load.  The callback is installed once, lazily, and is
+ * harmless for non-struct_ops loads (the buffer is simply ignored).
  *
  * VI4 -- host egress: the fuzzing guests run QEMU -snapshot (ephemeral
  * disk), so a guest-local stats file is lost on every VM restart and
@@ -252,30 +269,59 @@ static int brf_struct_ops_uniquify_name(struct bpf_map *map, char *out)
 #define BRF_VERIF_STATS_TAG     "brfstats"
 #define BRF_VERIF_STATS_FALLBACK "/tmp/brf_verifier_stats.log"
 #define BRF_VERIF_BOOT_ID_PATH  "/proc/sys/kernel/random/boot_id"
-/* Bound for one record and for the captured verifier-log text.  A
- * record is timestamp + pid + verdict + reason; 512 bytes is far
- * under PIPE_BUF (4096) so the write() is atomic. */
+/* Bound for one record and for the chosen verifier-log line.  A record
+ * is timestamp + pid + verdict + reason; 512 bytes is far under
+ * PIPE_BUF (4096) so the write() is atomic. */
 #define BRF_VERIF_RECORD_MAX    512
 #define BRF_VERIF_LOG_MAX       320
+/* Bound for the WARN-message accumulator.  libbpf emits the verifier
+ * log plus several wrapper warnings as separate WARN messages during
+ * one load; this buffer accumulates them all so the most informative
+ * line can be picked afterwards.  Sized generously -- it is a single
+ * file-scope static, not on any hot path, and only the chosen line
+ * (<= BRF_VERIF_LOG_MAX) ever reaches a record. */
+#define BRF_VERIF_ACCUM_MAX     8192
 /* Bound for the per-VM-boot stats path: BRF_VERIF_STATS_DIR +
  * "/stats." + boot-id (a 36-char UUID) + ".log".  256 is ample. */
 #define BRF_VERIF_PATH_MAX      256
 
-/* Most recent libbpf WARN message -- the verifier rejection text on a
- * failed struct_ops load.  Single-threaded per executor proc, so a
- * plain file-scope static needs no locking. */
-static char brf_verif_last_log[BRF_VERIF_LOG_MAX];
+/* Accumulator for the WARN-level messages of the current struct_ops
+ * load.  libbpf emits the verifier log and several generic wrapper
+ * warnings as separate WARN messages; accumulating them all here lets
+ * brf_verif_pick_reason() pick the most informative line afterwards.
+ * brf_verif_accum_len is the current used length (always <
+ * BRF_VERIF_ACCUM_MAX, NUL-terminated).  Single-threaded per executor
+ * proc, so a plain file-scope static needs no locking. */
+static char brf_verif_log_accum[BRF_VERIF_ACCUM_MAX];
+static size_t brf_verif_accum_len;
 static int brf_verif_print_installed;
 
-/* libbpf print callback: buffer WARN-level messages (the verifier log
- * is emitted at WARN level on a load failure).  Never prints; never
- * fails the load.  Signature matches libbpf_print_fn_t exactly. */
+/* libbpf print callback: APPEND WARN-level messages (the verifier log
+ * is emitted at WARN level on a load failure) to brf_verif_log_accum.
+ * Never prints; never fails the load.  Signature matches
+ * libbpf_print_fn_t exactly. */
 static int brf_verif_libbpf_print(enum libbpf_print_level level,
 				  const char *fmt, va_list ap)
 {
-	if (level == LIBBPF_WARN)
-		vsnprintf(brf_verif_last_log, sizeof(brf_verif_last_log),
-			  fmt, ap);
+	int n;
+	size_t avail;
+
+	if (level != LIBBPF_WARN)
+		return 0;
+	if (brf_verif_accum_len + 1 >= sizeof(brf_verif_log_accum))
+		return 0; /* accumulator full -- drop further messages */
+
+	avail = sizeof(brf_verif_log_accum) - brf_verif_accum_len;
+	n = vsnprintf(brf_verif_log_accum + brf_verif_accum_len, avail,
+		      fmt, ap);
+	/* vsnprintf returns the length it WOULD have written; clamp to
+	 * what actually fit so brf_verif_accum_len never runs past the
+	 * buffer.  A negative return (encoding error) appends nothing. */
+	if (n < 0)
+		return 0;
+	if ((size_t)n >= avail)
+		n = (int)avail - 1;
+	brf_verif_accum_len += (size_t)n;
 	return 0;
 }
 
@@ -296,6 +342,104 @@ static void brf_verif_sanitize(const char *src, char *out, size_t n)
 		out[i] = (c < 0x20 || c == 0x7f) ? ' ' : (char)c;
 	}
 	out[i] = '\0';
+}
+
+/* Change 1 (VI2): true if the line (a NUL-or-newline-bounded fragment
+ * starting at s) is one of libbpf's GENERIC load-failure wrapper
+ * warnings -- the LAST warnings libbpf emits, carrying no rejection
+ * detail ("libbpf: failed to load object '...'", "libbpf: failed to
+ * load object skeleton '...'", "libbpf: prog '...': failed to load:
+ * ..." with no further reason).  These must be skipped in favour of
+ * the earlier, specific verifier / map line. */
+static int brf_verif_is_generic_line(const char *s)
+{
+	/* strstr over a line is safe: the accumulator is NUL-terminated
+	 * and these substrings never span a newline. */
+	return strstr(s, "failed to load object") != NULL ||
+	       strstr(s, "failed to load program") != NULL;
+}
+
+/* Change 1 (VI2): pick the most INFORMATIVE line from the accumulated
+ * WARN messages (brf_verif_log_accum) and sanitise it into out (size
+ * n, <= BRF_VERIF_LOG_MAX).  out is always NUL-terminated.
+ *
+ * libbpf emits the specific rejection reason (the verifier-log line, a
+ * "libbpf: prog '...': ..." or map error) as an EARLIER warning, then
+ * finishes with the generic "failed to load object '...'" wrapper.  A
+ * naive last-message capture keeps only that wrapper, so the host-side
+ * histogram degenerates to "100% other".  This walks every accumulated
+ * line and prefers, in order:
+ *   1. a non-generic "libbpf: prog '...': ..." line (the verifier /
+ *      program-specific reason) -- the FIRST such line wins, since the
+ *      verifier log's head line carries the rejection cause;
+ *   2. otherwise the first non-generic, non-empty line;
+ *   3. otherwise the first non-empty line at all (last resort).
+ * Pure observation -- never touches the load path. */
+static void brf_verif_pick_reason(char *out, size_t n)
+{
+	const char *p = brf_verif_log_accum;
+	const char *best = NULL;
+	int best_rank = -1; /* 0: any non-empty; 1: non-generic; 2: prog line */
+
+	if (n == 0)
+		return;
+	out[0] = '\0';
+
+	while (*p) {
+		const char *line = p;
+		size_t len = 0;
+		int rank;
+		int is_prog;
+		int generic;
+		size_t i;
+		int blank = 1;
+
+		/* Bound this line at the next newline. */
+		while (line[len] && line[len] != '\n' && line[len] != '\r')
+			len++;
+
+		/* A line is "blank" if it holds only whitespace. */
+		for (i = 0; i < len; i++) {
+			unsigned char c = (unsigned char)line[i];
+
+			if (c != ' ' && c != '\t') {
+				blank = 0;
+				break;
+			}
+		}
+
+		if (!blank) {
+			/* strstr needs a NUL-terminated string; the
+			 * accumulator already is, and the wrapper /
+			 * "prog '" substrings never span a newline, so a
+			 * search from line is correct even though it may
+			 * read past this line's newline. */
+			generic = brf_verif_is_generic_line(line);
+			is_prog = (strncmp(line, "libbpf: prog '", 14) == 0);
+			if (is_prog && !generic)
+				rank = 2;
+			else if (!generic)
+				rank = 1;
+			else
+				rank = 0;
+
+			/* Strictly-greater keeps the FIRST line of the
+			 * top rank -- the verifier log's head line, which
+			 * states the cause. */
+			if (rank > best_rank) {
+				best_rank = rank;
+				best = line;
+			}
+		}
+
+		/* Advance past this line and its newline(s). */
+		p = line + len;
+		while (*p == '\n' || *p == '\r')
+			p++;
+	}
+
+	if (best)
+		brf_verif_sanitize(best, out, n);
 }
 
 /* VI4 -- resolved per-VM-boot stats path, computed once on first use.
@@ -379,9 +523,11 @@ static void brf_verif_resolve_path(void)
 }
 
 /* Append one struct_ops verifier-outcome record to the stats file.
- * Pure observation -- all failures are swallowed.  reason may be NULL
- * (used for ACCEPT records). */
-static void brf_verif_record(int accepted, const char *reason)
+ * Pure observation -- all failures are swallowed.  On a REJECT the
+ * rejection reason is picked from the WARN-message accumulator
+ * (brf_verif_log_accum) by brf_verif_pick_reason -- the most
+ * informative verifier-log line, not libbpf's generic wrapper. */
+static void brf_verif_record(int accepted)
 {
 	char rec[BRF_VERIF_RECORD_MAX];
 	char clean[BRF_VERIF_LOG_MAX];
@@ -405,9 +551,12 @@ static void brf_verif_record(int accepted, const char *reason)
 		len = snprintf(rec, sizeof(rec), "%lld %d ACCEPT\n",
 			       (long long)time(NULL), (int)getpid());
 	} else {
+		/* Change 1: pick the informative rejection line from the
+		 * accumulated WARN messages (skips the generic "failed to
+		 * load object" wrapper).  brf_verif_pick_reason already
+		 * sanitises to one line and NUL-terminates clean. */
 		clean[0] = '\0';
-		if (reason && reason[0])
-			brf_verif_sanitize(reason, clean, sizeof(clean));
+		brf_verif_pick_reason(clean, sizeof(clean));
 		len = snprintf(rec, sizeof(rec), "%lld %d REJECT %s\n",
 			       (long long)time(NULL), (int)getpid(),
 			       clean[0] ? clean : "(no-log)");
@@ -466,22 +615,48 @@ static long syz_bpf_prog_load(volatile long a0, volatile long a1)
 	}
 
 	/* VI2: install the libbpf print callback once, so a struct_ops
-	 * load failure below leaves the verifier-log text in
-	 * brf_verif_last_log.  Cheap and idempotent; harmless for the
+	 * load failure below accumulates the verifier-log text in
+	 * brf_verif_log_accum.  Cheap and idempotent; harmless for the
 	 * non-struct_ops path. */
 	if (is_struct_ops && !brf_verif_print_installed) {
 		libbpf_set_print(brf_verif_libbpf_print);
 		brf_verif_print_installed = 1;
 	}
-	if (is_struct_ops)
-		brf_verif_last_log[0] = '\0';
+	/* Change 1: reset the WARN accumulator so it captures only this
+	 * load's messages. */
+	if (is_struct_ops) {
+		brf_verif_log_accum[0] = '\0';
+		brf_verif_accum_len = 0;
+	}
 
 	bpf_object__add_kcov_handle(obj, kcov_common_handle());
 	err = bpf_object__load(obj);
 	/* VI1/VI2: record the struct_ops verifier outcome -- pure
-	 * observation, never affects the load result below. */
-	if (is_struct_ops)
-		brf_verif_record(err == 0, err ? brf_verif_last_log : NULL);
+	 * observation, never affects the load result below.
+	 *
+	 * Change 2: a generated syz-program can call syz_bpf_prog_load
+	 * twice on the same bpf_object; the second bpf_object__load fails
+	 * with "load can't be attempted twice", which is NOT a verifier
+	 * rejection.  Record an outcome only on the FIRST load of an
+	 * object -- struct_ops_verif_recorded[] (parallel to
+	 * bpf_object_list[]) marks objects already recorded, so a re-load
+	 * never emits a second, spurious REJECT. */
+	if (is_struct_ops) {
+		int already = 0, slot = -1;
+
+		for (i = 0; i < OBJ_LIST_SIZE; i++) {
+			if (bpf_object_list[i] == obj) {
+				slot = i;
+				already = struct_ops_verif_recorded[i];
+				break;
+			}
+		}
+		if (!already) {
+			brf_verif_record(err == 0);
+			if (slot >= 0)
+				struct_ops_verif_recorded[slot] = 1;
+		}
+	}
 	if (err) {
 		debug("syz_bpf_prog_load: failed to load bpf prog, errno %d\n", err);
 		return -1;
