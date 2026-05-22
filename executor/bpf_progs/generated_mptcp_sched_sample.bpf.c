@@ -62,19 +62,26 @@ int BPF_PROG(brf_5ed1ec_get_send, struct mptcp_sock *msk)
 	/* BRF-generated body. */
 	int s0 = msk->snd_burst;
 	bool s1 = mptcp_subflow_active(subflow);
-	/* BRF-generated subflow iterator. */
-	struct bpf_iter_mptcp_subflow it2;
-	struct mptcp_subflow_context *sf2;
-	bpf_iter_mptcp_subflow_new(&it2, (struct sock *)msk);
-	while ((sf2 = bpf_iter_mptcp_subflow_next(&it2))) {
-		unsigned long s3 = sf2->avg_pacing_rate;
-		bool s4 = mptcp_subflow_active(sf2);
-		sf2->avg_pacing_rate = 987654;
+	/* BRF-generated if/else. */
+	if (s0 > 4096) {
+		/* BRF-generated subflow iterator. */
+		struct bpf_iter_mptcp_subflow it2;
+		struct mptcp_subflow_context *sf2;
+		bpf_iter_mptcp_subflow_new(&it2, (struct sock *)msk);
+		while ((sf2 = bpf_iter_mptcp_subflow_next(&it2))) {
+			unsigned long s3 = sf2->avg_pacing_rate;
+			bool s4 = mptcp_subflow_active(sf2);
+			sf2->avg_pacing_rate = 987654;
+		}
+		bpf_iter_mptcp_subflow_destroy(&it2);
+		int s5 = s0 & 255;
+	} else {
+		__u64 s6 = mptcp_wnd_end(msk);
+		msk->snd_burst = 12345;
 	}
-	bpf_iter_mptcp_subflow_destroy(&it2);
-	__u64 s5 = mptcp_wnd_end(msk);
-	struct sock *s6 = bpf_mptcp_subflow_tcp_sock(subflow);
-	if (!s6)
+	__u64 s7 = mptcp_wnd_end(msk);
+	struct sock *s8 = bpf_mptcp_subflow_tcp_sock(subflow);
+	if (!s8)
 		return -1;
 	msk->snd_burst = -42;
 

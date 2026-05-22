@@ -16,6 +16,11 @@
 // (TestStructOpsSubflowIter) and that the generated `init` / `release`
 // bodies are non-empty (TestStructOpsInitReleaseBodies).
 //
+// Stage C-full Stage 2b adds TestStructOpsIfElse: generated free-form
+// `if/else` renders balanced, properly-indented C, no branch body emits
+// a `return`, branch-local variables do not leak past their branch, and
+// the nesting depth is capped.
+//
 // Run: go test ./prog/ -run StructOps -v
 
 package prog
@@ -189,6 +194,17 @@ func cmpStructOpsStmts(t *testing.T, path string, want, got []StructOpsStmt) {
 			}
 			cmpStructOpsStmts(t,
 				path+"["+itoa(i)+"].IterBody", ws.IterBody, gs.IterBody)
+		case StructOpsStmtIfElse:
+			if gs.CondVar != ws.CondVar || gs.CondOp != ws.CondOp ||
+				gs.CondVal != ws.CondVal {
+				t.Errorf("%s[%d]: cond got %q/%q/%d want %q/%q/%d",
+					path, i, gs.CondVar, gs.CondOp, gs.CondVal,
+					ws.CondVar, ws.CondOp, ws.CondVal)
+			}
+			cmpStructOpsStmts(t,
+				path+"["+itoa(i)+"].IfBody", ws.IfBody, gs.IfBody)
+			cmpStructOpsStmts(t,
+				path+"["+itoa(i)+"].ElseBody", ws.ElseBody, gs.ElseBody)
 		case StructOpsStmtCtxRead, StructOpsStmtCtxWrite:
 			if gs.FieldAccessor != ws.FieldAccessor {
 				t.Errorf("%s[%d]: FieldAccessor got %q want %q",
@@ -225,16 +241,52 @@ func firstIterSeed(t *testing.T, limit int64) int64 {
 	return -1
 }
 
+// usesIfElse reports whether any generated body of sop contains a
+// generated `if`/`else` statement.
+func usesIfElse(sop *StructOpsProg) bool {
+	found := false
+	for _, b := range [][]StructOpsStmt{
+		sop.GetSendBody, sop.InitBody, sop.ReleaseBody,
+	} {
+		walkStmts(b, func(st *StructOpsStmt) {
+			if st.Kind == StructOpsStmtIfElse {
+				found = true
+			}
+		})
+	}
+	return found
+}
+
+// firstIfElseSeed returns the lowest seed in [0, limit) whose generated
+// scheduler emits an `if`/`else`, or -1 if none does.
+func firstIfElseSeed(t *testing.T, limit int64) int64 {
+	t.Helper()
+	for seed := int64(0); seed < limit; seed++ {
+		p := newStructOpsTestProg(t, seed)
+		if usesIfElse(p.StructOps) {
+			return seed
+		}
+	}
+	return -1
+}
+
 func TestStructOpsGobRoundTrip(t *testing.T) {
-	// Seed 7 is a baseline sample; the second seed is the first one
-	// that exercises the subflow iterator, so the recursive gob path
-	// (a SubflowIter with a nested IterBody) is covered.
+	// Seed 7 is a baseline sample; the iterator seed covers the
+	// recursive gob path through a SubflowIter's nested IterBody; the
+	// if/else seed covers the recursive gob path through an IfElse's
+	// IfBody / ElseBody (Stage 2b).
 	seeds := []int64{7}
 	if it := firstIterSeed(t, 256); it >= 0 {
 		seeds = append(seeds, it)
 	} else {
 		t.Error("no subflow iterator generated across 256 seeds -- " +
 			"iterator gob path is untested")
+	}
+	if ie := firstIfElseSeed(t, 256); ie >= 0 {
+		seeds = append(seeds, ie)
+	} else {
+		t.Error("no if/else generated across 256 seeds -- " +
+			"if/else gob path is untested")
 	}
 	for _, seed := range seeds {
 		p := newStructOpsTestProg(t, seed)
@@ -641,6 +693,283 @@ func TestStructOpsInitReleaseBodies(t *testing.T) {
 			if !hasStmt {
 				t.Errorf("seed %d: %s callback body has no generated "+
 					"statement\n%s", seed, suffix, src)
+			}
+		}
+	}
+}
+
+// localDeclRe matches a generated local declaration -- `<type> sN = ...`
+// or the iterator's `struct ... *sfN;` -- and captures the local name.
+// The local types the generator emits are `int`, `unsigned long`,
+// `bool`, `__u64`, `struct sock *` and `struct mptcp_subflow_context *`.
+var localDeclRe = regexp.MustCompile(
+	`^(?:int|unsigned long|bool|__u64|struct sock \*|` +
+		`struct mptcp_subflow_context \*|struct bpf_iter_mptcp_subflow) ` +
+		`(s[0-9]+|sf[0-9]+|it[0-9]+)\b`)
+
+// localUseRe finds every `sN` / `sfN` / `itN` identifier token on a
+// line, so a use-after-scope can be detected.
+var localUseRe = regexp.MustCompile(`\b(s[0-9]+|sf[0-9]+|it[0-9]+)\b`)
+
+// TestStructOpsIfElse is the Stage C-full Stage 2b check for generated
+// free-form `if/else`.  It asserts that:
+//
+//   - across many seeds an `if/else` is generated at least once;
+//   - the rendered C is brace-balanced and properly nested;
+//   - no branch body emits a `return` (model and rendered C) -- so every
+//     path falls through to the fixed scheduling epilogue;
+//   - the condition tests an in-scope SCALAR local, never a pointer;
+//   - a branch-local variable is never referenced after its branch
+//     closes (C block scope -- no use-after-scope leak);
+//   - generated `if/else` nesting never exceeds the depth cap.
+func TestStructOpsIfElse(t *testing.T) {
+	sawIfElse := false
+	sawElse := false
+
+	// Scalar locals: the only legal condition operands.  A condition
+	// over anything else (a pointer local, or an undeclared name) is a
+	// generator bug.
+	scalarType := map[string]bool{
+		"int": true, "unsigned long": true, "bool": true, "__u64": true,
+	}
+
+	for seed := int64(0); seed < 256; seed++ {
+		p := newStructOpsTestProg(t, seed)
+		sop := p.StructOps
+
+		// Model walk: validate every IfElse statement and recurse.
+		var checkIfElse func(path string, body []StructOpsStmt, depth int)
+		checkIfElse = func(path string, body []StructOpsStmt, depth int) {
+			for i, st := range body {
+				switch st.Kind {
+				case StructOpsStmtIfElse:
+					sawIfElse = true
+					if len(st.ElseBody) > 0 {
+						sawElse = true
+					}
+					if st.CondVar == "" {
+						t.Errorf("seed %d %s[%d]: IfElse has no "+
+							"condition variable", seed, path, i)
+					}
+					if depth >= ifElseMaxDepth {
+						t.Errorf("seed %d %s[%d]: IfElse at depth %d "+
+							"exceeds cap %d", seed, path, i, depth,
+							ifElseMaxDepth)
+					}
+					if len(st.IfBody) == 0 {
+						t.Errorf("seed %d %s[%d]: IfElse has empty "+
+							"if-body", seed, path, i)
+					}
+					// No branch may emit a `return`: the only
+					// return-emitting statement is a KF_RET_NULL-pointer
+					// kfunc call (NullGuard).  Walk both branch bodies.
+					for _, br := range [][]StructOpsStmt{
+						st.IfBody, st.ElseBody,
+					} {
+						walkStmts(br, func(b *StructOpsStmt) {
+							if b.Kind == StructOpsStmtKfuncCall &&
+								b.NullGuard {
+								t.Errorf("seed %d %s[%d]: branch body "+
+									"has a NullGuard kfunc call -- a "+
+									"branch must not emit a return",
+									seed, path, i)
+							}
+						})
+					}
+					checkIfElse(path+"["+itoa(i)+"].IfBody",
+						st.IfBody, depth+1)
+					checkIfElse(path+"["+itoa(i)+"].ElseBody",
+						st.ElseBody, depth+1)
+				case StructOpsStmtSubflowIter:
+					// An iterator inside a branch keeps the same depth
+					// (the loop body is not an if/else level).
+					checkIfElse(path+"["+itoa(i)+"].IterBody",
+						st.IterBody, depth)
+				}
+			}
+		}
+		checkIfElse("GetSendBody", sop.GetSendBody, 0)
+		// init/release are straight-line (allowIf false) -- no IfElse
+		// must ever appear there.
+		for _, b := range []struct {
+			name string
+			body []StructOpsStmt
+		}{{"InitBody", sop.InitBody}, {"ReleaseBody", sop.ReleaseBody}} {
+			walkStmts(b.body, func(st *StructOpsStmt) {
+				if st.Kind == StructOpsStmtIfElse {
+					t.Errorf("seed %d: IfElse generated in %s -- "+
+						"init/release are straight-line", seed, b.name)
+				}
+			})
+		}
+
+		if !usesIfElse(sop) {
+			continue
+		}
+
+		src := p.genStructOpsSource()
+
+		// Brace balance: across the whole rendered TU, `{` and `}`
+		// counts match and the running depth never goes negative.
+		depth := 0
+		minDepth := 0
+		for _, ch := range src {
+			switch ch {
+			case '{':
+				depth++
+			case '}':
+				depth--
+				if depth < minDepth {
+					minDepth = depth
+				}
+			}
+		}
+		if depth != 0 {
+			t.Errorf("seed %d: rendered C brace imbalance (net %d)\n%s",
+				seed, depth, src)
+		}
+		if minDepth < 0 {
+			t.Errorf("seed %d: rendered C has a `}` with no matching "+
+				"`{`\n%s", seed, src)
+		}
+
+		// Condition operand must be a declared scalar local.  For each
+		// IfElse, CondVar must name a local whose declared type is
+		// scalar (never a pointer).
+		declType := map[string]string{}
+		for _, b := range [][]StructOpsStmt{
+			sop.GetSendBody, sop.InitBody, sop.ReleaseBody,
+		} {
+			walkStmts(b, func(st *StructOpsStmt) {
+				if st.Var != "" && st.CType != "" {
+					declType[st.Var] = st.CType
+				}
+			})
+		}
+		walkStmts(sop.GetSendBody, func(st *StructOpsStmt) {
+			if st.Kind != StructOpsStmtIfElse {
+				return
+			}
+			ct, ok := declType[st.CondVar]
+			if !ok {
+				t.Errorf("seed %d: IfElse condition var %q is not a "+
+					"declared local", seed, st.CondVar)
+				return
+			}
+			if !scalarType[ct] {
+				t.Errorf("seed %d: IfElse condition var %q has "+
+					"non-scalar type %q -- conditions must be scalar",
+					seed, st.CondVar, ct)
+			}
+		})
+
+		// Rendered-C return check: a generated `if/else` block (its
+		// opening line carries the `/* BRF-generated if/else. */`
+		// comment) must contain no `return` until it closes.  Walk
+		// lines, tracking brace depth; when inside an if/else block at
+		// or below its opening depth, a `return` line is a leak.
+		lines := strings.Split(src, "\n")
+		ifElseDepths := []int{} // brace depths at which an if/else opened
+		curDepth := 0
+		for li, line := range lines {
+			l := strings.TrimSpace(line)
+			isIfElseOpen := li > 0 &&
+				strings.Contains(strings.TrimSpace(lines[li-1]),
+					"BRF-generated if/else.")
+			// Count braces on this line to update depth.
+			opens := strings.Count(line, "{")
+			closes := strings.Count(line, "}")
+			if isIfElseOpen && opens > 0 {
+				ifElseDepths = append(ifElseDepths, curDepth)
+			}
+			if strings.HasPrefix(l, "return ") &&
+				len(ifElseDepths) > 0 {
+				t.Errorf("seed %d: `return` inside a generated "+
+					"if/else branch\n%s", seed, src)
+			}
+			curDepth += opens - closes
+			// Pop any if/else whose block has now closed.
+			for len(ifElseDepths) > 0 &&
+				curDepth <= ifElseDepths[len(ifElseDepths)-1] {
+				ifElseDepths = ifElseDepths[:len(ifElseDepths)-1]
+			}
+		}
+
+		// Scope-leak check on the rendered C: a local declared inside a
+		// `{ }` block must not be referenced after that block closes.
+		// Track a stack of per-block declared-local sets; on `}` the
+		// top set's locals go out of scope, and any later use of one is
+		// a use-after-scope leak.
+		assertNoScopeLeak(t, seed, src)
+	}
+
+	if !sawIfElse {
+		t.Error("no if/else generated across 256 seeds -- the Stage " +
+			"C-full Stage 2b generator is not firing")
+	}
+	if !sawElse {
+		t.Error("no if/else with an `else` branch generated across " +
+			"256 seeds -- the optional-else path is untested")
+	}
+}
+
+// assertNoScopeLeak verifies that no generated local is referenced
+// after the `{ }` block it was declared in has closed -- the C
+// block-scope correctness invariant for Stage 2b's branch bodies.  It
+// walks the rendered C maintaining a stack of brace-scopes, each
+// carrying the locals declared directly in it; a `}` pops the scope and
+// retires its locals; a reference to a retired local fails the test.
+func assertNoScopeLeak(t *testing.T, seed int64, src string) {
+	t.Helper()
+	// scopes is a stack of declared-local sets, one per open `{`.
+	var scopes []map[string]bool
+	retired := map[string]bool{} // locals whose scope has closed
+	push := func() { scopes = append(scopes, map[string]bool{}) }
+	pop := func() {
+		if len(scopes) == 0 {
+			return
+		}
+		top := scopes[len(scopes)-1]
+		for name := range top {
+			retired[name] = true
+		}
+		scopes = scopes[:len(scopes)-1]
+	}
+	declareHere := func(name string) {
+		if len(scopes) > 0 {
+			scopes[len(scopes)-1][name] = true
+		}
+		// A name re-entering scope (fresh block) is no longer retired.
+		delete(retired, name)
+	}
+
+	for _, raw := range strings.Split(src, "\n") {
+		line := raw
+		l := strings.TrimSpace(line)
+		// A declaration introduces a local into the current scope.  Do
+		// this before the use-check so a `int s0 = s0 ...` self-ref
+		// (which the generator never emits) would still not false-fail.
+		if m := localDeclRe.FindStringSubmatch(l); m != nil {
+			// The local is declared in whatever scope is current when
+			// the `{` of its block has already been pushed.
+			declareHere(m[1])
+		}
+		// Any use of a retired local on this line is a leak.
+		for _, m := range localUseRe.FindAllStringSubmatch(l, -1) {
+			if retired[m[1]] {
+				t.Errorf("seed %d: local %q used after its block "+
+					"closed (use-after-scope)\n%s",
+					seed, m[1], src)
+			}
+		}
+		// Update the scope stack for braces on this line.  A line may
+		// carry both (`} else {`); process left to right.
+		for _, ch := range line {
+			switch ch {
+			case '{':
+				push()
+			case '}':
+				pop()
 			}
 		}
 	}

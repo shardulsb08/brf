@@ -45,9 +45,24 @@ package prog
 // and `msk`-satisfiable kfunc calls; never `mptcp_subflow_set_scheduled`
 // -- those callbacks do not schedule).
 //
-// Out of scope (Stage 2b): generated free-form `if/else`.  The only
-// control flow the generator introduces is the iterator's `while` loop
-// and the existing KF_RET_NULL NULL-guards.
+// Scope (Stage C-full, Stage 2b): generated free-form `if/else`.  An
+// `if (<cond>) { <branch> } [else { <branch> }]` statement kind is added
+// to the `get_send` body generator.  The condition is a simple boolean
+// expression -- a comparison / bit-test against a fuzzer constant or the
+// truthiness of an in-scope SCALAR local (never a pointer: prologue and
+// kfunc-return pointers are already NULL-guarded, so a pointer condition
+// is redundant or constant-true).  Each branch body is generated with the
+// existing body machinery under a `bodyScope` with `noReturn` SET: with no
+// `return` in any branch every path falls through to the fixed scheduling
+// epilogue, so `get_send` always schedules >= 1 subflow -- no per-path
+// scheduling analysis is needed.  A KF_RET_NULL-pointer kfunc (its guard
+// emits a `return`) is therefore not offered inside a branch body, the
+// same exclusion the iterator loop body applies.  Branch-local variables
+// are block-scoped: each branch is its own generated statement slice with
+// its own typed-value pool, so a local declared inside a branch is never
+// referenced after the branch closes.  Nesting depth and total statement
+// count are capped so generated programs stay within the verifier's
+// instruction/complexity limits.
 
 import (
 	"bytes"
@@ -294,6 +309,14 @@ const (
 	// `new -> next* -> destroy` lifecycle on every path, so the three
 	// kfuncs are never emitted apart.
 	StructOpsStmtSubflowIter
+	// StructOpsStmtIfElse -- a generated free-form `if/else` (Stage
+	// 2b).  Rendered as `if (<cond>) { <IfBody> }` optionally followed
+	// by `else { <ElseBody> }`.  The condition is a simple boolean
+	// expression over an in-scope scalar local (Cond* fields); both
+	// branch bodies are generated with the existing body machinery
+	// under a `noReturn` scope, so no branch emits a `return` and every
+	// path falls through to the fixed scheduling epilogue.
+	StructOpsStmtIfElse
 )
 
 // StructOpsStmt is one statement of the BRF-generated get_send body.
@@ -350,6 +373,25 @@ type StructOpsStmt struct {
 	// a valid `struct mptcp_subflow_context *`.  Reuses the same
 	// StructOpsStmt kinds as the top-level body.
 	IterBody []StructOpsStmt
+	// CondVar is the in-scope scalar local the condition tests --
+	// valid for IfElse.  Always a scalar (`int` / `unsigned long` /
+	// `bool` / `__u64`); never a pointer (see StructOpsStmtIfElse).
+	CondVar string
+	// CondOp is the condition operator for IfElse: one of ">", "<",
+	// "==", "!=", "&", or "" (the empty string meaning a bare
+	// truthiness test `if (CondVar)`).
+	CondOp string
+	// CondVal is the fuzzer-chosen constant the condition compares /
+	// bit-tests against -- valid for IfElse when CondOp != "".
+	CondVal int64
+	// IfBody is the generated body of the `if` branch -- valid for
+	// IfElse.  Always non-empty.  Generated under a `noReturn` scope,
+	// so it emits no `return`.
+	IfBody []StructOpsStmt
+	// ElseBody is the generated body of the optional `else` branch --
+	// valid for IfElse.  When nil/empty the renderer emits no `else`.
+	// Generated under the same `noReturn` scope as IfBody.
+	ElseBody []StructOpsStmt
 }
 
 // StructOpsProg is the per-program model of a generated MPTCP struct_ops
@@ -501,13 +543,35 @@ type bodyScope struct {
 	// explicit iterator idiom has no `__attribute__((cleanup))`, so a
 	// `return` from inside the `while` loop would skip
 	// `bpf_iter_mptcp_subflow_destroy` and the verifier would reject
-	// the program for an unreleased iterator.  A KF_RET_NULL-pointer
-	// kfunc is simply not offered inside the loop; a non-guarded
-	// scalar/void kfunc still is.
+	// the program for an unreleased iterator.  Set TRUE for an
+	// `if`/`else` branch body too (Stage 2b): a `return` inside a
+	// branch would make `get_send` skip the fixed scheduling epilogue
+	// on that path, so no branch may return -- every path then falls
+	// through to the epilogue and always schedules.  A KF_RET_NULL-
+	// pointer kfunc is simply not offered when noReturn is set; a
+	// non-guarded scalar/void kfunc still is.
 	noReturn bool
+	// allowIf permits StructOpsStmtIfElse as a statement kind (Stage
+	// 2b).  True for the top-level get_send body and -- subject to the
+	// depth cap -- for an `if`/`else` branch body, so generated
+	// branching may nest.  False for init/release and for an iterator
+	// loop body, which are kept straight-line.
+	allowIf bool
+	// depth is the current `if`/`else` nesting depth (0 at a callback's
+	// top level).  ifElseMaxDepth caps it -- a branch body deeper than
+	// the cap is generated with allowIf cleared, so generated programs
+	// stay within the verifier's instruction/complexity limits.
+	depth int
 	// minStmt / maxStmt bound the generated statement count.
 	minStmt, maxStmt int
 }
+
+// ifElseMaxDepth caps generated `if`/`else` nesting (Stage 2b).  A
+// branch body at this depth is generated with `if`/`else` no longer an
+// offered statement kind, so the deepest branch is straight-line.  Kept
+// small (2) so a generated `get_send` body stays well within the BPF
+// verifier's instruction- and branch-complexity limits.
+const ifElseMaxDepth = 2
 
 // genStructOpsBody generates a BRF struct_ops body: a short,
 // randomly-ordered sequence of ctx reads, ctx writes (the write
@@ -583,19 +647,30 @@ func genStructOpsBody(r *randGen, sop *StructOpsProg, sc bodyScope, varId *int) 
 		pool = append(pool, typedVal{expr: v, ctype: normalizeCType(f.ctype)})
 	}
 
+	// kinds is the set of statement kinds the generator may draw from
+	// for this scope.  The four straight-line kinds are always in;
+	// the iterator is added only when sc.allowIter; the `if`/`else`
+	// statement (Stage 2b) only when sc.allowIf and the nesting cap is
+	// not yet reached.
+	kinds := []StructOpsStmtKind{
+		StructOpsStmtCtxRead, StructOpsStmtCtxWrite,
+		StructOpsStmtArith, StructOpsStmtKfuncCall,
+	}
+	if sc.allowIter {
+		kinds = append(kinds, StructOpsStmtSubflowIter)
+	}
+	if sc.allowIf && sc.depth < ifElseMaxDepth {
+		kinds = append(kinds, StructOpsStmtIfElse)
+	}
+
 	span := sc.maxStmt - sc.minStmt + 1
 	if span < 1 {
 		span = 1
 	}
 	nStmt := sc.minStmt + r.Intn(span)
 	for i := 0; i < nStmt; i++ {
-		// Pick freely among the statement kinds; the iterator is only
-		// in the draw when sc.allowIter.
-		nKinds := 4
-		if sc.allowIter {
-			nKinds = 5
-		}
-		kind := StructOpsStmtKind(r.Intn(nKinds))
+		// Pick freely among the statement kinds available to this scope.
+		kind := kinds[r.Intn(len(kinds))]
 		if sc.requireWrite && i == nStmt-1 {
 			// Bias the last statement toward a write so the headline
 			// primitive is reliably exercised.
@@ -616,6 +691,11 @@ func genStructOpsBody(r *randGen, sop *StructOpsProg, sc bodyScope, varId *int) 
 		if kind == StructOpsStmtKfuncCall && len(callableKfuncs()) == 0 {
 			// No kfunc satisfiable from the pool -- fall back to a
 			// read (always satisfiable).
+			kind = StructOpsStmtCtxRead
+		}
+		if kind == StructOpsStmtIfElse && len(readVars) == 0 {
+			// The condition tests an in-scope scalar local; none yet --
+			// fall back to a read, which produces one.
 			kind = StructOpsStmtCtxRead
 		}
 
@@ -698,9 +778,84 @@ func genStructOpsBody(r *randGen, sop *StructOpsProg, sc bodyScope, varId *int) 
 			body = append(body, st)
 		case StructOpsStmtSubflowIter:
 			body = append(body, genSubflowIter(r, sop, varId))
+		case StructOpsStmtIfElse:
+			// readVars is non-empty here (the fallback above guarantees
+			// it); build the condition over an in-scope scalar local,
+			// then generate the branch bodies.  Pass the CURRENT pool /
+			// scalar-local set as the branch seeds -- a branch sees
+			// everything declared before the `if`.  Branch-body locals
+			// do NOT re-enter this function's pool / readVars: each
+			// branch is a separate genStructOpsBody call with its own
+			// pool, which is exactly C block scoping (a local declared
+			// inside a branch is unreachable after the branch closes).
+			condNames := make([]string, len(readVars))
+			for ci, rv := range readVars {
+				condNames[ci] = rv.name
+			}
+			body = append(body, genIfElse(r, sop, sc, varId, pool, condNames))
 		}
 	}
 	return body
+}
+
+// structOpsCondOps -- the condition operators genIfElse may pick for an
+// `if`/`else`.  The empty string is the bare truthiness test
+// `if (s0)`; the rest are a comparison or a bit-test against a fuzzer
+// constant.  No division/modulo and no assignment: a condition is a
+// pure read of an in-scope scalar.
+var structOpsCondOps = []string{"", ">", "<", "==", "!=", "&"}
+
+// genIfElse builds one StructOpsStmtIfElse: a generated free-form
+// `if`/`else` (Stage 2b).  condNames are the in-scope scalar locals the
+// condition may test (guaranteed non-empty by the caller); seedPool is
+// the typed-value pool visible at the `if` -- the branch bodies are
+// generated against a COPY of it, so a branch may use any value declared
+// before the `if` but a branch-local value never escapes the branch.
+//
+// Both branch bodies are generated with `noReturn` set: with no `return`
+// in either branch every path falls through to the fixed scheduling
+// epilogue, so `get_send` always schedules >= 1 subflow.  `allowIf`
+// stays on (subject to the depth cap via sc.depth+1) so branching may
+// nest; `allowIter` carries the parent's setting so a branch of the
+// top-level body may still contain the subflow iterator.  `requireWrite`
+// is cleared -- a forced write per branch is not wanted.
+func genIfElse(r *randGen, sop *StructOpsProg, sc bodyScope, varId *int,
+	seedPool []typedVal, condNames []string) StructOpsStmt {
+	st := StructOpsStmt{
+		Kind:    StructOpsStmtIfElse,
+		CondVar: condNames[r.Intn(len(condNames))],
+		CondOp:  structOpsCondOps[r.Intn(len(structOpsCondOps))],
+	}
+	if st.CondOp != "" {
+		// A 16-bit constant keeps comparisons / bit-tests in a range
+		// that is meaningful against the scalar locals in scope.
+		st.CondVal = int64(r.Intn(1 << 16))
+	}
+
+	// The branch scope: same writable surface and same iterator
+	// permission as the enclosing scope, but `noReturn` set (no branch
+	// may return) and `requireWrite` cleared.  depth+1 lets the nesting
+	// cap stop runaway recursion.
+	branchScope := bodyScope{
+		pool:         append([]typedVal(nil), seedPool...),
+		writeFields:  sc.writeFields,
+		allowIter:    sc.allowIter,
+		requireWrite: false,
+		noReturn:     true,
+		allowIf:      sc.allowIf,
+		depth:        sc.depth + 1,
+		minStmt:      1,
+		maxStmt:      3,
+	}
+	st.IfBody = genStructOpsBody(r, sop, branchScope, varId)
+	if r.bin() {
+		// Optional `else` -- generated against a fresh copy of the same
+		// seed scope so its locals are independent of the `if` branch.
+		elseScope := branchScope
+		elseScope.pool = append([]typedVal(nil), seedPool...)
+		st.ElseBody = genStructOpsBody(r, sop, elseScope, varId)
+	}
+	return st
 }
 
 // genSubflowIter builds one StructOpsStmtSubflowIter: the open-coded
@@ -752,8 +907,8 @@ func genSubflowIter(r *randGen, sop *StructOpsProg, varId *int) StructOpsStmt {
 
 // getSendScope is the bodyScope for the top-level get_send body: the
 // three fixed-prologue values are in scope, both writable fields are
-// available against their fixed accessors, the iterator is allowed, and
-// a write is required.
+// available against their fixed accessors, the iterator and generated
+// `if`/`else` are allowed, and a write is required.
 func getSendScope() bodyScope {
 	return bodyScope{
 		pool: []typedVal{
@@ -764,6 +919,8 @@ func getSendScope() bodyScope {
 		writeFields:  schedWriteFieldsResolved(),
 		allowIter:    true,
 		requireWrite: true,
+		allowIf:      true,
+		depth:        0,
 		minStmt:      3,
 		maxStmt:      8,
 	}
@@ -833,14 +990,18 @@ func genStructOpsProg(r *randGen) *StructOpsProg {
 }
 
 // walkStmts invokes fn on every statement in body, recursing into the
-// loop body of every SubflowIter so callers see the whole statement
-// tree.
+// loop body of every SubflowIter and both branch bodies of every IfElse
+// so callers see the whole statement tree.
 func walkStmts(body []StructOpsStmt, fn func(*StructOpsStmt)) {
 	for i := range body {
 		st := &body[i]
 		fn(st)
-		if st.Kind == StructOpsStmtSubflowIter {
+		switch st.Kind {
+		case StructOpsStmtSubflowIter:
 			walkStmts(st.IterBody, fn)
+		case StructOpsStmtIfElse:
+			walkStmts(st.IfBody, fn)
+			walkStmts(st.ElseBody, fn)
 		}
 	}
 }
@@ -938,8 +1099,36 @@ func (sop *StructOpsProg) renderBody(s *bytes.Buffer, body []StructOpsStmt, inde
 			}
 		case StructOpsStmtSubflowIter:
 			sop.renderSubflowIter(s, st, indent)
+		case StructOpsStmtIfElse:
+			sop.renderIfElse(s, st, indent)
 		}
 	}
+}
+
+// renderIfElse renders one IfElse (Stage 2b) as
+// `if (<cond>) { <IfBody> }` optionally followed by
+// `else { <ElseBody> }`.  The condition is a comparison / bit-test
+// against a fuzzer constant, or -- when CondOp is empty -- the bare
+// truthiness of an in-scope scalar local.  Both branch bodies are
+// rendered recursively at indent+"\t"; they were generated under a
+// `noReturn` scope, so neither emits a `return` and every path falls
+// through to the caller's fixed scheduling epilogue.
+func (sop *StructOpsProg) renderIfElse(s *bytes.Buffer, st StructOpsStmt, indent string) {
+	var cond string
+	if st.CondOp == "" {
+		// Bare truthiness test.
+		cond = st.CondVar
+	} else {
+		cond = fmt.Sprintf("%s %s %d", st.CondVar, st.CondOp, st.CondVal)
+	}
+	fmt.Fprintf(s, "%s/* BRF-generated if/else. */\n", indent)
+	fmt.Fprintf(s, "%sif (%s) {\n", indent, cond)
+	sop.renderBody(s, st.IfBody, indent+"\t")
+	if len(st.ElseBody) > 0 {
+		fmt.Fprintf(s, "%s} else {\n", indent)
+		sop.renderBody(s, st.ElseBody, indent+"\t")
+	}
+	fmt.Fprintf(s, "%s}\n", indent)
 }
 
 // renderSubflowIter renders one SubflowIter as the complete,

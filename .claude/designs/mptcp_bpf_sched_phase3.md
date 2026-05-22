@@ -3,12 +3,14 @@
 Design doc for **Phase 3** of the MPTCP harness coverage-gap
 backlog (audit gap 1).  As of 2026-05-22: Stage 0/A/B are done and
 verified; Stage C-minimal and Stage D are implemented, committed
-and host-verified, and VM-verified by the fuzz run; Stage C-full
-Stage 1 (straight-line, contract-aware kfunc-call generation) is
-implemented and host-verified; Stage C-full Stage 2a (subflow
-iterator + non-empty init/release) is implemented; the remaining
-Stage C-full work (Stage 2b -- generated free-form if/else) is not
-done.  See the per-stage Status section below.
+and host-verified, and VM-verified by the fuzz run; Stage C-full is
+implemented through **Stage 2b** -- Stage 1 (straight-line,
+contract-aware kfunc-call generation), Stage 2a (subflow iterator +
+non-empty init/release) and Stage 2b (generated free-form
+`if/else`) -- and **host-verified** (build / test / clang).
+Stage C-full as a whole is **not yet VM-confirmed**: the open items
+are a BRF rebuild + fuzz run to exercise Stage 1/2a/2b live and the
+verifier-accept rate.  See the per-stage Status section below.
 
 Auto-loads (per repo `CLAUDE.md`) when work touches the BRF program
 generator (`prog/brf*.go`) for the BPF struct_ops scheduler.
@@ -67,13 +69,21 @@ VM-confirmed) / **IMPLEMENTED, VM-VERIFICATION IN PROGRESS**
   Stage 2a — implemented" below).  `get_send` bodies may now emit
   the open-coded `bpf_iter_mptcp_subflow_*` iterator; `init` and
   `release` get generated `msk`-reachable bodies.
-- **Stage C-full Stage 2b** — **NOT DONE** (generated free-form
-  `if/else` beyond the mandatory KF_RET_NULL guards and the
-  iterator's `while` loop).
+- **Stage C-full Stage 2b** — generated free-form `if/else` —
+  **DONE, host-verified** (see "Stage C-full — Stage 2b —
+  implemented" below).  `get_send` bodies may now emit
+  `if (<cond>) { … } [else { … }]` over an in-scope scalar local,
+  with `noReturn` branch bodies so every path still falls through to
+  the fixed scheduling epilogue.  **This completes Stage C-full.**
 
-The Phase 3 pipeline is end-to-end confirmed.  The one open item
-is the verifier-accept *rate* on generated `get_send` bodies — not
-yet quantified from coverage alone.
+With Stage 2b done, **Stage C-full is implemented through Stage 2b
+and host-verified** (`go build` / `go vet` clean, `go test ./prog/
+-run StructOps` passes, the regenerated sample clang-compiles).
+Phase 3 is **not** marked verified: the C-full features (Stage
+1/2a/2b) are not yet VM-confirmed.  The open items are a BRF
+rebuild + fuzz run to exercise Stage 1/2a/2b live, and the
+verifier-accept *rate* on generated `get_send` bodies — not yet
+quantified from coverage alone.
 
 ### VM run — first observations (2026-05-22)
 
@@ -359,6 +369,104 @@ extended to recurse into `IterBody` and cover `InitBody`/`ReleaseBody`;
 the iterator and the non-empty `init`/`release`; the clang-compile
 is the parent's follow-up.
 
+### Stage C-full — Stage 2b — implemented (2026-05-22)
+
+Stage 2b adds **generated free-form `if/else`** to the `get_send`
+body generator and **completes Stage C-full**.  All changes are in
+`prog/brf_structops.go` + `prog/brf_structops_test.go`.
+
+**The statement kind.**  A new `StructOpsStmtIfElse` body statement
+kind renders as
+
+```
+if (<cond>) {
+        <if-body>
+} [else {
+        <else-body>
+}]
+```
+
+`StructOpsStmt` gains five fields for it: `CondVar` / `CondOp` /
+`CondVal` (the condition) and `IfBody` / `ElseBody` (the two branch
+bodies, recursive `[]StructOpsStmt`).  `walkStmts` now recurses into
+both branch bodies, so `usedKfuncIdxs` / `usesSubflowIter` and the
+tests see the whole statement tree; the gob round-trip covers the
+recursive `IfBody` / `ElseBody` path.
+
+**The condition — scalar only.**  The condition is a simple boolean
+expression over an **in-scope scalar local** — a ctx-read local, an
+arithmetic local, or a scalar kfunc-return local (the generator
+already tracks exactly these in its `readVars` set).  `CondOp` is
+one of `>`, `<`, `==`, `!=`, `&` against a 16-bit fuzzer constant,
+or the empty string for a bare truthiness test `if (s0)`.  Pointers
+are **never** branched on: prologue and kfunc-return pointers are
+already NULL-guarded, so a pointer condition would be redundant or
+constant-true.  When no scalar local is yet in scope the chosen
+`if/else` falls back to a ctx read (which produces one), the same
+fallback pattern Arith uses.
+
+**Branch bodies — `noReturn`, the key correctness lever.**  Each
+branch body is generated with the existing `genStructOpsBody`
+machinery under a `bodyScope` with **`noReturn` set**.  With no
+`return` in any branch, every path falls through to the fixed
+scheduling epilogue (`mptcp_subflow_set_scheduled(subflow, true);
+return 0;`), so `get_send` always schedules ≥ 1 subflow — no
+per-path scheduling analysis is needed.  `noReturn` already existed
+(Stage 2a, for the iterator loop body) and already excludes the
+only `return`-emitting statement, a `KF_RET_NULL`-pointer kfunc
+call; that exclusion now also applies inside a branch.  Stage-1
+scalar/void kfunc calls and the Stage-2a iterator remain available
+as branch-body statements (`allowIter` carries the enclosing
+scope's setting, so a top-level branch may still contain the
+iterator).
+
+**Block scoping — branch-local variables do not leak.**  The
+typed-value pool is block-scoped: each branch body is a separate
+`genStructOpsBody` call with its **own** copied `pool` / `readVars`,
+seeded from the values in scope at the `if` but never feeding new
+locals back into the enclosing function's pool.  That is exactly C
+block scope — a local declared inside a branch renders inside the
+branch's `{ }` and is unreachable after the branch closes.  The
+`else` branch is generated from a fresh copy of the same seed
+scope, so its locals are independent of the `if` branch.
+
+**Nesting cap.**  `bodyScope` gains `allowIf` (permits the new
+statement kind) and `depth` (current nesting depth); a branch scope
+is `depth+1`.  `ifElseMaxDepth` (= 2) caps it — at the cap `allowIf`
+is effectively cleared so the deepest branch is straight-line.
+Together with the existing per-body `minStmt`/`maxStmt` bounds
+(branch bodies are 1–3 statements) this keeps a generated
+`get_send` body well within the BPF verifier's instruction- and
+branch-complexity limits.  `init`/`release` keep `allowIf` false —
+they stay straight-line; iterator loop bodies likewise.
+
+**Refactor.**  `genStructOpsBody`'s statement-kind draw was changed
+from an `r.Intn(nKinds)` over a contiguous enum range to an
+explicit `kinds` slice built per scope (the four straight-line
+kinds always, `SubflowIter` when `allowIter`, `IfElse` when
+`allowIf && depth < ifElseMaxDepth`) — the iterator and `if/else`
+are independently gated, which the old contiguous draw could not
+express.  `genIfElse` builds one `IfElse` statement; `renderIfElse`
+renders it (recursing into `renderBody` at `indent+"\t"` for each
+branch).
+
+Verification status: **host-verified 2026-05-22** —
+`go build ./prog/...` and `go vet ./prog/` clean;
+`go test ./prog/ -run StructOps` passes all seven StructOps tests.
+`prog/brf_structops_test.go` gains `TestStructOpsIfElse`: across 256
+seeds it asserts an `if/else` (and an `if/else` with an `else`) is
+generated, the rendered C is brace-balanced and properly nested, no
+branch body emits a `return` (model and rendered C), the condition
+tests a declared scalar local (never a pointer), generated nesting
+never exceeds `ifElseMaxDepth`, and — via `assertNoScopeLeak`, a
+brace-scope walk of the rendered C — no branch-local variable is
+referenced after its block closes.  `TestStructOpsGobRoundTrip` now
+also covers a seed that exercises `if/else`.  The regenerated
+sample `executor/bpf_progs/generated_mptcp_sched_sample.bpf.c`
+exercises a generated `if/else` (an `if`-branch containing the
+subflow iterator, an `else`-branch with a kfunc call and a ctx
+write); it clang-compiles with the README recipe.
+
 ## What it is
 
 MPTCP has a pluggable packet scheduler — `struct mptcp_sched_ops`
@@ -485,9 +593,11 @@ contract-aware calls to the six common straight-line kfuncs; see
 generated non-empty `init`/`release`; see "Stage C-full — Stage 2a
 — implemented" under Status above.
 
-**Still pending (Stage C-full Stage 2b):**
-- Generated free-form `if/else` beyond the mandatory `KF_RET_NULL`
-  guards and the iterator's `while` loop.
+**Stage C-full Stage 2b is implemented** — generated free-form
+`if/else`; see "Stage C-full — Stage 2b — implemented" under Status
+above.  **Stage C-full is now complete through Stage 2b.**
+
+**Still pending after Stage C-full (future work, not Stage 2b):**
 - A richer `init`/`release` surface (e.g. `BPF_MAP_TYPE_SK_STORAGE`
   per-msk state, as in `mptcp_bpf_rr.c`) — Stage 2a's `init`/`release`
   bodies are reads/writes/arith/kfunc-calls over `msk` only.
@@ -497,6 +607,8 @@ generated non-empty `init`/`release`; see "Stage C-full — Stage 2a
   `bpf_mptcp_sched_btf_struct_access` fields; every `KF_RET_NULL`
   pointer immediately NULL-checked; the iterator always the complete
   `new → next* → destroy` triple with no `return` inside the loop;
+  generated `if/else` branch bodies carry `noReturn` so every path
+  reaches the scheduling epilogue, and nesting is capped at depth 2;
   only typed in-scope values passed as kfunc arguments) to maximise
   the first-pass verifier-accept rate.
 
