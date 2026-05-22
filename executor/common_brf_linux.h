@@ -186,8 +186,10 @@ static int brf_struct_ops_uniquify_name(struct bpf_map *map, char *out)
 		if (uniq_len > field)
 			uniq_len = field;
 		memcpy(blob + i, uniq, uniq_len);
-		strncpy(out, uniq, BRF_MPTCP_SCHED_NAME_MAX - 1);
-		out[BRF_MPTCP_SCHED_NAME_MAX - 1] = '\0';
+		/* uniq is a full BRF_MPTCP_SCHED_NAME_MAX-byte buffer holding
+		 * a NUL-terminated name -- copy all of it (memcpy avoids the
+		 * gcc stringop-truncation warning strncpy(.,.,len) trips). */
+		memcpy(out, uniq, BRF_MPTCP_SCHED_NAME_MAX);
 		debug("syz_bpf_prog_load: struct_ops sched %s -> %s\n",
 		      orig, uniq);
 		return 0;
@@ -225,9 +227,9 @@ static long syz_bpf_prog_load(volatile long a0, volatile long a1)
 		if (brf_struct_ops_uniquify_name(map, sched_name) == 0) {
 			for (i = 0; i < OBJ_LIST_SIZE; i++) {
 				if (bpf_object_list[i] == obj) {
-					strncpy(struct_ops_name_list[i],
-						sched_name,
-						BRF_MPTCP_SCHED_NAME_MAX - 1);
+					memcpy(struct_ops_name_list[i],
+					       sched_name,
+					       BRF_MPTCP_SCHED_NAME_MAX);
 					break;
 				}
 			}
