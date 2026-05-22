@@ -8,9 +8,11 @@ implemented through **Stage 2b** -- Stage 1 (straight-line,
 contract-aware kfunc-call generation), Stage 2a (subflow iterator +
 non-empty init/release) and Stage 2b (generated free-form
 `if/else`) -- and **host-verified** (build / test / clang).
-Stage C-full as a whole is **not yet VM-confirmed**: the open items
-are a BRF rebuild + fuzz run to exercise Stage 1/2a/2b live and the
-verifier-accept rate.  See the per-stage Status section below.
+Stage C-full is **not yet VM-confirmed**: BRF was rebuilt with
+Stage 1/2a/2b and the fuzzer restarted on it 2026-05-22
+(`run_20260522_151649`, in progress); the verdict and the
+verifier-accept rate are pending that run.  See the per-stage
+Status section below.
 
 Auto-loads (per repo `CLAUDE.md`) when work touches the BRF program
 generator (`prog/brf*.go`) for the BPF struct_ops scheduler.
@@ -80,10 +82,12 @@ With Stage 2b done, **Stage C-full is implemented through Stage 2b
 and host-verified** (`go build` / `go vet` clean, `go test ./prog/
 -run StructOps` passes, the regenerated sample clang-compiles).
 Phase 3 is **not** marked verified: the C-full features (Stage
-1/2a/2b) are not yet VM-confirmed.  The open items are a BRF
-rebuild + fuzz run to exercise Stage 1/2a/2b live, and the
-verifier-accept *rate* on generated `get_send` bodies — not yet
-quantified from coverage alone.
+1/2a/2b) are not yet VM-confirmed.  BRF was rebuilt with C-full
+and the fuzzer restarted on it 2026-05-22 (`run_20260522_151649`,
+in progress) — see "C-full rebuild + run" below; the verdict (do
+the C-full kfunc calls / iterator / `if/else` reach new
+`bpf_mptcp_*` / `mptcp_sched_*` coverage) and the verifier-accept
+*rate* are pending that run.
 
 ### VM run — first observations (2026-05-22)
 
@@ -114,6 +118,22 @@ First fuzz run on the Stage C/D build (`run_20260522_073845`):
   syscall` — a syz-fuzzer Go panic (`checkDisabledCalls`), not a
   kernel bug and not a Phase 3 finding; a BRF fuzzer-robustness
   nit (once in 2.5 h).
+
+### C-full rebuild + run (2026-05-22)
+
+`run_20260522_100632` (the Stage C-minimal/D build) later broke
+its ~18,600 plateau on its own — a stochastic breakthrough to a
+new region took total cover to ~20,700.  That is the C-minimal/D
+harness's ceiling, not a C-full result.
+
+BRF was then rebuilt with Stage C-full (Stages 1/2a/2b) and the
+fuzzer restarted 2026-05-22 ~15:17 — run `run_20260522_151649`,
+**in progress**.  The C-full verdict — does it reach new kernel
+coverage beyond the ~20,700 ceiling, and do the C-full-specific
+functions (`bpf_iter_mptcp_subflow_*`, `bpf_mptcp_subflow_tcp_sock`,
+`bpf_mptcp_subflow_queues_empty`, `mptcp_subflow_active`,
+`mptcp_set_timeout`, `mptcp_wnd_end`) go cold → covered — needs
+the run to accumulate (hours).  Verdict pending.
 
 ### Stage C-minimal — implemented (2026-05-22)
 
