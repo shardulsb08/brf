@@ -149,8 +149,15 @@ BRF=/mnt/work_4gb/Dev/mpiric_kernel_dev_env/open/src/fuzzing/brf
 git am < $BRF/kernel_patches/bpf_kcov/0001-kcov-bpf-Add-support-for-preallocated-coverage-area.patch
 
 # 2. Subsystem-specific patches for whatever harness is being built.
-git am < $BRF/kernel_patches/mptcp_kcov/0001-mptcp-add-kcov_remote_handle-fields-and-MPTCP_KCOV_H.patch
-git am < $BRF/kernel_patches/mptcp_kcov/0002-mptcp-instrument-MP_JOIN-validity-gates-with-kcov.patch
+#    The MPTCP series is six patches (0001-0006) as of 2026-05-22;
+#    apply them all in order.  See kernel_patches/mptcp_kcov/README.md
+#    for the authoritative current list.
+git am < $BRF/kernel_patches/mptcp_kcov/0001-*.patch
+git am < $BRF/kernel_patches/mptcp_kcov/0002-*.patch
+git am < $BRF/kernel_patches/mptcp_kcov/0003-*.patch
+git am < $BRF/kernel_patches/mptcp_kcov/0004-*.patch
+git am < $BRF/kernel_patches/mptcp_kcov/0005-*.patch
+git am < $BRF/kernel_patches/mptcp_kcov/0006-*.patch
 ```
 
 (Patches are 3-way mergeable in `git am`, so most upstream churn

@@ -1,8 +1,10 @@
 # Phase 3 — fuzzing the MPTCP BPF struct_ops scheduler
 
 Design doc for **Phase 3** of the MPTCP harness coverage-gap
-backlog (audit gap 1).  Stage A (scoping) is complete and captured
-here; Stages B/C/D are the implementation plan.
+backlog (audit gap 1).  As of 2026-05-22: Stage 0/A/B are done and
+verified; Stage C-minimal and Stage D are implemented, committed
+and host-verified, with VM verification in progress; Stage C-full
+is not done.  See the per-stage Status section below.
 
 Auto-loads (per repo `CLAUDE.md`) when work touches the BRF program
 generator (`prog/brf*.go`) for the BPF struct_ops scheduler.
@@ -28,20 +30,35 @@ rename — citation discipline applies.
 
 ## Status (2026-05-22)
 
-- **Stage 0** — kernel prerequisites — **DONE**.
+Three-state legend used below: **VERIFIED-WORKING** (host- and
+VM-confirmed) / **IMPLEMENTED, VM-VERIFICATION IN PROGRESS**
+(committed + host-verified; live behaviour unconfirmed) /
+**NOT DONE**.
+
+- **Stage 0** — kernel prerequisites — **DONE** (VERIFIED-WORKING).
 - **Stage A** — generator scoping + design — **DONE** (this doc).
-- **Stage B** — fixed-scheduler floor — **DONE** (2026-05-22; the
-  smoke test passes — see `executor/bpf_progs/README.md`).
-- **Stage C-minimal** — generator core — **IMPLEMENTED** (2026-05-22;
-  see "Stage C-minimal — implemented" below).  BRF's program
-  generator now generates and renders a fuzzed `mptcp_sched_ops`
-  struct_ops scheduler.  VM/verifier verification is the follow-up.
+- **Stage B** — fixed-scheduler floor — **DONE, VERIFIED-WORKING**
+  (2026-05-22; the smoke test passes — see
+  `executor/bpf_progs/README.md`).
+- **Stage C-minimal** — generator core — **IMPLEMENTED; VM
+  VERIFICATION IN PROGRESS** (2026-05-22; see "Stage C-minimal —
+  implemented" below).  BRF's program generator now generates and
+  renders a fuzzed `mptcp_sched_ops` struct_ops scheduler.
+  Host-verified (go build/test/vet clean; a rendered sample
+  clang-compiles to a valid struct_ops `.o`).  Live behaviour
+  (kernel verifier accept, registration, execution) is **not yet
+  VM-confirmed** — a fuzz run is accumulating; verdict pending.
 - **Stage D** — wire generated schedulers into live fuzzing —
-  **IMPLEMENTED** (2026-05-22; see "Stage D — implemented" below).
-  The executor loads + registers + selects a generated scheduler and
-  drives MPTCP traffic over it.  VM verification is the follow-up.
-- **Stage C-full** — pending (arbitrary kfunc-call generation,
+  **IMPLEMENTED; VM VERIFICATION IN PROGRESS** (2026-05-22; see
+  "Stage D — implemented" below).  The executor loads + registers +
+  selects a generated scheduler and drives MPTCP traffic over it.
+  Host-verified (go build clean; executor C reviewed; a -Werror
+  build issue found + fixed).  **Not yet VM-confirmed.**
+- **Stage C-full** — **NOT DONE** (arbitrary kfunc-call generation,
   non-empty `init`/`release`).
+
+The genuine open risk is the verifier-accept rate on generated
+`get_send` bodies — unknown until the VM run reports back.
 
 ### VM run — first observations (2026-05-22)
 
@@ -55,15 +72,17 @@ First fuzz run on the Stage C/D build (`run_20260522_073845`):
   was `^mptcp_.*` / `^__mptcp_.*` / `^subflow_.*` / `^__subflow_.*`
   — none match `net/mptcp/bpf.c`'s `bpf_mptcp_*` functions, so the
   Phase 3 surface was neither measured nor guiding the fuzzer.
-  Added `^bpf_mptcp_.*` to `mptcp_v01_first_kmemleak_debug.cfg`
-  (needs a syz-manager restart).  Any future Phase 3 run config
-  must keep `^bpf_mptcp_.*` in the filter.
+  `^bpf_mptcp_.*` has been added to
+  `mptcp_v01_first_kmemleak_debug.cfg`.  Any future Phase 3 run
+  config must keep `^bpf_mptcp_.*` in the filter.
 - **struct_ops generation not yet confirmed.**  BRF's program
   generation runs guest-side, so the syz-manager log shows no
-  per-program generation activity.  Confirmation will come from
-  `bpf_mptcp_*` coverage appearing after the cover_filter restart,
-  or a guest-side check of `/mnt/brf_work_dir` for generated
-  `prog_*.{c,o}` plus the syz-fuzzer compile log.
+  per-program generation activity.  The fuzz run is accumulating
+  with the widened filter; confirmation (do generated struct_ops
+  schedulers load + pass the kernel verifier + run) will come from
+  `bpf_mptcp_*` coverage appearing, or a guest-side check of
+  `/mnt/brf_work_dir` for generated `prog_*.{c,o}` plus the
+  syz-fuzzer compile log.  **Verdict pending.**
 
 ### Stage C-minimal — implemented (2026-05-22)
 
@@ -316,29 +335,35 @@ a live corpus program is most likely to still reference by path)
 survive longest.  Best-effort: any error logs and stops; generation
 never fails.  The generator is not frozen.
 
-**Verification status:** Go-side host-verified is the parent's to
-run (`go build ./prog/... && go build ./syz-manager`,
-`go test ./prog/ -run StructOps`).  The executor C
-(`common_brf_linux.h`) is VM-build-only and self-reviewed.  Live
-verification — generated scheduler loads, registers under the
-unique name, is selected, and `get_send` runs under
-`drive_traffic` — is the VM follow-up, cleanest now that the
-load/register/select path is executor-wired.
+**Verification status:** **host-verified 2026-05-22**.  Go side is
+build-clean (`go build ./prog/... && go build ./syz-manager`) and
+`go test ./prog/ -run StructOps` passes; the executor C
+(`common_brf_linux.h`) was reviewed and a `-Werror=stringop-truncation`
+build issue found + fixed (commit `22834b91a`).  Live verification —
+generated scheduler loads, registers under the unique name, is
+selected, and `get_send` runs under `drive_traffic` — is **VM
+verification in progress**: a fuzz run is accumulating, verdict
+pending.
 
 ## Estimate
 
-**~3-5 weeks of focused work.**  Stage B ships in days and is the
-guaranteed-demoable floor.  Stage C is the genuine flagship and
-where overrun risk lives.  **Not done by the 2026-06-01
-submission** — the submission presents Phase 3 as the
-flagship-in-progress; the **2026-07-13 talk** is the landing
-target.
+**~3-5 weeks of focused work.**  As of 2026-05-22: Stage B is done
+and verified; Stage C-minimal and Stage D are implemented,
+committed, and host-verified, with VM verification in progress;
+Stage C-full is not done.  The submission (2026-06-01) presents
+Phase 3 as the flagship-in-progress; the **2026-07-13 talk** is the
+landing target.  Overrun risk now lives in Stage C-full and in
+whatever the VM-verification run surfaces about generated-body
+verifier-accept rate.
 
 ## Risks / open items
 
-- `mutBpfProg` (`brf.go`) is a stub — BRF only generates fresh
-  programs, never mutates them.  This caps coverage-guided
-  exploration of the scheduler.  A post-Stage-D consideration.
+- `mutBpfProg` (lowercase, `brf.go`) is a dead stub; the real
+  mutation function is `MutBpfProg` (capital, `brf_legacy.go`),
+  which BRF does call — and `MutBpfProg` re-rolls a struct_ops body
+  rather than spinning on the empty `Calls` list (Stage C-minimal
+  piece 5).  So BRF *does* mutate generated schedulers; the open
+  item is the depth of that mutation, a post-Stage-D consideration.
 - `/mnt/brf_work_dir` disk growth — **addressed in Stage D4**:
   `pruneWorkDir` sweeps oldest `prog_*` artifacts under a 4 GiB soft
   cap each generation.  The generator is not frozen.

@@ -108,6 +108,10 @@ Expect the `PASS` block shown above.
   need vmlinux.h** -- only the host compile step (2) does.
 - `mptcp_sched.bpf.c` is the Stage C scaffold -- keep it minimal;
   BRF's generator replaces the `get_send` body.
-- Stage C/D move this from a manual smoke test to executor-driven
-  loading (and BRF compiling generated programs into
-  `/mnt/brf_work_dir`).  See the design doc.
+- Stage C-minimal and Stage D (executor-driven loading, with BRF
+  compiling generated struct_ops schedulers into
+  `/mnt/brf_work_dir`) are **implemented, committed and
+  host-verified** as of 2026-05-22, with VM verification in
+  progress -- see `../../.claude/designs/mptcp_bpf_sched_phase3.md`
+  for current status.  This directory's smoke test remains the
+  Stage B fixed-scheduler floor and the Stage C scaffold.

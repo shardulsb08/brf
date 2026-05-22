@@ -13,9 +13,23 @@ this first as the worked example, then specialise.
 - `.claude/tasks/netdev_0x1a_protocol_fuzzing/context_reference.md`
   (strategic context, citation discipline).
 
-**Status:** v0 draft, 2026-05-15.  No code written yet.  This doc
-fixes the design before implementation so the harness lands in
-idiomatic BRF shape on first try.
+**Status (updated 2026-05-22):** this began as a v0 design draft
+(2026-05-15, "no code written yet"); the body has since been
+revised in place with dated decision markers as the design
+settled.  **The harness it describes is now built and the
+described surface is largely implemented.**  As of 2026-05-22 the
+MPTCP harness is at **25 pseudo-syscalls** (21 MPTCP + 4 BPF) — far
+beyond the five sketched in Section 3 — covering MP_CAPABLE,
+MP_JOIN with wire mutation, DSS data, both path managers, the
+error-signalling options, setsockopt/getsockopt and sysctl
+fuzzing, and v4/v6.  The audit-driven coverage-gap backlog (gaps
+2-10) is complete and committed; gap 1 (the BPF struct_ops
+scheduler) is implemented through Stage D with VM verification in
+progress — see `.claude/designs/mptcp_bpf_sched_phase3.md`.  This
+doc is retained as the worked design record (and the template for
+sibling QUIC / tlshd harnesses); the per-section dated markers and
+the historical "no code" framing below are a record of how the
+design evolved, not a description of current state.
 
 ## 1. Goal
 

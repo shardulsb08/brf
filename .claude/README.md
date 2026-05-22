@@ -22,10 +22,11 @@ under JIT, plus the helpers/maps/attach paths around them). The
 codebase is Go (Syzkaller's prog/sys descriptors + a BRF overlay) plus
 the C executor and the syscall description files under `sys/linux/`.
 
-The repo's mainline is `dev`; current working branch is
-`bootstrap_experimental_v0_01`. `origin` points at the personal fork
-`git@github.com:shardulsb08/brf.git`, so this is a working clone, not
-a public mirror.
+The repo's mainline is `dev`; the current working branch is
+`protocol_flow_fuzzing_harness` (the netdev 0x1A protocol-flow
+harness work; off `bootstrap_experimental_v0_01`). `origin` points
+at the personal fork `git@github.com:shardulsb08/brf.git`, so this
+is a working clone, not a public mirror.
 
 This shape -- a long-running fork with several in-flight changes (new
 prog types, new map types, fuzzer tuning, deadlock/repro analysis,

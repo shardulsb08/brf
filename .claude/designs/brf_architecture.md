@@ -485,8 +485,9 @@ subsystem.  See also project memory
 `reference_kcov_brf_patches.md` for the patch-set version history.
 
 **How patches relate to the kernel base:** patches live in the BRF
-repo (`brf/kernel_patches/<harness>_kcov/v??/`), not in the kernel
-tree.  At build time, we fetch upstream, fast-forward our local
+repo (`brf/kernel_patches/<harness>_kcov/`, flat -- no `v??/`
+subdirectories; iterations live in BRF git history), not in the
+kernel tree.  At build time, we fetch upstream, fast-forward our local
 tracking branch (`*_brf_fuzz_base`), then apply our patches.  This
 keeps the kernel tree upstream-clean for diffs and reproduction,
 and lets the kernel base move forward without breaking our patch
