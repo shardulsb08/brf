@@ -82,12 +82,17 @@ Implemented in five pieces, all in `prog/`:
    `MutBpfProg` re-rolls a struct_ops body rather than spinning on
    the empty `Calls` list.
 
-Verification status: code self-reviewed for compile-correctness.
-`go build` / clang / `git` could not be executed in the
-implementation environment (sandbox denied build/exec tooling) — a
-representative rendered scheduler is committed at
-`executor/bpf_progs/generated_mptcp_sched_sample.bpf.c` for the
-follow-up `go build` + clang-compile + VM/verifier pass.
+Verification status: **host-verified 2026-05-22** (commits
+`e894ba00d` + `d2f5aa96b`).  `go build ./prog/...` and `go vet
+./prog/` are clean; `go test ./prog/ -run StructOps` passes (64
+rendered schedulers; structural, write-target and gob-roundtrip
+checks); the rendered sample
+`executor/bpf_progs/generated_mptcp_sched_sample.bpf.c`
+clang-compiles to a valid struct_ops `.o` (struct_ops +
+.struct_ops.link + .BTF).  Remaining: generated schedulers
+passing the kernel BPF verifier and registering on a live kernel
+-- the VM follow-up, cleanest once Stage D wires executor-side
+loading.
 
 ## What it is
 
