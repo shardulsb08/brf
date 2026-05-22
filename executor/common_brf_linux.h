@@ -200,6 +200,122 @@ static int brf_struct_ops_uniquify_name(struct bpf_map *map, char *out)
 	return -1;
 }
 
+/* BRF Phase 3 -- continuous verifier-accept instrumentation.
+ *
+ * Generated mptcp_sched_ops struct_ops schedulers are run through the
+ * kernel BPF verifier by bpf_object__load() in syz_bpf_prog_load().
+ * To make the generator-tuning loop measure-driven, every struct_ops
+ * load records its verifier outcome (ACCEPT / REJECT, and on reject
+ * the key verifier-log line) to an append-only stats file.  A host-
+ * side tally script (brf_verifier_tally.sh) buckets the results.
+ *
+ * Scope: struct_ops objects ONLY -- the recording is gated on
+ * brf_find_struct_ops_map(obj) != NULL.  Regular BPF loads are not
+ * instrumented.  The recording is pure observation: it never alters
+ * the load path or its return value, and any instrumentation failure
+ * (open/write error, full buffer) is silently ignored.
+ *
+ * Atomicity: each record is emitted as a SINGLE write() of a bounded
+ * buffer well under PIPE_BUF (4 KiB), to an O_APPEND fd.  POSIX
+ * guarantees such writes from concurrent executor procs interleave
+ * atomically, so the file stays line-consistent across the whole run.
+ *
+ * VI2 -- verifier-log capture: a libbpf_set_print callback buffers
+ * libbpf's most recent WARN-level message into a file-scope static.
+ * On a struct_ops load failure that buffer holds the verifier's
+ * rejection text; its first line is folded into the REJECT record.
+ * The callback is installed once, lazily, and is harmless for
+ * non-struct_ops loads (the buffer is simply ignored). */
+
+#define BRF_VERIF_STATS_PATH    "/mnt/brf_work_dir/brf_verifier_stats.log"
+#define BRF_VERIF_STATS_FALLBACK "/tmp/brf_verifier_stats.log"
+/* Bound for one record and for the captured verifier-log text.  A
+ * record is timestamp + pid + verdict + reason; 512 bytes is far
+ * under PIPE_BUF (4096) so the write() is atomic. */
+#define BRF_VERIF_RECORD_MAX    512
+#define BRF_VERIF_LOG_MAX       320
+
+/* Most recent libbpf WARN message -- the verifier rejection text on a
+ * failed struct_ops load.  Single-threaded per executor proc, so a
+ * plain file-scope static needs no locking. */
+static char brf_verif_last_log[BRF_VERIF_LOG_MAX];
+static int brf_verif_print_installed;
+
+/* libbpf print callback: buffer WARN-level messages (the verifier log
+ * is emitted at WARN level on a load failure).  Never prints; never
+ * fails the load.  Signature matches libbpf_print_fn_t exactly. */
+static int brf_verif_libbpf_print(enum libbpf_print_level level,
+				  const char *fmt, va_list ap)
+{
+	if (level == LIBBPF_WARN)
+		vsnprintf(brf_verif_last_log, sizeof(brf_verif_last_log),
+			  fmt, ap);
+	return 0;
+}
+
+/* Sanitise a captured verifier-log fragment into out (size n): copy up
+ * to the first newline, replacing any other control char with a space,
+ * so the whole record stays one line.  out is always NUL-terminated. */
+static void brf_verif_sanitize(const char *src, char *out, size_t n)
+{
+	size_t i = 0;
+
+	if (n == 0)
+		return;
+	for (; src && src[i] && i + 1 < n; i++) {
+		unsigned char c = (unsigned char)src[i];
+
+		if (c == '\n' || c == '\r')
+			break;
+		out[i] = (c < 0x20 || c == 0x7f) ? ' ' : (char)c;
+	}
+	out[i] = '\0';
+}
+
+/* Append one struct_ops verifier-outcome record to the stats file.
+ * Pure observation -- all failures are swallowed.  reason may be NULL
+ * (used for ACCEPT records). */
+static void brf_verif_record(int accepted, const char *reason)
+{
+	char rec[BRF_VERIF_RECORD_MAX];
+	char clean[BRF_VERIF_LOG_MAX];
+	int fd, len;
+	ssize_t w;
+
+	fd = open(BRF_VERIF_STATS_PATH,
+		  O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+	if (fd < 0)
+		fd = open(BRF_VERIF_STATS_FALLBACK,
+			  O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+	if (fd < 0)
+		return;
+
+	if (accepted) {
+		len = snprintf(rec, sizeof(rec), "%lld %d ACCEPT\n",
+			       (long long)time(NULL), (int)getpid());
+	} else {
+		clean[0] = '\0';
+		if (reason && reason[0])
+			brf_verif_sanitize(reason, clean, sizeof(clean));
+		len = snprintf(rec, sizeof(rec), "%lld %d REJECT %s\n",
+			       (long long)time(NULL), (int)getpid(),
+			       clean[0] ? clean : "(no-log)");
+	}
+	/* snprintf returns the length it WOULD have produced; given the
+	 * bounds above (clean <= 320, rec = 512) it never truncates, but
+	 * clamp defensively to the actual written length so the single
+	 * write() stays bounded and never includes the NUL. */
+	if (len < 0)
+		len = 0;
+	if (len > (int)sizeof(rec) - 1)
+		len = (int)sizeof(rec) - 1;
+	if (len > 0) {
+		w = write(fd, rec, (size_t)len);
+		(void)w;
+	}
+	close(fd);
+}
+
 static long syz_bpf_prog_load(volatile long a0, volatile long a1)
 {
 	const char *file = (char *)a0;
@@ -208,6 +324,7 @@ static long syz_bpf_prog_load(volatile long a0, volatile long a1)
 	struct bpf_object *obj;
 	struct bpf_map *map;
 	int i, err;
+	bool is_struct_ops;
 
 	obj = find_bpf_object_by_basename(file);
 	if (!obj) {
@@ -221,6 +338,7 @@ static long syz_bpf_prog_load(volatile long a0, volatile long a1)
 	 * select it.  Best-effort -- on failure the attach path falls
 	 * back to the object's compiled-in name. */
 	map = brf_find_struct_ops_map(obj);
+	is_struct_ops = (map != NULL);
 	if (map) {
 		char sched_name[BRF_MPTCP_SCHED_NAME_MAX] = {0};
 
@@ -236,8 +354,23 @@ static long syz_bpf_prog_load(volatile long a0, volatile long a1)
 		}
 	}
 
+	/* VI2: install the libbpf print callback once, so a struct_ops
+	 * load failure below leaves the verifier-log text in
+	 * brf_verif_last_log.  Cheap and idempotent; harmless for the
+	 * non-struct_ops path. */
+	if (is_struct_ops && !brf_verif_print_installed) {
+		libbpf_set_print(brf_verif_libbpf_print);
+		brf_verif_print_installed = 1;
+	}
+	if (is_struct_ops)
+		brf_verif_last_log[0] = '\0';
+
 	bpf_object__add_kcov_handle(obj, kcov_common_handle());
 	err = bpf_object__load(obj);
+	/* VI1/VI2: record the struct_ops verifier outcome -- pure
+	 * observation, never affects the load result below. */
+	if (is_struct_ops)
+		brf_verif_record(err == 0, err ? brf_verif_last_log : NULL);
 	if (err) {
 		debug("syz_bpf_prog_load: failed to load bpf prog, errno %d\n", err);
 		return -1;

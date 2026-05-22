@@ -86,7 +86,11 @@ Stage C-full is **VM-confirmed** (2026-05-22): the fuzz run
 ceiling — see "C-full rebuild + run" below.  Phase 3's whole
 implementation is now coverage-verified end to end.  Two honest
 caveats remain: the verifier-accept *rate* on generated bodies is
-not quantified from coverage alone, and a `kcov_remote_start_prealloc`
+not quantified from coverage alone — now **addressed** by the
+verifier-accept instrumentation (see "Verifier-accept
+instrumentation" under Stage D below): every struct_ops load
+records ACCEPT/REJECT + the rejection reason to an append-only
+stats file, tallied host-side — and a `kcov_remote_start_prealloc`
 WARNING in the BRF coverage instrumentation (not an MPTCP/BPF bug)
 is being fixed separately.
 
@@ -723,6 +727,85 @@ passes; the executor C (`common_brf_linux.h`) was reviewed and a
 `bpf_mptcp_*` surface — generated schedulers load, the kernel
 verifier processes them, they register and `get_send` runs.  The
 verifier-accept *rate* is not yet quantified.
+
+### Verifier-accept instrumentation (2026-05-22)
+
+The verifier-accept *rate* — what fraction of generated
+`mptcp_sched_ops` schedulers the kernel BPF verifier accepts, and
+*why* the rest are rejected — is the missing measurement that makes
+the generator-tuning loop measure-driven.  Coverage alone does not
+quantify it.  This instrumentation closes that gap: every
+struct_ops load records its verifier outcome to an append-only
+stats file, continuously, every run.
+
+Three pieces, all gated **struct_ops only** (`brf_find_struct_ops_map`)
+— regular BPF loads are untouched.
+
+**VI1 — outcome recording + stats file**
+(`executor/common_brf_linux.h`).  `syz_bpf_prog_load` already
+detects a struct_ops object via `brf_find_struct_ops_map`; that
+result is now also kept in a local `is_struct_ops` flag.  Around
+the existing `bpf_object__load(obj)` call — *the* verifier step —
+`brf_verif_record()` appends one line per struct_ops load to
+`/mnt/brf_work_dir/brf_verifier_stats.log` (fallback
+`/tmp/brf_verifier_stats.log` when the work dir is absent).  The
+file is opened `O_WRONLY|O_CREAT|O_APPEND|O_CLOEXEC` and each
+record is emitted as a SINGLE bounded `write()` (≤ 511 bytes, far
+under `PIPE_BUF` = 4 KiB) so concurrent writes from many executor
+procs interleave atomically.  The file accumulates over the whole
+run.  Instrumentation is pure observation — it never alters the
+load path or its return value, and every failure (open/write
+error) is silently swallowed.
+
+Record format, one line each:
+
+```
+<unix-ts> <pid> ACCEPT
+<unix-ts> <pid> REJECT <sanitised verifier-log line>
+```
+
+**VI2 — verifier-log capture**
+(`executor/common_brf_linux.h`).  A `libbpf_set_print` callback
+(`brf_verif_libbpf_print`) buffers libbpf's most recent
+`LIBBPF_WARN` message into a file-scope static; on a struct_ops
+`bpf_object__load` failure that buffer holds the verifier's
+rejection text.  The callback is installed once, lazily, on the
+first struct_ops load.  `brf_verif_record` folds the first line of
+the captured text into the `REJECT` record (`brf_verif_sanitize`
+strips newlines / control chars and caps the length at 320 bytes
+so the whole record stays bounded and one line).  The
+`libbpf_set_print` route was chosen over `bpf_object__open`'s
+`kernel_log_buf` open-opts: `syz_bpf_prog_open` (a separate
+function) does the open, so the open-opts route would mean
+threading a buffer across functions, whereas the print callback is
+a single self-contained install with no change to the open path.
+
+**VI3 — host-side tally script**
+(`executor/bpf_progs/brf_verifier_tally.sh`).  Reads one or more
+stats files (defaults to the guest path + fallback; accepts
+multiple per-VM files as arguments) and prints total struct_ops
+loads, accept / reject counts, accept rate %, and a
+rejection-reason histogram.  Reason categorization lives **here**,
+host-side — `categorize_reason()` buckets the raw verifier-log
+lines by pattern (unreleased reference, invalid memory access,
+pointer bounds, bad return value, unchecked NULL, program too
+large, unknown kfunc, BTF/type mismatch, disallowed context write,
+…), tunable without an executor rebuild.
+
+**Scope boundary.**  Surfacing is deliberately the append-only
+file, not a syz-manager stat line — wiring the rate into
+syz-manager's stats plumbing is noted as future polish.
+
+**Verification status:** **host-reviewed 2026-05-22** — the
+executor C cannot be host-built (the executor build is VM-only),
+so the C change (~110 lines incl. comments in `common_brf_linux.h`)
+was self-reviewed for C++-safety (explicit casts, file-scope
+statics, callback signature matching `libbpf_print_fn_t` exactly),
+bounded buffers, and the no-disturb-on-failure property.  Human
+follow-up: rebuild BRF, run the fuzzer, then run
+`brf_verifier_tally.sh` against the accumulated
+`brf_verifier_stats.log` to read the accept rate and
+rejection-reason histogram.
 
 ## Estimate
 
