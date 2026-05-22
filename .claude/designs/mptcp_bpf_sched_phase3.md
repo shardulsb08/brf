@@ -5,9 +5,10 @@ backlog (audit gap 1).  As of 2026-05-22: Stage 0/A/B are done and
 verified; Stage C-minimal and Stage D are implemented, committed
 and host-verified, and VM-verified by the fuzz run; Stage C-full
 Stage 1 (straight-line, contract-aware kfunc-call generation) is
-implemented and host-verified; the remaining Stage C-full work
-(Stage 2 -- subflow iterator, non-empty init/release) is not done.
-See the per-stage Status section below.
+implemented and host-verified; Stage C-full Stage 2a (subflow
+iterator + non-empty init/release) is implemented; the remaining
+Stage C-full work (Stage 2b -- generated free-form if/else) is not
+done.  See the per-stage Status section below.
 
 Auto-loads (per repo `CLAUDE.md`) when work touches the BRF program
 generator (`prog/brf*.go`) for the BPF struct_ops scheduler.
@@ -61,10 +62,14 @@ VM-confirmed) / **IMPLEMENTED, VM-VERIFICATION IN PROGRESS**
   kfunc-call generation — **DONE, host-verified** (see "Stage
   C-full — Stage 1 — implemented" below).  Generated `get_send`
   bodies now call six more common MPTCP kfuncs.
-- **Stage C-full Stage 2** — **NOT DONE** (subflow iterator
-  `bpf_iter_mptcp_subflow_*` / `bpf_for_each`, generated `if/else`
-  beyond the mandatory KF_RET_NULL guards, non-empty
-  `init`/`release`).
+- **Stage C-full Stage 2a** — subflow iterator + non-empty
+  `init`/`release` — **DONE, host-verified** (see "Stage C-full —
+  Stage 2a — implemented" below).  `get_send` bodies may now emit
+  the open-coded `bpf_iter_mptcp_subflow_*` iterator; `init` and
+  `release` get generated `msk`-reachable bodies.
+- **Stage C-full Stage 2b** — **NOT DONE** (generated free-form
+  `if/else` beyond the mandatory KF_RET_NULL guards and the
+  iterator's `while` loop).
 
 The Phase 3 pipeline is end-to-end confirmed.  The one open item
 is the verifier-accept *rate* on generated `get_send` bodies — not
@@ -252,6 +257,108 @@ compiles clean (`go test -count=0`).  The regenerated sample
 all six new kfuncs incl. the `KF_RET_NULL` guard; the
 clang-compile is the parent's follow-up.
 
+### Stage C-full — Stage 2a — implemented (2026-05-22)
+
+Stage 2a adds two pieces to the generator, both in
+`prog/brf_structops.go` + `prog/brf_structops_test.go`.  Stage 2b
+(generated free-form `if/else`) remains out of scope.
+
+**Piece 1 — the subflow iterator.**  The three
+`bpf_iter_mptcp_subflow_*` kfuncs (`bpf_mptcp_iter_kfunc_ids` in
+`net/mptcp/bpf.c`) become one possible `get_send` body statement
+kind, `StructOpsStmtSubflowIter`.  The BPF verifier enforces the
+open-coded-iterator lifecycle `new → next* → destroy` on **every
+path**, so the iterator is always rendered as the complete triple —
+one atomic compound statement, never partial:
+
+```
+struct bpf_iter_mptcp_subflow itN;
+struct mptcp_subflow_context *sfN;
+bpf_iter_mptcp_subflow_new(&itN, (struct sock *)msk);
+while ((sfN = bpf_iter_mptcp_subflow_next(&itN))) {
+        /* short generated body over sfN */
+}
+bpf_iter_mptcp_subflow_destroy(&itN);
+```
+
+The idiom is modelled on the kernel selftest
+`tools/testing/selftests/bpf/progs/mptcp_bpf_rr.c`, whose
+`bpf_for_each(mptcp_subflow, subflow, (struct sock *)msk)` macro
+expands to exactly this `new`/`next`/`destroy` shape — the `_new`
+socket argument is the verbatim `(struct sock *)msk` (the MPTCP
+`struct sock *`, a cast of the `msk` context).  The generator emits
+the **explicit** three-kfunc form rather than the `bpf_for_each`
+macro: BRF renders self-contained BPF C and the explicit form keeps
+the generated lifecycle visible and auditable.
+
+`bpf_iter_mptcp_subflow_next` is `KF_ITER_NEXT | KF_RET_NULL`, so
+the `while` condition **is** the mandatory NULL-check; inside the
+loop `sfN` is a valid `struct mptcp_subflow_context *` and feeds a
+short generated read/write/arith/kfunc-call body (the same
+`genStructOpsBody` machinery, re-seeded with `sfN` in the typed-value
+pool and the `avg_pacing_rate` write field re-based onto `sfN`).
+
+Key verifier-safety decision: the explicit idiom has **no**
+`__attribute__((cleanup))` (which is how the `bpf_for_each` macro
+auto-destroys the iterator).  A `return` from inside the `while`
+loop would therefore skip `bpf_iter_mptcp_subflow_destroy` and the
+verifier would reject the program for an unreleased iterator.  The
+iterator loop body is consequently generated with a new
+`bodyScope.noReturn` flag set, which excludes the only `return`-emitting
+statement — a `KF_RET_NULL`-pointer kfunc call (its guard is
+`if (!v) return -1;`).  Non-guarded scalar/void kfuncs are still
+offered inside the loop.
+
+**Piece 2 — non-empty init/release.**  `init` and `release` —
+previously rendered with empty `{}` — get a generated body each.
+They are `void BPF_PROG(..., struct mptcp_sock *msk)`: only `msk`
+is in scope, no scheduling.  Their `bodyScope` (`initReleaseScope`)
+seeds the pool with just `msk` / `msk->first`, restricts the
+writable surface to `msk->snd_burst` (the only `msk`-reachable
+writable field — `avg_pacing_rate` lives on a subflow, and there is
+no `subflow` here), forbids the iterator, and sets `noReturn`
+(these callbacks are `void`, so a `return -1;` would be invalid C).
+`mptcp_subflow_set_scheduled` is structurally unreachable from
+`init`/`release` — it needs a `struct mptcp_subflow_context *`,
+which never enters the pool.
+
+**Refactor.**  `genStructOpsBody` is parameterised by a `bodyScope`
+(seed pool, resolved writable fields, `allowIter` / `requireWrite` /
+`noReturn` flags, statement-count bounds) so the same generator
+serves four surfaces: the top-level `get_send` body, an iterator
+loop body, and the `init` / `release` bodies.  A shared `varId`
+counter keeps every local across the whole callback (including
+nested iterator loop bodies) uniquely named.  `StructOpsStmt` gains
+`FieldAccessor` / `FieldCType` (a self-contained ctx-field lvalue —
+context-correct even inside a loop where the subflow base local is
+`sfN`, not the fixed `subflow`) and the iterator fields (`IterId`,
+`IterSockExpr`, `IterBody`).  The renderer factors body rendering
+into `renderBody` (recurses into a `SubflowIter`'s loop body at
+`indent+"\t"`) and `renderSubflowIter`.  `usedKfuncIdxs` and the new
+`usesSubflowIter` walk every body — `get_send` / `init` / `release`,
+recursing into iterator loop bodies via `walkStmts` — so the emitted
+`extern … __ksym;` set is exactly the referenced kfuncs; the three
+iterator externs are emitted only when a body uses the iterator.
+
+Verification status: **host-verified by self-review 2026-05-22** —
+build/test/`go vet` could not be **run** in the implementing
+sandbox (`Bash`/git denied; same pre-existing `sys/test/gen`
+limitation as Stage 1).  Code self-reviewed for compile- and
+verifier-correctness.  `prog/brf_structops_test.go` is extended:
+`TestStructOpsSubflowIter` asserts the iterator is generated, is
+always the complete `new → next* → destroy` triple in the rendered
+C (call-site counts, well-formed `while`-condition, `_new`/`_destroy`
+bracketing, all three externs present) and never appears in
+`init`/`release`; `TestStructOpsInitReleaseBodies` asserts both
+bodies are non-empty in model and rendered C and never call
+`mptcp_subflow_set_scheduled`; `TestStructOpsGobRoundTrip` is
+extended to recurse into `IterBody` and cover `InitBody`/`ReleaseBody`;
+`TestStructOpsGenAndRender`'s write-lvalue check now also allows
+`sfN->avg_pacing_rate`.  The regenerated sample
+`executor/bpf_progs/generated_mptcp_sched_sample.bpf.c` exercises
+the iterator and the non-empty `init`/`release`; the clang-compile
+is the parent's follow-up.
+
 ## What it is
 
 MPTCP has a pluggable packet scheduler — `struct mptcp_sched_ops`
@@ -374,19 +481,24 @@ breakdown.  The original plan, for reference:
 contract-aware calls to the six common straight-line kfuncs; see
 "Stage C-full — Stage 1 — implemented" under Status above.
 
-**Still pending (Stage C-full Stage 2):**
-- The subflow iterator: the three `bpf_iter_mptcp_subflow_*`
-  iterator kfuncs / `bpf_for_each(mptcp_subflow, …)`.
-- Generated `if/else` beyond the mandatory `KF_RET_NULL` guards.
-- Generated non-empty `init`/`release` (e.g. `BPF_MAP_TYPE_SK_STORAGE`
-  per-msk state, as in `mptcp_bpf_rr.c`).
+**Stage C-full Stage 2a is implemented** — the subflow iterator and
+generated non-empty `init`/`release`; see "Stage C-full — Stage 2a
+— implemented" under Status above.
+
+**Still pending (Stage C-full Stage 2b):**
+- Generated free-form `if/else` beyond the mandatory `KF_RET_NULL`
+  guards and the iterator's `while` loop.
+- A richer `init`/`release` surface (e.g. `BPF_MAP_TYPE_SK_STORAGE`
+  per-msk state, as in `mptcp_bpf_rr.c`) — Stage 2a's `init`/`release`
+  bodies are reads/writes/arith/kfunc-calls over `msk` only.
 - Verifier-pass iteration on generated bodies — the genuine risk;
   unknown until a VM run.  The bodies are deliberately
   conservative (writes confined to the two
   `bpf_mptcp_sched_btf_struct_access` fields; every `KF_RET_NULL`
-  pointer immediately NULL-checked; only typed in-scope values
-  passed as kfunc arguments) to maximise the first-pass
-  verifier-accept rate.
+  pointer immediately NULL-checked; the iterator always the complete
+  `new → next* → destroy` triple with no `return` inside the loop;
+  only typed in-scope values passed as kfunc arguments) to maximise
+  the first-pass verifier-accept rate.
 
 ### Stage D — wire + fuzz — implemented (2026-05-22)
 

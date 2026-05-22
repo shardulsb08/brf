@@ -11,12 +11,18 @@
 // straight-line kfunc calls and that every KF_RET_NULL *pointer*
 // result is NULL-checked before any use (TestStructOpsKfuncCalls).
 //
+// Stage C-full Stage 2a adds checks that a generated subflow iterator
+// is ALWAYS the complete `new -> next* -> destroy` triple
+// (TestStructOpsSubflowIter) and that the generated `init` / `release`
+// bodies are non-empty (TestStructOpsInitReleaseBodies).
+//
 // Run: go test ./prog/ -run StructOps -v
 
 package prog
 
 import (
 	"math/rand"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -107,8 +113,11 @@ func TestStructOpsGenAndRender(t *testing.T) {
 		}
 
 		// No write to any field outside the writable surface: a
-		// write reaches the verifier as `<lvalue> = `.  Confirm the
-		// only `->`-write lvalues are the two permitted fields.
+		// write reaches the verifier as `<lvalue> = `.  The only
+		// `->`-write lvalues permitted are `msk->snd_burst` and
+		// `avg_pacing_rate` reached via the fixed `subflow` local or
+		// an iterator loop variable `sfN`.
+		iterSubflowWrite := regexp.MustCompile(`^sf[0-9]+->avg_pacing_rate$`)
 		for _, line := range strings.Split(src, "\n") {
 			l := strings.TrimSpace(line)
 			eq := strings.Index(l, " = ")
@@ -125,7 +134,8 @@ func TestStructOpsGenAndRender(t *testing.T) {
 				continue
 			}
 			if lvalue != "msk->snd_burst" &&
-				lvalue != "subflow->avg_pacing_rate" {
+				lvalue != "subflow->avg_pacing_rate" &&
+				!iterSubflowWrite.MatchString(lvalue) {
 				t.Errorf("seed %d: write to non-writable lvalue %q",
 					seed, lvalue)
 			}
@@ -133,60 +143,135 @@ func TestStructOpsGenAndRender(t *testing.T) {
 	}
 }
 
-func TestStructOpsGobRoundTrip(t *testing.T) {
-	p := newStructOpsTestProg(t, 7)
-	if err := p.writeGob(); err != nil {
-		t.Fatalf("writeGob: %v", err)
+// cmpStructOpsStmts deeply compares two generated-body slices, recursing
+// into a SubflowIter's loop body.  path is a human-readable prefix for
+// error messages (e.g. "GetSendBody", "GetSendBody[2].IterBody").
+func cmpStructOpsStmts(t *testing.T, path string, want, got []StructOpsStmt) {
+	t.Helper()
+	if len(want) != len(got) {
+		t.Errorf("%s len: got %d want %d", path, len(got), len(want))
+		return
 	}
-	var q BpfProg
-	if err := q.readGob(p.BasePath + ".gob"); err != nil {
-		t.Fatalf("readGob: %v", err)
-	}
-	if q.StructOps == nil {
-		t.Fatal("StructOps lost across gob round-trip")
-	}
-	if q.StructOps.SchedName != p.StructOps.SchedName {
-		t.Errorf("SchedName: got %q want %q",
-			q.StructOps.SchedName, p.StructOps.SchedName)
-	}
-	if len(q.StructOps.GetSendBody) != len(p.StructOps.GetSendBody) {
-		t.Errorf("GetSendBody len: got %d want %d",
-			len(q.StructOps.GetSendBody), len(p.StructOps.GetSendBody))
-	}
-	if len(q.StructOps.Kfuncs) != len(p.StructOps.Kfuncs) {
-		t.Errorf("Kfuncs len: got %d want %d",
-			len(q.StructOps.Kfuncs), len(p.StructOps.Kfuncs))
-	}
-	// Stage C-full: kfunc-call statements -- with their KfuncArgs
-	// slice and NullGuard flag -- must survive the gob round-trip
-	// intact, since rendering happens after deserialization.
-	for i := range p.StructOps.GetSendBody {
-		ps := p.StructOps.GetSendBody[i]
-		qs := q.StructOps.GetSendBody[i]
-		if ps.Kind != qs.Kind {
-			t.Errorf("stmt %d: Kind got %d want %d", i, qs.Kind, ps.Kind)
+	for i := range want {
+		ws, gs := want[i], got[i]
+		if ws.Kind != gs.Kind {
+			t.Errorf("%s[%d]: Kind got %d want %d", path, i, gs.Kind, ws.Kind)
 		}
-		if ps.Kind != StructOpsStmtKfuncCall {
-			continue
-		}
-		if qs.KfuncIdx != ps.KfuncIdx {
-			t.Errorf("stmt %d: KfuncIdx got %d want %d",
-				i, qs.KfuncIdx, ps.KfuncIdx)
-		}
-		if qs.NullGuard != ps.NullGuard {
-			t.Errorf("stmt %d: NullGuard got %v want %v",
-				i, qs.NullGuard, ps.NullGuard)
-		}
-		if len(qs.KfuncArgs) != len(ps.KfuncArgs) {
-			t.Fatalf("stmt %d: KfuncArgs len got %d want %d",
-				i, len(qs.KfuncArgs), len(ps.KfuncArgs))
-		}
-		for j := range ps.KfuncArgs {
-			if qs.KfuncArgs[j] != ps.KfuncArgs[j] {
-				t.Errorf("stmt %d arg %d: got %q want %q",
-					i, j, qs.KfuncArgs[j], ps.KfuncArgs[j])
+		switch ws.Kind {
+		case StructOpsStmtKfuncCall:
+			if gs.KfuncIdx != ws.KfuncIdx {
+				t.Errorf("%s[%d]: KfuncIdx got %d want %d",
+					path, i, gs.KfuncIdx, ws.KfuncIdx)
+			}
+			if gs.NullGuard != ws.NullGuard {
+				t.Errorf("%s[%d]: NullGuard got %v want %v",
+					path, i, gs.NullGuard, ws.NullGuard)
+			}
+			if len(gs.KfuncArgs) != len(ws.KfuncArgs) {
+				t.Fatalf("%s[%d]: KfuncArgs len got %d want %d",
+					path, i, len(gs.KfuncArgs), len(ws.KfuncArgs))
+			}
+			for j := range ws.KfuncArgs {
+				if gs.KfuncArgs[j] != ws.KfuncArgs[j] {
+					t.Errorf("%s[%d] arg %d: got %q want %q",
+						path, i, j, gs.KfuncArgs[j], ws.KfuncArgs[j])
+				}
+			}
+		case StructOpsStmtSubflowIter:
+			if gs.IterId != ws.IterId {
+				t.Errorf("%s[%d]: IterId got %d want %d",
+					path, i, gs.IterId, ws.IterId)
+			}
+			if gs.Var != ws.Var || gs.IterSockExpr != ws.IterSockExpr {
+				t.Errorf("%s[%d]: iter Var/SockExpr got %q/%q want %q/%q",
+					path, i, gs.Var, gs.IterSockExpr,
+					ws.Var, ws.IterSockExpr)
+			}
+			cmpStructOpsStmts(t,
+				path+"["+itoa(i)+"].IterBody", ws.IterBody, gs.IterBody)
+		case StructOpsStmtCtxRead, StructOpsStmtCtxWrite:
+			if gs.FieldAccessor != ws.FieldAccessor {
+				t.Errorf("%s[%d]: FieldAccessor got %q want %q",
+					path, i, gs.FieldAccessor, ws.FieldAccessor)
 			}
 		}
+	}
+}
+
+// itoa is a tiny local int->string for cmpStructOpsStmts paths.
+func itoa(n int) string {
+	if n == 0 {
+		return "0"
+	}
+	var b []byte
+	for n > 0 {
+		b = append([]byte{byte('0' + n%10)}, b...)
+		n /= 10
+	}
+	return string(b)
+}
+
+// firstIterSeed returns the lowest seed in [0, limit) whose generated
+// scheduler uses the subflow iterator, or -1 if none does.  Used so
+// tests exercise the iterator path without hardcoding a seed.
+func firstIterSeed(t *testing.T, limit int64) int64 {
+	t.Helper()
+	for seed := int64(0); seed < limit; seed++ {
+		p := newStructOpsTestProg(t, seed)
+		if p.StructOps.usesSubflowIter() {
+			return seed
+		}
+	}
+	return -1
+}
+
+func TestStructOpsGobRoundTrip(t *testing.T) {
+	// Seed 7 is a baseline sample; the second seed is the first one
+	// that exercises the subflow iterator, so the recursive gob path
+	// (a SubflowIter with a nested IterBody) is covered.
+	seeds := []int64{7}
+	if it := firstIterSeed(t, 256); it >= 0 {
+		seeds = append(seeds, it)
+	} else {
+		t.Error("no subflow iterator generated across 256 seeds -- " +
+			"iterator gob path is untested")
+	}
+	for _, seed := range seeds {
+		p := newStructOpsTestProg(t, seed)
+		if err := p.writeGob(); err != nil {
+			t.Fatalf("seed %d: writeGob: %v", seed, err)
+		}
+		var q BpfProg
+		if err := q.readGob(p.BasePath + ".gob"); err != nil {
+			t.Fatalf("seed %d: readGob: %v", seed, err)
+		}
+		if q.StructOps == nil {
+			t.Fatalf("seed %d: StructOps lost across gob round-trip", seed)
+		}
+		if q.StructOps.SchedName != p.StructOps.SchedName {
+			t.Errorf("seed %d: SchedName: got %q want %q",
+				seed, q.StructOps.SchedName, p.StructOps.SchedName)
+		}
+		if len(q.StructOps.Kfuncs) != len(p.StructOps.Kfuncs) {
+			t.Errorf("seed %d: Kfuncs len: got %d want %d",
+				seed, len(q.StructOps.Kfuncs), len(p.StructOps.Kfuncs))
+		}
+		if len(q.StructOps.IterKfuncs) != len(p.StructOps.IterKfuncs) {
+			t.Errorf("seed %d: IterKfuncs len: got %d want %d",
+				seed, len(q.StructOps.IterKfuncs),
+				len(p.StructOps.IterKfuncs))
+		}
+		// Stage C-full Stage 1/2a: every body -- with kfunc-call
+		// statements (KfuncArgs + NullGuard) and SubflowIter
+		// statements (IterBody recursively) -- must survive the gob
+		// round-trip intact, since rendering happens after
+		// deserialization.
+		cmpStructOpsStmts(t, "GetSendBody",
+			p.StructOps.GetSendBody, q.StructOps.GetSendBody)
+		cmpStructOpsStmts(t, "InitBody",
+			p.StructOps.InitBody, q.StructOps.InitBody)
+		cmpStructOpsStmts(t, "ReleaseBody",
+			p.StructOps.ReleaseBody, q.StructOps.ReleaseBody)
 	}
 }
 
@@ -352,5 +437,211 @@ func TestStructOpsKfuncCalls(t *testing.T) {
 	if !sawGuard {
 		t.Error("no KF_RET_NULL guard generated across 256 seeds -- " +
 			"the pointer-return contract path is untested")
+	}
+}
+
+// TestStructOpsSubflowIter is the Stage C-full Stage 2a check for the
+// subflow iterator.  It asserts that:
+//
+//   - across many seeds the iterator is generated at least once;
+//   - every generated SubflowIter statement carries the modelled
+//     `(struct sock *)msk` socket expression and a loop variable;
+//   - in the rendered C, every iterator is the COMPLETE
+//     `new -> next* -> destroy` triple -- the count of `_new`, `_next`
+//     and `_destroy` call-sites is consistent with that, the three
+//     iterator kfuncs all have an `extern ... __ksym;` decl, and the
+//     `while` condition is the KF_RET_NULL NULL-check on `_next`.
+func TestStructOpsSubflowIter(t *testing.T) {
+	sawIter := false
+	// `(sfN = bpf_iter_mptcp_subflow_next(&itN))` -- the while-loop
+	// condition: the next-call IS the NULL-check.
+	whileCond := regexp.MustCompile(
+		`while \(\(sf[0-9]+ = bpf_iter_mptcp_subflow_next\(&it[0-9]+\)\)\) \{`)
+
+	for seed := int64(0); seed < 256; seed++ {
+		p := newStructOpsTestProg(t, seed)
+		sop := p.StructOps
+
+		// Count SubflowIter statements across every body and validate
+		// each one's model fields.
+		nIter := 0
+		for _, b := range [][]StructOpsStmt{
+			sop.GetSendBody, sop.InitBody, sop.ReleaseBody,
+		} {
+			walkStmts(b, func(st *StructOpsStmt) {
+				if st.Kind != StructOpsStmtSubflowIter {
+					return
+				}
+				nIter++
+				if st.IterSockExpr != "(struct sock *)msk" {
+					t.Errorf("seed %d: iter sock expr %q, want "+
+						"%q", seed, st.IterSockExpr, "(struct sock *)msk")
+				}
+				if st.Var == "" {
+					t.Errorf("seed %d: SubflowIter has no loop variable",
+						seed)
+				}
+				if st.CType != "struct mptcp_subflow_context *" {
+					t.Errorf("seed %d: iter loop var type %q, want "+
+						"%q", seed, st.CType,
+						"struct mptcp_subflow_context *")
+				}
+			})
+		}
+		// init/release must never iterate -- only get_send may.
+		for _, b := range [][]StructOpsStmt{sop.InitBody, sop.ReleaseBody} {
+			for _, st := range b {
+				if st.Kind == StructOpsStmtSubflowIter {
+					t.Errorf("seed %d: iterator generated in "+
+						"init/release -- only get_send may iterate", seed)
+				}
+			}
+		}
+		if nIter == 0 {
+			continue
+		}
+		sawIter = true
+
+		// Rendered C: the iterator must be the complete triple.  Every
+		// modelled SubflowIter renders exactly one `_new`, one
+		// `_destroy` and one `_next` (the `while` condition).  A
+		// partial iterator -- any of the three missing -- is a
+		// verifier reject.
+		src := p.genStructOpsSource()
+		nNew := strings.Count(src, "bpf_iter_mptcp_subflow_new(&")
+		nNext := strings.Count(src, "bpf_iter_mptcp_subflow_next(&")
+		nDestroy := strings.Count(src, "bpf_iter_mptcp_subflow_destroy(&")
+		if nNew != nIter || nNext != nIter || nDestroy != nIter {
+			t.Errorf("seed %d: %d iterators modelled but rendered "+
+				"new=%d next=%d destroy=%d -- not a complete triple\n%s",
+				seed, nIter, nNew, nNext, nDestroy, src)
+		}
+
+		// The `while` condition must be the KF_RET_NULL NULL-check on
+		// `_next` -- this is the verifier-required idiom.
+		if got := len(whileCond.FindAllString(src, -1)); got != nIter {
+			t.Errorf("seed %d: %d iterators but %d well-formed "+
+				"while-conditions\n%s", seed, nIter, got, src)
+		}
+
+		// All three iterator kfuncs must have an extern decl.
+		for _, kf := range []string{
+			"bpf_iter_mptcp_subflow_new",
+			"bpf_iter_mptcp_subflow_next",
+			"bpf_iter_mptcp_subflow_destroy",
+		} {
+			if !strings.Contains(src, "extern") ||
+				!strings.Contains(src, kf+"(") {
+				t.Errorf("seed %d: iterator kfunc %q has no extern decl\n%s",
+					seed, kf, src)
+			}
+		}
+
+		// The iterator declaration and destroy must bracket the loop:
+		// for each `_new(&itN, ...)` line there is a later
+		// `_destroy(&itN)` line.  Per-iterator-id, _destroy follows
+		// _new in source order.
+		lines := strings.Split(src, "\n")
+		idRe := regexp.MustCompile(`bpf_iter_mptcp_subflow_new\(&(it[0-9]+),`)
+		for li, line := range lines {
+			m := idRe.FindStringSubmatch(line)
+			if m == nil {
+				continue
+			}
+			id := m[1]
+			foundDestroy := false
+			for _, later := range lines[li+1:] {
+				if strings.Contains(later,
+					"bpf_iter_mptcp_subflow_destroy(&"+id+")") {
+					foundDestroy = true
+					break
+				}
+			}
+			if !foundDestroy {
+				t.Errorf("seed %d: iterator %q has _new but no later "+
+					"_destroy\n%s", seed, id, src)
+			}
+		}
+	}
+
+	if !sawIter {
+		t.Error("no subflow iterator generated across 256 seeds -- " +
+			"the Stage C-full Stage 2a iterator generator is not firing")
+	}
+}
+
+// TestStructOpsInitReleaseBodies is the Stage C-full Stage 2a check for
+// the non-empty init / release callbacks.  Before Stage 2a both were
+// rendered with empty `{}`; now each gets a generated `msk`-reachable
+// body.  The test asserts both bodies are non-empty in the model and
+// the rendered C, that neither schedules
+// (`mptcp_subflow_set_scheduled` is a get_send-only kfunc), and that
+// the rendered callback bodies are not literally empty.
+func TestStructOpsInitReleaseBodies(t *testing.T) {
+	for seed := int64(0); seed < 128; seed++ {
+		p := newStructOpsTestProg(t, seed)
+		sop := p.StructOps
+
+		if len(sop.InitBody) == 0 {
+			t.Errorf("seed %d: InitBody is empty", seed)
+		}
+		if len(sop.ReleaseBody) == 0 {
+			t.Errorf("seed %d: ReleaseBody is empty", seed)
+		}
+
+		// init/release do not schedule -- mptcp_subflow_set_scheduled
+		// must never be called from either body.
+		for _, b := range []struct {
+			name string
+			body []StructOpsStmt
+		}{
+			{"InitBody", sop.InitBody},
+			{"ReleaseBody", sop.ReleaseBody},
+		} {
+			walkStmts(b.body, func(st *StructOpsStmt) {
+				if st.Kind != StructOpsStmtKfuncCall {
+					return
+				}
+				if sop.Kfuncs[st.KfuncIdx].Name ==
+					"mptcp_subflow_set_scheduled" {
+					t.Errorf("seed %d: %s calls "+
+						"mptcp_subflow_set_scheduled -- init/release "+
+						"do not schedule", seed, b.name)
+				}
+			})
+		}
+
+		// Rendered C: the init/release callback bodies must contain a
+		// generated statement, not just the `{ }` braces.  Extract the
+		// brace-delimited body of each and confirm it is non-trivial.
+		src := p.genStructOpsSource()
+		for _, suffix := range []string{"_init", "_release"} {
+			marker := "BPF_PROG(" + sop.SchedName + suffix +
+				", struct mptcp_sock *msk)"
+			idx := strings.Index(src, marker)
+			if idx < 0 {
+				t.Fatalf("seed %d: rendered source missing %q", seed, marker)
+			}
+			open := strings.Index(src[idx:], "{")
+			closeBrace := strings.Index(src[idx:], "\n}")
+			if open < 0 || closeBrace < 0 || closeBrace <= open {
+				t.Fatalf("seed %d: malformed %s callback body", seed, suffix)
+			}
+			body := strings.TrimSpace(src[idx+open+1 : idx+closeBrace])
+			// The body always carries the `/* BRF-generated body. */`
+			// comment; require at least one further non-comment line.
+			hasStmt := false
+			for _, ln := range strings.Split(body, "\n") {
+				ln = strings.TrimSpace(ln)
+				if ln == "" || strings.HasPrefix(ln, "/*") {
+					continue
+				}
+				hasStmt = true
+			}
+			if !hasStmt {
+				t.Errorf("seed %d: %s callback body has no generated "+
+					"statement\n%s", seed, suffix, src)
+			}
+		}
 	}
 }

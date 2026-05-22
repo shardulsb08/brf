@@ -29,7 +29,25 @@ package prog
 // local and immediately NULL-checked before any use; a scalar result is
 // bound to a local usable in later arithmetic; a void kfunc is emitted
 // for effect.  No generated branching beyond the mandatory KF_RET_NULL
-// guards; no subflow iterator -- those are Stage 2.
+// guards.
+//
+// Scope (Stage C-full, Stage 2a): two additions.  (1) The subflow
+// iterator -- the three `bpf_iter_mptcp_subflow_*` kfuncs
+// (`bpf_mptcp_iter_kfunc_ids` in net/mptcp/bpf.c) -- becomes one
+// possible `get_send` body statement kind.  It is ALWAYS rendered as the
+// complete, verifier-required `new -> next* -> destroy` triple (an
+// atomic compound statement, never partial): an open-coded iterator
+// declaration, a `while ((sfN = ..._next(&it)))` loop whose condition is
+// the KF_RET_NULL NULL-check, and the mandatory `..._destroy(&it)`.  The
+// loop body is a short generated read/write/arith/kfunc-call sequence
+// over the loop variable `sfN`.  (2) `init`/`release` -- previously
+// empty `{}` -- get a generated `msk`-reachable body (reads/writes/arith
+// and `msk`-satisfiable kfunc calls; never `mptcp_subflow_set_scheduled`
+// -- those callbacks do not schedule).
+//
+// Out of scope (Stage 2b): generated free-form `if/else`.  The only
+// control flow the generator introduces is the iterator's `while` loop
+// and the existing KF_RET_NULL NULL-guards.
 
 import (
 	"bytes"
@@ -78,17 +96,21 @@ func (kf *BpfKfunc) needsNullGuard() bool {
 }
 
 // mptcpSchedKfuncs are the kfuncs the get_send body may use.
-// net/mptcp/bpf.c registers nine MPTCP kfuncs in total via
-// `bpf_mptcp_common_kfunc_ids`.  Modelled here:
+// net/mptcp/bpf.c registers MPTCP kfuncs via `bpf_mptcp_common_kfunc_ids`
+// and `bpf_mptcp_iter_kfunc_ids`.  Modelled here:
 //
 //   - the two the FIXED prologue/epilogue needs
 //     (`bpf_mptcp_subflow_ctx`, `mptcp_subflow_set_scheduled`);
 //   - the six straight-line common kfuncs the Stage C-full Stage 1
 //     call generator draws on.
 //
+// The three `bpf_iter_mptcp_subflow_*` iterator kfuncs are modelled
+// separately (`mptcpSubflowIterKfuncs`) -- they are not callable
+// individually by the kfunc-call generator; the renderer emits the
+// verifier-required `new -> next* -> destroy` triple as one atomic unit.
+//
 // Deliberately EXCLUDED: `mptcp_pm_subflow_chk_stale` (KF_SLEEPABLE --
-// not callable from the non-sleepable `get_send`) and the three
-// `bpf_iter_mptcp_subflow_*` iterator kfuncs (Stage 2).
+// not callable from the non-sleepable `get_send`).
 //
 // Signatures are transcribed verbatim from net/mptcp/bpf.c (the
 // `__bpf_kfunc` definitions) and net/mptcp/protocol.h.
@@ -168,6 +190,51 @@ var mptcpSchedKfuncs = []BpfKfunc{
 	},
 }
 
+// mptcpSubflowIterKfuncs are the three open-coded-iterator kfuncs from
+// `bpf_mptcp_iter_kfunc_ids` in net/mptcp/bpf.c.  They are not callable
+// individually by the kfunc-call generator: the BPF verifier enforces
+// the lifecycle `new -> next* -> destroy` on EVERY path, so the renderer
+// only ever emits all three together as the atomic iterator idiom (see
+// renderSubflowIter).  Modelled here purely to carry the
+// `extern ... __ksym;` decls and the verbatim signatures.
+//
+//   - bpf_iter_mptcp_subflow_new(struct bpf_iter_mptcp_subflow *it,
+//                                struct sock *sk)         -> int, KF_ITER_NEW
+//   - bpf_iter_mptcp_subflow_next(struct bpf_iter_mptcp_subflow *it)
+//        -> struct mptcp_subflow_context *, KF_ITER_NEXT | KF_RET_NULL
+//   - bpf_iter_mptcp_subflow_destroy(struct bpf_iter_mptcp_subflow *it)
+//        -> void, KF_ITER_DESTROY
+//
+// `struct bpf_iter_mptcp_subflow` is the opaque public iterator type
+// (net/mptcp/bpf.c: `__u64 __opaque[2]`); it is BTF-exported and so
+// resolved from vmlinux.h -- no local definition is emitted.
+var mptcpSubflowIterKfuncs = []BpfKfunc{
+	{
+		Name: "bpf_iter_mptcp_subflow_new",
+		CDecl: "extern int\n" +
+			"bpf_iter_mptcp_subflow_new(struct bpf_iter_mptcp_subflow *it,\n" +
+			"\t\t\t   struct sock *sk) __ksym;",
+		RetType:  "int",
+		ArgTypes: []string{"struct bpf_iter_mptcp_subflow *", "struct sock *"},
+	},
+	{
+		Name: "bpf_iter_mptcp_subflow_next",
+		CDecl: "extern struct mptcp_subflow_context *\n" +
+			"bpf_iter_mptcp_subflow_next(struct bpf_iter_mptcp_subflow *it) __ksym;",
+		RetType:  "struct mptcp_subflow_context *",
+		ArgTypes: []string{"struct bpf_iter_mptcp_subflow *"},
+		IsPtrRet: true,
+		RetNull:  true, // KF_ITER_NEXT | KF_RET_NULL
+	},
+	{
+		Name: "bpf_iter_mptcp_subflow_destroy",
+		CDecl: "extern void\n" +
+			"bpf_iter_mptcp_subflow_destroy(struct bpf_iter_mptcp_subflow *it) __ksym;",
+		RetType:  "", // void
+		ArgTypes: []string{"struct bpf_iter_mptcp_subflow *"},
+	},
+}
+
 // StructOpsCtxField models one writable context field reachable from a
 // struct_ops scheduler callback.  Owner is the C struct type the field
 // lives on; Accessor is the C lvalue used to reach it from the callback
@@ -218,6 +285,15 @@ const (
 	// statement); a scalar return is bound to a local; a void kfunc
 	// is emitted for effect.
 	StructOpsStmtKfuncCall
+	// StructOpsStmtSubflowIter -- the open-coded subflow iterator.
+	// Rendered as ONE atomic compound statement: the iterator
+	// declaration, `bpf_iter_mptcp_subflow_new`, a
+	// `while ((sfN = bpf_iter_mptcp_subflow_next(&it)))` loop with a
+	// short generated body over `sfN`, and the mandatory
+	// `bpf_iter_mptcp_subflow_destroy`.  The verifier enforces the
+	// `new -> next* -> destroy` lifecycle on every path, so the three
+	// kfuncs are never emitted apart.
+	StructOpsStmtSubflowIter
 )
 
 // StructOpsStmt is one statement of the BRF-generated get_send body.
@@ -226,8 +302,17 @@ const (
 type StructOpsStmt struct {
 	Kind StructOpsStmtKind
 	// Field index into the program's WriteFields slice -- valid for
-	// CtxRead and CtxWrite.
+	// CtxRead and CtxWrite generated against the fixed get_send
+	// surface.  Retained for introspection; the renderer uses
+	// FieldAccessor / FieldCType (which are context-correct even
+	// inside an iterator loop body, where the subflow base local is
+	// `sfN`, not the fixed `subflow`).
 	FieldIdx int
+	// FieldAccessor is the fully-resolved C lvalue of a CtxRead /
+	// CtxWrite (e.g. "msk->snd_burst", "sf3->avg_pacing_rate").
+	FieldAccessor string
+	// FieldCType is the C type of FieldAccessor.
+	FieldCType string
 	// Var is the local declared by CtxRead / Arith / KfuncCall
 	// (e.g. "s0").  Empty for a void KfuncCall.
 	Var string
@@ -252,19 +337,40 @@ type StructOpsStmt struct {
 	// KF_RET_NULL and the renderer must emit the mandatory
 	// `if (!Var) return -1;` guard immediately after the call.
 	NullGuard bool
+	// IterId is a per-statement unique id for a SubflowIter -- it
+	// names the iterator local (`itN`) and the loop variable
+	// (`sfN`), keeping nested/repeated iterators non-colliding.
+	IterId int
+	// IterSockExpr is the `struct sock *` expression passed to
+	// `bpf_iter_mptcp_subflow_new` -- the MPTCP socket, `(struct
+	// sock *)msk`.  Valid for SubflowIter.
+	IterSockExpr string
+	// IterBody is the (possibly empty) short generated loop body of a
+	// SubflowIter, executed with the loop variable `sfN` in scope as
+	// a valid `struct mptcp_subflow_context *`.  Reuses the same
+	// StructOpsStmt kinds as the top-level body.
+	IterBody []StructOpsStmt
 }
 
 // StructOpsProg is the per-program model of a generated MPTCP struct_ops
 // scheduler.  It hangs off BpfProg.StructOps and is what
 // genStructOpsSource renders.  It is intentionally small: a scheduler
 // name, the writable-field table the body draws on, the kfunc model the
-// body's calls draw on, and the generated get_send body.  init/release
-// are empty (non-empty callbacks are Stage 2).
+// body's calls draw on, and the generated get_send / init / release
+// bodies.
+//
+// Stage C-full Stage 2a: InitBody / ReleaseBody carry the generated
+// (previously empty) `init` / `release` bodies.  IterKfuncs carries the
+// three subflow-iterator kfuncs' externs, emitted only when a generated
+// body actually uses the iterator.
 type StructOpsProg struct {
 	SchedName   string
 	WriteFields []StructOpsCtxField
 	Kfuncs      []BpfKfunc
+	IterKfuncs  []BpfKfunc
 	GetSendBody []StructOpsStmt
+	InitBody    []StructOpsStmt
+	ReleaseBody []StructOpsStmt
 }
 
 // isStructOps reports whether a BpfProg is a generated struct_ops
@@ -361,22 +467,63 @@ func pickKfuncArgs(r *randGen, kf *BpfKfunc, pool []typedVal) ([]string, bool) {
 	return args, true
 }
 
-// genStructOpsBody generates the BRF body of the get_send callback: a
-// short, randomly-ordered sequence of ctx reads, ctx writes (the write
-// primitive), arithmetic over the read locals, and -- Stage C-full,
-// Stage 1 -- straight-line contract-aware kfunc calls.  The fixed
-// kfunc prologue/epilogue is added by genStructOpsSource, not here --
-// this is purely the generated middle.
+// ctxWriteField is one writable ctx field available to a body, with the
+// accessor already resolved for the body's surface -- e.g. the top-level
+// get_send body sees `subflow->avg_pacing_rate`, but an iterator loop
+// body sees `sfN->avg_pacing_rate` (same field, different base local).
+type ctxWriteField struct {
+	accessor string // resolved C lvalue
+	ctype    string // C type
+}
+
+// bodyScope parameterises genStructOpsBody for the three surfaces it
+// renders: the top-level get_send body, an iterator loop body, and the
+// init/release bodies.  It carries the seed typed-value pool, the
+// writable fields resolved for this surface, and whether the subflow
+// iterator is an allowed statement kind here.
+type bodyScope struct {
+	// pool is the set of typed values in scope at body entry.
+	pool []typedVal
+	// writeFields are the ctx fields writable/readable from this body.
+	writeFields []ctxWriteField
+	// allowIter permits StructOpsStmtSubflowIter as a statement kind.
+	// True only for the top-level get_send body -- iterator loop
+	// bodies do not nest an iterator, and init/release do not iterate.
+	allowIter bool
+	// requireWrite biases the last statement toward a ctx write so the
+	// headline write primitive is reliably exercised.  True for
+	// get_send; false for the (short) iterator loop body and for
+	// init/release, where a guaranteed write is not wanted.
+	requireWrite bool
+	// noReturn forbids any statement that emits a `return` -- i.e. a
+	// KF_RET_NULL-pointer kfunc call (whose mandatory guard is
+	// `if (!v) return -1;`).  Set TRUE for an iterator loop body: this
+	// explicit iterator idiom has no `__attribute__((cleanup))`, so a
+	// `return` from inside the `while` loop would skip
+	// `bpf_iter_mptcp_subflow_destroy` and the verifier would reject
+	// the program for an unreleased iterator.  A KF_RET_NULL-pointer
+	// kfunc is simply not offered inside the loop; a non-guarded
+	// scalar/void kfunc still is.
+	noReturn bool
+	// minStmt / maxStmt bound the generated statement count.
+	minStmt, maxStmt int
+}
+
+// genStructOpsBody generates a BRF struct_ops body: a short,
+// randomly-ordered sequence of ctx reads, ctx writes (the write
+// primitive), arithmetic over the read locals, Stage-1 straight-line
+// contract-aware kfunc calls, and -- when sc.allowIter -- the Stage-2a
+// subflow iterator.  Fixed prologue/epilogue text is added by the
+// renderer, not here -- this is purely the generated middle.
 //
-// The generator threads a pool of TYPED values.  It seeds the pool
-// with the three values the fixed prologue establishes -- `msk`
-// (`struct mptcp_sock *`), `msk->first` (`struct sock *`) and
-// `subflow` (`struct mptcp_subflow_context *`) -- and grows it with
-// every typed local it produces.  A kfunc call is generated only when
-// every one of its argument types is satisfiable from the pool; a
+// The generator threads a pool of TYPED values seeded from sc.pool and
+// grown with every typed local it produces.  A kfunc call is generated
+// only when every argument type is satisfiable from the pool; a
 // KF_RET_NULL pointer result is bound to a local and IMMEDIATELY
-// guarded, and only then enters the pool.
-func genStructOpsBody(r *randGen, sop *StructOpsProg, varId *int) []StructOpsStmt {
+// guarded, and only then enters the pool.  varId is a shared counter so
+// every local across the whole callback (including nested iterator loop
+// bodies) is uniquely named.
+func genStructOpsBody(r *randGen, sop *StructOpsProg, sc bodyScope, varId *int) []StructOpsStmt {
 	var body []StructOpsStmt
 	// readVars tracks (local name, C type) of scalar locals available
 	// as arithmetic operands.
@@ -386,25 +533,28 @@ func genStructOpsBody(r *randGen, sop *StructOpsProg, varId *int) []StructOpsStm
 	}
 	var readVars []readVar
 
-	// pool is the set of typed values in scope -- seeded with the
-	// fixed prologue locals.  Types are stored normalized.
-	pool := []typedVal{
-		{expr: "msk", ctype: "struct mptcp_sock *"},
-		{expr: "msk->first", ctype: "struct sock *"},
-		{expr: "subflow", ctype: "struct mptcp_subflow_context *"},
-	}
+	// pool is the set of typed values in scope -- seeded from the
+	// scope and grown locally.  Copied so the caller's slice is not
+	// aliased.
+	pool := append([]typedVal(nil), sc.pool...)
 
 	// callableKfuncs returns the indices of kfuncs whose every
 	// argument type is satisfiable from the current pool.  The two
 	// fixed-skeleton kfuncs (bpf_mptcp_subflow_ctx,
 	// mptcp_subflow_set_scheduled) are excluded from generation -- the
 	// renderer emits those itself as the fixed prologue/epilogue.
+	// When sc.noReturn is set, a KF_RET_NULL-pointer kfunc is excluded
+	// too: its mandatory guard emits a `return`, which is unsafe
+	// inside an iterator loop body (see bodyScope.noReturn).
 	callableKfuncs := func() []int {
 		var idxs []int
 		for ki := range sop.Kfuncs {
 			kf := &sop.Kfuncs[ki]
 			if kf.Name == "bpf_mptcp_subflow_ctx" ||
 				kf.Name == "mptcp_subflow_set_scheduled" {
+				continue
+			}
+			if sc.noReturn && kf.needsNullGuard() {
 				continue
 			}
 			if _, ok := pickKfuncArgs(r, kf, pool); ok {
@@ -414,13 +564,41 @@ func genStructOpsBody(r *randGen, sop *StructOpsProg, varId *int) []StructOpsStm
 		return idxs
 	}
 
-	nStmt := 3 + r.Intn(6) // 3..8 statements
+	// emitCtxRead appends a ctx read of writeFields[fi], registering
+	// the new local in readVars and the pool.  Factored out because
+	// it is also the fallback when a chosen kind is not satisfiable.
+	emitCtxRead := func(fi int) {
+		f := sc.writeFields[fi]
+		v := fmt.Sprintf("s%d", *varId)
+		*varId++
+		body = append(body, StructOpsStmt{
+			Kind:          StructOpsStmtCtxRead,
+			FieldIdx:      fi,
+			FieldAccessor: f.accessor,
+			FieldCType:    f.ctype,
+			Var:           v,
+			CType:         f.ctype,
+		})
+		readVars = append(readVars, readVar{v, f.ctype})
+		pool = append(pool, typedVal{expr: v, ctype: normalizeCType(f.ctype)})
+	}
+
+	span := sc.maxStmt - sc.minStmt + 1
+	if span < 1 {
+		span = 1
+	}
+	nStmt := sc.minStmt + r.Intn(span)
 	for i := 0; i < nStmt; i++ {
-		// Bias toward a write at least once so the headline
-		// primitive is reliably exercised; otherwise pick freely
-		// among the four statement kinds.
-		kind := StructOpsStmtKind(r.Intn(4))
-		if i == nStmt-1 {
+		// Pick freely among the statement kinds; the iterator is only
+		// in the draw when sc.allowIter.
+		nKinds := 4
+		if sc.allowIter {
+			nKinds = 5
+		}
+		kind := StructOpsStmtKind(r.Intn(nKinds))
+		if sc.requireWrite && i == nStmt-1 {
+			// Bias the last statement toward a write so the headline
+			// primitive is reliably exercised.
 			haveWrite := false
 			for _, st := range body {
 				if st.Kind == StructOpsStmtCtxWrite {
@@ -443,24 +621,16 @@ func genStructOpsBody(r *randGen, sop *StructOpsProg, varId *int) []StructOpsStm
 
 		switch kind {
 		case StructOpsStmtCtxRead:
-			fi := r.Intn(len(sop.WriteFields))
-			v := fmt.Sprintf("s%d", *varId)
-			*varId++
-			ct := sop.WriteFields[fi].CType
-			body = append(body, StructOpsStmt{
-				Kind:     StructOpsStmtCtxRead,
-				FieldIdx: fi,
-				Var:      v,
-				CType:    ct,
-			})
-			readVars = append(readVars, readVar{v, ct})
-			pool = append(pool, typedVal{expr: v, ctype: normalizeCType(ct)})
+			emitCtxRead(r.Intn(len(sc.writeFields)))
 		case StructOpsStmtCtxWrite:
-			fi := r.Intn(len(sop.WriteFields))
+			fi := r.Intn(len(sc.writeFields))
+			f := sc.writeFields[fi]
 			body = append(body, StructOpsStmt{
-				Kind:     StructOpsStmtCtxWrite,
-				FieldIdx: fi,
-				Val:      genStructOpsCtxValue(r, sop.WriteFields[fi].CType),
+				Kind:          StructOpsStmtCtxWrite,
+				FieldIdx:      fi,
+				FieldAccessor: f.accessor,
+				FieldCType:    f.ctype,
+				Val:           genStructOpsCtxValue(r, f.ctype),
 			})
 		case StructOpsStmtArith:
 			src := readVars[r.Intn(len(readVars))]
@@ -487,16 +657,7 @@ func genStructOpsBody(r *randGen, sop *StructOpsProg, varId *int) []StructOpsStm
 				// Defensive -- pool only grows, so this cannot
 				// happen; fall back to a read rather than emit a
 				// malformed call.
-				fi := r.Intn(len(sop.WriteFields))
-				v := fmt.Sprintf("s%d", *varId)
-				*varId++
-				ct := sop.WriteFields[fi].CType
-				body = append(body, StructOpsStmt{
-					Kind: StructOpsStmtCtxRead, FieldIdx: fi,
-					Var: v, CType: ct,
-				})
-				readVars = append(readVars, readVar{v, ct})
-				pool = append(pool, typedVal{expr: v, ctype: normalizeCType(ct)})
+				emitCtxRead(r.Intn(len(sc.writeFields)))
 				continue
 			}
 			st := StructOpsStmt{
@@ -535,9 +696,118 @@ func genStructOpsBody(r *randGen, sop *StructOpsProg, varId *int) []StructOpsStm
 				})
 			}
 			body = append(body, st)
+		case StructOpsStmtSubflowIter:
+			body = append(body, genSubflowIter(r, sop, varId))
 		}
 	}
 	return body
+}
+
+// genSubflowIter builds one StructOpsStmtSubflowIter: the open-coded
+// subflow iterator.  The verifier requires the `new -> next* -> destroy`
+// lifecycle on every path, so this statement is ALWAYS rendered as the
+// complete triple (see renderSubflowIter) -- it is never partial.
+//
+// The loop variable `sfN` is a valid `struct mptcp_subflow_context *`
+// inside the loop (the `while` condition is the KF_RET_NULL NULL-check),
+// so the loop body is generated with `sfN` seeded into a fresh pool and
+// the avg_pacing_rate write field re-based onto `sfN`.  The loop body
+// does NOT nest another iterator (allowIter false) and is kept short.
+func genSubflowIter(r *randGen, sop *StructOpsProg, varId *int) StructOpsStmt {
+	id := *varId
+	*varId++
+	sfVar := fmt.Sprintf("sf%d", id)
+
+	// The loop body sees `sfN` (the per-iteration subflow) plus the
+	// callback's `msk` and `msk->first`.  Writes are confined to the
+	// subflow field re-based onto `sfN`; reading/writing msk->snd_burst
+	// is also valid inside the loop.
+	loopScope := bodyScope{
+		pool: []typedVal{
+			{expr: "msk", ctype: "struct mptcp_sock *"},
+			{expr: "msk->first", ctype: "struct sock *"},
+			{expr: sfVar, ctype: "struct mptcp_subflow_context *"},
+		},
+		writeFields: []ctxWriteField{
+			{accessor: "msk->snd_burst", ctype: "int"},
+			{accessor: sfVar + "->avg_pacing_rate", ctype: "unsigned long"},
+		},
+		allowIter:    false,
+		requireWrite: false,
+		noReturn:     true, // no `return` inside the loop -- see noReturn
+		minStmt:      0,
+		maxStmt:      3,
+	}
+	loopBody := genStructOpsBody(r, sop, loopScope, varId)
+
+	return StructOpsStmt{
+		Kind:         StructOpsStmtSubflowIter,
+		IterId:       id,
+		Var:          sfVar,
+		CType:        "struct mptcp_subflow_context *",
+		IterSockExpr: "(struct sock *)msk",
+		IterBody:     loopBody,
+	}
+}
+
+// getSendScope is the bodyScope for the top-level get_send body: the
+// three fixed-prologue values are in scope, both writable fields are
+// available against their fixed accessors, the iterator is allowed, and
+// a write is required.
+func getSendScope() bodyScope {
+	return bodyScope{
+		pool: []typedVal{
+			{expr: "msk", ctype: "struct mptcp_sock *"},
+			{expr: "msk->first", ctype: "struct sock *"},
+			{expr: "subflow", ctype: "struct mptcp_subflow_context *"},
+		},
+		writeFields:  schedWriteFieldsResolved(),
+		allowIter:    true,
+		requireWrite: true,
+		minStmt:      3,
+		maxStmt:      8,
+	}
+}
+
+// initReleaseScope is the bodyScope for the init / release bodies.  Only
+// `msk` (and the derived `msk->first`) is in scope -- there is no
+// scheduling and no `subflow` prologue -- so the writable surface is
+// just `msk->snd_burst`, the iterator is not allowed, and no write is
+// forced.  `mptcp_subflow_set_scheduled` is never reachable here because
+// it needs a `struct mptcp_subflow_context *`, which is not in the pool.
+//
+// noReturn is set: `init`/`release` are `void BPF_PROG(...)`, so a
+// generated `if (!v) return -1;` (the KF_RET_NULL-pointer guard) would
+// be `return` of a value from a void function -- invalid C.  A
+// KF_RET_NULL-pointer kfunc is therefore not offered here; the
+// straight-line scalar/void kfuncs still are.
+func initReleaseScope() bodyScope {
+	return bodyScope{
+		pool: []typedVal{
+			{expr: "msk", ctype: "struct mptcp_sock *"},
+			{expr: "msk->first", ctype: "struct sock *"},
+		},
+		writeFields: []ctxWriteField{
+			{accessor: "msk->snd_burst", ctype: "int"},
+		},
+		allowIter:    false,
+		requireWrite: false,
+		noReturn:     true,
+		minStmt:      2,
+		maxStmt:      4,
+	}
+}
+
+// schedWriteFieldsResolved returns mptcpSchedWriteFields as the
+// renderer-facing ctxWriteField list (accessor + ctype), for the
+// top-level get_send body where the subflow base local is the fixed
+// `subflow`.
+func schedWriteFieldsResolved() []ctxWriteField {
+	out := make([]ctxWriteField, len(mptcpSchedWriteFields))
+	for i, f := range mptcpSchedWriteFields {
+		out[i] = ctxWriteField{accessor: f.Accessor, ctype: f.CType}
+	}
+	return out
 }
 
 // genStructOpsProg builds a fully-generated MPTCP struct_ops scheduler
@@ -546,6 +816,7 @@ func genStructOpsProg(r *randGen) *StructOpsProg {
 	sop := &StructOpsProg{
 		WriteFields: mptcpSchedWriteFields,
 		Kfuncs:      mptcpSchedKfuncs,
+		IterKfuncs:  mptcpSubflowIterKfuncs,
 	}
 	// A short, unique-enough scheduler name within MPTCP_SCHED_NAME_MAX.
 	name := fmt.Sprintf("brf_%x", r.Intn(1<<24))
@@ -555,17 +826,50 @@ func genStructOpsProg(r *randGen) *StructOpsProg {
 	sop.SchedName = name
 
 	varId := 0
-	sop.GetSendBody = genStructOpsBody(r, sop, &varId)
+	sop.GetSendBody = genStructOpsBody(r, sop, getSendScope(), &varId)
+	sop.InitBody = genStructOpsBody(r, sop, initReleaseScope(), &varId)
+	sop.ReleaseBody = genStructOpsBody(r, sop, initReleaseScope(), &varId)
 	return sop
+}
+
+// walkStmts invokes fn on every statement in body, recursing into the
+// loop body of every SubflowIter so callers see the whole statement
+// tree.
+func walkStmts(body []StructOpsStmt, fn func(*StructOpsStmt)) {
+	for i := range body {
+		st := &body[i]
+		fn(st)
+		if st.Kind == StructOpsStmtSubflowIter {
+			walkStmts(st.IterBody, fn)
+		}
+	}
+}
+
+// usesSubflowIter reports whether any generated body uses the subflow
+// iterator -- the renderer emits the three `bpf_iter_mptcp_subflow_*`
+// externs only when at least one does.
+func (sop *StructOpsProg) usesSubflowIter() bool {
+	found := false
+	for _, b := range [][]StructOpsStmt{
+		sop.GetSendBody, sop.InitBody, sop.ReleaseBody,
+	} {
+		walkStmts(b, func(st *StructOpsStmt) {
+			if st.Kind == StructOpsStmtSubflowIter {
+				found = true
+			}
+		})
+	}
+	return found
 }
 
 // usedKfuncIdxs returns the indices of every kfunc the rendered
 // translation unit actually references -- the two the fixed
 // prologue/epilogue needs plus every kfunc a generated KfuncCall
-// statement targets -- so genStructOpsSource emits an `extern … __ksym;`
-// decl for exactly those and no more.  An unused extern is harmless,
-// but emitting only the used set keeps each rendered scheduler honest
-// about its kfunc surface.
+// statement targets in ANY body (get_send / init / release, including
+// inside iterator loop bodies) -- so genStructOpsSource emits an
+// `extern … __ksym;` decl for exactly those and no more.  An unused
+// extern is harmless, but emitting only the used set keeps each rendered
+// scheduler honest about its kfunc surface.
 func (sop *StructOpsProg) usedKfuncIdxs() []int {
 	used := make(map[int]bool)
 	for ki, kf := range sop.Kfuncs {
@@ -574,10 +878,14 @@ func (sop *StructOpsProg) usedKfuncIdxs() []int {
 			used[ki] = true // fixed prologue / epilogue
 		}
 	}
-	for _, st := range sop.GetSendBody {
-		if st.Kind == StructOpsStmtKfuncCall {
-			used[st.KfuncIdx] = true
-		}
+	for _, b := range [][]StructOpsStmt{
+		sop.GetSendBody, sop.InitBody, sop.ReleaseBody,
+	} {
+		walkStmts(b, func(st *StructOpsStmt) {
+			if st.Kind == StructOpsStmtKfuncCall {
+				used[st.KfuncIdx] = true
+			}
+		})
 	}
 	// Return indices in Kfuncs order for a stable render.
 	var idxs []int
@@ -587,6 +895,74 @@ func (sop *StructOpsProg) usedKfuncIdxs() []int {
 		}
 	}
 	return idxs
+}
+
+// renderBody renders a generated body to BPF C.  indent is the leading
+// whitespace prefixed to every statement (one tab at callback scope,
+// two inside an iterator loop).  The body may itself contain a
+// SubflowIter, whose loop body is rendered recursively at indent+"\t".
+func (sop *StructOpsProg) renderBody(s *bytes.Buffer, body []StructOpsStmt, indent string) {
+	for _, st := range body {
+		switch st.Kind {
+		case StructOpsStmtCtxRead:
+			fmt.Fprintf(s, "%s%s %s = %s;\n",
+				indent, st.FieldCType, st.Var, st.FieldAccessor)
+		case StructOpsStmtCtxWrite:
+			fmt.Fprintf(s, "%s%s = %d;\n", indent, st.FieldAccessor, st.Val)
+		case StructOpsStmtArith:
+			fmt.Fprintf(s, "%s%s %s = %s %s %d;\n",
+				indent, st.CType, st.Var, st.SrcVar, st.Op, st.Val)
+		case StructOpsStmtKfuncCall:
+			kf := &sop.Kfuncs[st.KfuncIdx]
+			argList := ""
+			for ai, a := range st.KfuncArgs {
+				if ai > 0 {
+					argList += ", "
+				}
+				argList += a
+			}
+			if st.Var == "" {
+				// void kfunc -- call for effect.
+				fmt.Fprintf(s, "%s%s(%s);\n", indent, kf.Name, argList)
+			} else {
+				// kfunc with a result -- bind to a typed local.
+				fmt.Fprintf(s, "%s%s %s = %s(%s);\n",
+					indent, st.CType, st.Var, kf.Name, argList)
+			}
+			if st.NullGuard {
+				// Mandatory KF_RET_NULL pointer guard -- emitted
+				// IMMEDIATELY after the call so the local is only
+				// ever used after the verifier sees it null-checked.
+				fmt.Fprintf(s, "%sif (!%s)\n", indent, st.Var)
+				fmt.Fprintf(s, "%s\treturn -1;\n", indent)
+			}
+		case StructOpsStmtSubflowIter:
+			sop.renderSubflowIter(s, st, indent)
+		}
+	}
+}
+
+// renderSubflowIter renders one SubflowIter as the complete,
+// verifier-required `new -> next* -> destroy` triple -- ALWAYS all three
+// together, never partial.  The `while` condition is the KF_RET_NULL
+// NULL-check on `bpf_iter_mptcp_subflow_next`; inside the loop `sfN` is a
+// valid `struct mptcp_subflow_context *`.  Modelled on the kernel
+// selftest `tools/testing/selftests/bpf/progs/mptcp_bpf_rr.c`, whose
+// `bpf_for_each(mptcp_subflow, subflow, (struct sock *)msk)` expands to
+// exactly this idiom; the socket argument is `(struct sock *)msk`.
+func (sop *StructOpsProg) renderSubflowIter(s *bytes.Buffer, st StructOpsStmt, indent string) {
+	itVar := fmt.Sprintf("it%d", st.IterId)
+	sfVar := st.Var
+	fmt.Fprintf(s, "%s/* BRF-generated subflow iterator. */\n", indent)
+	fmt.Fprintf(s, "%sstruct bpf_iter_mptcp_subflow %s;\n", indent, itVar)
+	fmt.Fprintf(s, "%sstruct mptcp_subflow_context *%s;\n", indent, sfVar)
+	fmt.Fprintf(s, "%sbpf_iter_mptcp_subflow_new(&%s, %s);\n",
+		indent, itVar, st.IterSockExpr)
+	fmt.Fprintf(s, "%swhile ((%s = bpf_iter_mptcp_subflow_next(&%s))) {\n",
+		indent, sfVar, itVar)
+	sop.renderBody(s, st.IterBody, indent+"\t")
+	fmt.Fprintf(s, "%s}\n", indent)
+	fmt.Fprintf(s, "%sbpf_iter_mptcp_subflow_destroy(&%s);\n", indent, itVar)
 }
 
 // genStructOpsSource renders a struct_ops BpfProg to a complete BPF C
@@ -615,15 +991,39 @@ func (p *BpfProg) genStructOpsSource() string {
 	for _, ki := range sop.usedKfuncIdxs() {
 		fmt.Fprintf(s, "%s\n", sop.Kfuncs[ki].CDecl)
 	}
+	// Subflow-iterator kfuncs -- emitted only when a generated body
+	// uses the iterator.  The verifier requires the full
+	// new -> next* -> destroy triple, so either all three externs are
+	// needed or none are.
+	if sop.usesSubflowIter() {
+		fmt.Fprintf(s, "/* MPTCP subflow-iterator kfuncs (net/mptcp/bpf.c). */\n")
+		for i := range sop.IterKfuncs {
+			fmt.Fprintf(s, "%s\n", sop.IterKfuncs[i].CDecl)
+		}
+	}
 	fmt.Fprintf(s, "\n")
 
-	// init / release -- empty (non-empty init/release is Stage 2).
-	fmt.Fprintf(s, "SEC(\"struct_ops\")\n")
-	fmt.Fprintf(s, "void BPF_PROG(%s_init, struct mptcp_sock *msk)\n{\n}\n\n",
-		sop.SchedName)
-	fmt.Fprintf(s, "SEC(\"struct_ops\")\n")
-	fmt.Fprintf(s, "void BPF_PROG(%s_release, struct mptcp_sock *msk)\n{\n}\n\n",
-		sop.SchedName)
+	// init / release -- generated `msk`-reachable bodies (Stage C-full
+	// Stage 2a; previously empty `{}`).  Only `msk` is in scope; these
+	// callbacks do not schedule, so the renderer emits no fixed
+	// skeleton -- just the generated body.
+	for _, cb := range []struct {
+		suffix string
+		body   []StructOpsStmt
+	}{
+		{"_init", sop.InitBody},
+		{"_release", sop.ReleaseBody},
+	} {
+		fmt.Fprintf(s, "SEC(\"struct_ops\")\n")
+		fmt.Fprintf(s, "void BPF_PROG(%s%s, struct mptcp_sock *msk)\n{\n",
+			sop.SchedName, cb.suffix)
+		fmt.Fprintf(s, "\t/* BRF-generated body. */\n")
+		if len(cb.body) == 0 {
+			fmt.Fprintf(s, "\t/* (empty) */\n")
+		}
+		sop.renderBody(s, cb.body, "\t")
+		fmt.Fprintf(s, "}\n\n")
+	}
 
 	// get_send -- fixed kfunc prologue, generated body, fixed kfunc
 	// epilogue.
@@ -641,43 +1041,7 @@ func (p *BpfProg) genStructOpsSource() string {
 	if len(sop.GetSendBody) == 0 {
 		fmt.Fprintf(s, "\t/* (empty) */\n")
 	}
-	for _, st := range sop.GetSendBody {
-		switch st.Kind {
-		case StructOpsStmtCtxRead:
-			f := sop.WriteFields[st.FieldIdx]
-			fmt.Fprintf(s, "\t%s %s = %s;\n", st.CType, st.Var, f.Accessor)
-		case StructOpsStmtCtxWrite:
-			f := sop.WriteFields[st.FieldIdx]
-			fmt.Fprintf(s, "\t%s = %d;\n", f.Accessor, st.Val)
-		case StructOpsStmtArith:
-			fmt.Fprintf(s, "\t%s %s = %s %s %d;\n",
-				st.CType, st.Var, st.SrcVar, st.Op, st.Val)
-		case StructOpsStmtKfuncCall:
-			kf := &sop.Kfuncs[st.KfuncIdx]
-			argList := ""
-			for ai, a := range st.KfuncArgs {
-				if ai > 0 {
-					argList += ", "
-				}
-				argList += a
-			}
-			if st.Var == "" {
-				// void kfunc -- call for effect.
-				fmt.Fprintf(s, "\t%s(%s);\n", kf.Name, argList)
-			} else {
-				// kfunc with a result -- bind to a typed local.
-				fmt.Fprintf(s, "\t%s %s = %s(%s);\n",
-					st.CType, st.Var, kf.Name, argList)
-			}
-			if st.NullGuard {
-				// Mandatory KF_RET_NULL pointer guard -- emitted
-				// IMMEDIATELY after the call so the local is only
-				// ever used after the verifier sees it null-checked.
-				fmt.Fprintf(s, "\tif (!%s)\n", st.Var)
-				fmt.Fprintf(s, "\t\treturn -1;\n")
-			}
-		}
-	}
+	sop.renderBody(s, sop.GetSendBody, "\t")
 	fmt.Fprintf(s, "\n")
 
 	// Fixed epilogue.
