@@ -826,13 +826,13 @@ func generateStruct(p *BpfProg, r *randGen, sizeConstraints []int, hints map[Arg
 	if useHint {
 		target = "val"
 	}
-	fmt.Printf("(%v) gen %v struct_%d initial min=%v max=%v align=%v ArgHints=%x occu=%d\n",
+	fmt.Printf("(%v) gen %v struct_%d initial min=%v max=%v align=%v ArgHints=%v occu=%d\n",
 		rd, target, len(p.Structs), min, max, align, hints, occupiedSize(hints))
 
 	if useHint {
 		occupied := occupiedSize(hints)
 		if occupied > max {
-			fmt.Printf("error: map type value size not large enough to accommodate %x\n", hints)
+			fmt.Printf("error: map type value size not large enough to accommodate %v\n", hints)
 			return nil, false
 		}
 		if occupied > min {
@@ -1982,7 +1982,7 @@ func (p *BpfProg) genBpfHelperCallArg(r *randGen, call *BpfCall, arg int) bool {
 	if !ok {
 		return false
 	}
-	fmt.Printf("(%v) gen arg v%v\n", r, ok, p.VarId)
+	fmt.Printf("(%v) gen arg v%v\n", r, p.VarId)
 
 	if argType == "ARG_CONST_SIZE" || argType == "ARG_CONST_SIZE_OR_ZERO" {
 		a.Umax = int64(call.StackVarSize) //XXX check if this handle multiple mem size pairs
