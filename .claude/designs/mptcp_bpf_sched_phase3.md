@@ -746,9 +746,8 @@ Three pieces, all gated **struct_ops only** (`brf_find_struct_ops_map`)
 detects a struct_ops object via `brf_find_struct_ops_map`; that
 result is now also kept in a local `is_struct_ops` flag.  Around
 the existing `bpf_object__load(obj)` call — *the* verifier step —
-`brf_verif_record()` appends one line per struct_ops load to
-`/mnt/brf_work_dir/brf_verifier_stats.log` (fallback
-`/tmp/brf_verifier_stats.log` when the work dir is absent).  The
+`brf_verif_record()` appends one line per struct_ops load to a
+per-VM-boot stats file (see **VI4** for the egress / path).  The
 file is opened `O_WRONLY|O_CREAT|O_APPEND|O_CLOEXEC` and each
 record is emitted as a SINGLE bounded `write()` (≤ 511 bytes, far
 under `PIPE_BUF` = 4 KiB) so concurrent writes from many executor
@@ -782,9 +781,10 @@ a single self-contained install with no change to the open path.
 
 **VI3 — host-side tally script**
 (`executor/bpf_progs/brf_verifier_tally.sh`).  Reads one or more
-stats files (defaults to the guest path + fallback; accepts
-multiple per-VM files as arguments) and prints total struct_ops
-loads, accept / reject counts, accept rate %, and a
+stats files (defaults glob the host 9p-share directory — see
+**VI4** — plus the in-VM mountpoint and the `/tmp` fallback;
+accepts multiple per-VM files as arguments) and prints total
+struct_ops loads, accept / reject counts, accept rate %, and a
 rejection-reason histogram.  Reason categorization lives **here**,
 host-side — `categorize_reason()` buckets the raw verifier-log
 lines by pattern (unreleased reference, invalid memory access,
@@ -792,20 +792,54 @@ pointer bounds, bad return value, unchecked NULL, program too
 large, unknown kfunc, BTF/type mismatch, disallowed context write,
 …), tunable without an executor rebuild.
 
+**VI4 — host egress via a 9p share (2026-05-22).**  The fuzzing
+guests run QEMU `-snapshot` (ephemeral disk) with no host-shared
+mount, so the original `/mnt/brf_work_dir/brf_verifier_stats.log`
+target was **guest-local** — invisible to the host and lost on
+every VM restart.  Fixed by routing the stats file to a 9p host
+share:
+
+- The syz-manager config (`mptcp_v01_first_kmemleak_debug.cfg`,
+  *not* in the BRF repo) appends a `-virtfs
+  local,...,mount_tag=brfstats,security_model=none` entry to
+  `vm.qemu_args`, exporting the host directory
+  `…/syz_manager/workdir_v01/brf_verifier_stats/`.
+- The executor mounts that share once, lazily and idempotently,
+  at `/mnt/brf_verif_stats` (`brf_verif_mount_share` —
+  `mkdir` + `mount(...,"9p",...,"trans=virtio,version=9p2000.L")`,
+  modelled on `prog/brf.go`'s mount of the `brf` share).  A
+  missing share or an already-mounted dir fails silently.
+- `brf_verif_record` writes to
+  `/mnt/brf_verif_stats/stats.<boot-id>.log`, where `<boot-id>`
+  is this VM-boot's UUID read once from
+  `/proc/sys/kernel/random/boot_id` and cached in a file-scope
+  static.  One file per VM-boot ⇒ no cross-VM 9p append
+  contention; `-snapshot` restarts produce a fresh boot-id ⇒ a
+  fresh file, all durable on the host.  If the share is absent
+  or `boot_id` is unreadable, the path degrades to the
+  `/tmp/brf_verifier_stats.log` fallback — a failed mount never
+  breaks the load path.
+
+VI1's atomicity and no-disturb properties are unchanged; only the
+egress (mount + path) moved.
+
 **Scope boundary.**  Surfacing is deliberately the append-only
 file, not a syz-manager stat line — wiring the rate into
 syz-manager's stats plumbing is noted as future polish.
 
 **Verification status:** **host-reviewed 2026-05-22** — the
 executor C cannot be host-built (the executor build is VM-only),
-so the C change (~110 lines incl. comments in `common_brf_linux.h`)
-was self-reviewed for C++-safety (explicit casts, file-scope
-statics, callback signature matching `libbpf_print_fn_t` exactly),
-bounded buffers, and the no-disturb-on-failure property.  Human
-follow-up: rebuild BRF, run the fuzzer, then run
-`brf_verifier_tally.sh` against the accumulated
-`brf_verifier_stats.log` to read the accept rate and
-rejection-reason histogram.
+so the C change in `common_brf_linux.h` (the VI1/VI2 instrumentation
+plus the VI4 9p-egress mount + per-VM-boot path resolution) was
+self-reviewed for C++-safety (explicit casts, file-scope statics,
+callback signature matching `libbpf_print_fn_t` exactly), bounded
+buffers (`BRF_VERIF_PATH_MAX`), and the no-disturb-on-failure
+property (every mount/open/read failure degrades to the `/tmp`
+fallback or is swallowed).  Human follow-up: rebuild BRF **and**
+restart syz-manager so both the executor change and the config
+change take effect, run the fuzzer, then run `brf_verifier_tally.sh`
+against the accumulated `workdir_v01/brf_verifier_stats/stats.*.log`
+files to read the accept rate and rejection-reason histogram.
 
 ## Estimate
 

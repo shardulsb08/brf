@@ -1,4 +1,11 @@
 
+/* For the verifier-accept instrumentation's 9p egress (VI3): mount()
+ * for the brfstats share, mkdir() for its mountpoint.  Both headers
+ * are guarded, so re-including them here is harmless and keeps this
+ * file self-contained regardless of the conditional includes above. */
+#include <sys/mount.h>
+#include <sys/stat.h>
+
 #define OBJ_LIST_SIZE 32
 
 /* Weak stub for bpf_object__add_kcov_handle.  The real implementation
@@ -225,15 +232,34 @@ static int brf_struct_ops_uniquify_name(struct bpf_map *map, char *out)
  * On a struct_ops load failure that buffer holds the verifier's
  * rejection text; its first line is folded into the REJECT record.
  * The callback is installed once, lazily, and is harmless for
- * non-struct_ops loads (the buffer is simply ignored). */
+ * non-struct_ops loads (the buffer is simply ignored).
+ *
+ * VI4 -- host egress: the fuzzing guests run QEMU -snapshot (ephemeral
+ * disk), so a guest-local stats file is lost on every VM restart and
+ * is invisible to the host.  Instead the stats file lives on a 9p
+ * host share (mount_tag "brfstats", added to qemu_args by the
+ * syz-manager config) mounted at BRF_VERIF_STATS_DIR.  The mount is
+ * idempotent and best-effort -- modelled on prog/brf.go's mount of
+ * the "brf" share for /mnt/brf_work_dir.  The stats file name carries
+ * the per-VM-boot UUID (/proc/sys/kernel/random/boot_id), so each
+ * VM-boot writes its own file: no cross-VM 9p append contention, and
+ * -snapshot restarts simply produce a fresh boot-id => a fresh file,
+ * all durable on the host.  If the share is missing or the mount
+ * fails, recording degrades to a /tmp fallback -- instrumentation
+ * never disturbs fuzzing. */
 
-#define BRF_VERIF_STATS_PATH    "/mnt/brf_work_dir/brf_verifier_stats.log"
+#define BRF_VERIF_STATS_DIR     "/mnt/brf_verif_stats"
+#define BRF_VERIF_STATS_TAG     "brfstats"
 #define BRF_VERIF_STATS_FALLBACK "/tmp/brf_verifier_stats.log"
+#define BRF_VERIF_BOOT_ID_PATH  "/proc/sys/kernel/random/boot_id"
 /* Bound for one record and for the captured verifier-log text.  A
  * record is timestamp + pid + verdict + reason; 512 bytes is far
  * under PIPE_BUF (4096) so the write() is atomic. */
 #define BRF_VERIF_RECORD_MAX    512
 #define BRF_VERIF_LOG_MAX       320
+/* Bound for the per-VM-boot stats path: BRF_VERIF_STATS_DIR +
+ * "/stats." + boot-id (a 36-char UUID) + ".log".  256 is ample. */
+#define BRF_VERIF_PATH_MAX      256
 
 /* Most recent libbpf WARN message -- the verifier rejection text on a
  * failed struct_ops load.  Single-threaded per executor proc, so a
@@ -272,6 +298,86 @@ static void brf_verif_sanitize(const char *src, char *out, size_t n)
 	out[i] = '\0';
 }
 
+/* VI4 -- resolved per-VM-boot stats path, computed once on first use.
+ * Empty until brf_verif_resolve_path() runs; on any failure it stays
+ * the /tmp fallback so recording always has a usable target. */
+static char brf_verif_stats_path[BRF_VERIF_PATH_MAX];
+
+/* VI4: mount the brfstats 9p host share at BRF_VERIF_STATS_DIR.  Run
+ * once, idempotent and best-effort -- modelled on prog/brf.go's mount
+ * of the "brf" share (mount -t 9p -o trans=virtio,version=9p2000.L).
+ * An already-mounted dir or a missing share just fails the mount()
+ * silently; the caller then falls back to /tmp.  Never disturbs
+ * fuzzing -- no errno is propagated. */
+static void brf_verif_mount_share(void)
+{
+	/* mkdir the mountpoint; EEXIST (already there) is fine. */
+	if (mkdir(BRF_VERIF_STATS_DIR, 0755) != 0 && errno != EEXIST)
+		return;
+	/* Best-effort mount.  If the share is absent, or the dir is
+	 * already mounted, this fails harmlessly and we degrade to the
+	 * /tmp fallback in brf_verif_resolve_path(). */
+	(void)mount(BRF_VERIF_STATS_TAG, BRF_VERIF_STATS_DIR, "9p", 0,
+		    "trans=virtio,version=9p2000.L");
+}
+
+/* VI4: compute brf_verif_stats_path once.  Mount the share, read this
+ * VM-boot's UUID from /proc/sys/kernel/random/boot_id, and form
+ * BRF_VERIF_STATS_DIR/stats.<boot-id>.log.  On any failure (no share,
+ * unreadable boot_id) fall back to BRF_VERIF_STATS_FALLBACK so the
+ * load path always has a durable-or-local target.  Idempotent: the
+ * non-empty brf_verif_stats_path short-circuits later calls. */
+static void brf_verif_resolve_path(void)
+{
+	char boot_id[64];
+	int fd, n, i;
+	ssize_t r;
+
+	if (brf_verif_stats_path[0])
+		return;
+
+	/* Default to the local fallback; only upgrade on full success. */
+	snprintf(brf_verif_stats_path, sizeof(brf_verif_stats_path), "%s",
+		 BRF_VERIF_STATS_FALLBACK);
+
+	brf_verif_mount_share();
+
+	fd = open(BRF_VERIF_BOOT_ID_PATH, O_RDONLY | O_CLOEXEC);
+	if (fd < 0)
+		return;
+	r = read(fd, boot_id, sizeof(boot_id) - 1);
+	close(fd);
+	if (r <= 0)
+		return;
+	boot_id[r] = '\0';
+	/* boot_id is a UUID followed by '\n'; trim trailing whitespace
+	 * and reject any non-UUID char so the path stays well-formed. */
+	for (n = 0; n < (int)r; n++) {
+		char c = boot_id[n];
+
+		if (c == '\n' || c == '\r' || c == ' ' || c == '\0')
+			break;
+	}
+	boot_id[n] = '\0';
+	if (n == 0)
+		return;
+	for (i = 0; i < n; i++) {
+		char c = boot_id[i];
+
+		if (!((c >= '0' && c <= '9') ||
+		      (c >= 'a' && c <= 'f') ||
+		      (c >= 'A' && c <= 'F') || c == '-'))
+			return;
+	}
+	/* Upgrade to the per-VM-boot host path only if it fits. */
+	if (snprintf(brf_verif_stats_path, sizeof(brf_verif_stats_path),
+		     "%s/stats.%s.log", BRF_VERIF_STATS_DIR, boot_id) >=
+	    (int)sizeof(brf_verif_stats_path))
+		snprintf(brf_verif_stats_path,
+			 sizeof(brf_verif_stats_path), "%s",
+			 BRF_VERIF_STATS_FALLBACK);
+}
+
 /* Append one struct_ops verifier-outcome record to the stats file.
  * Pure observation -- all failures are swallowed.  reason may be NULL
  * (used for ACCEPT records). */
@@ -282,9 +388,14 @@ static void brf_verif_record(int accepted, const char *reason)
 	int fd, len;
 	ssize_t w;
 
-	fd = open(BRF_VERIF_STATS_PATH,
+	/* Resolve the per-VM-boot host path on first use; thereafter
+	 * brf_verif_stats_path is a cached, non-empty target. */
+	brf_verif_resolve_path();
+
+	fd = open(brf_verif_stats_path,
 		  O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
-	if (fd < 0)
+	if (fd < 0 &&
+	    strcmp(brf_verif_stats_path, BRF_VERIF_STATS_FALLBACK) != 0)
 		fd = open(BRF_VERIF_STATS_FALLBACK,
 			  O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
 	if (fd < 0)

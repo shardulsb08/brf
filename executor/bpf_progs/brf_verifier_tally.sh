@@ -24,19 +24,30 @@
 # Usage:
 #   brf_verifier_tally.sh [stats-file ...]
 #
-# With no arguments it tries the default guest path and the fallback:
-#   /mnt/brf_work_dir/brf_verifier_stats.log
-#   /tmp/brf_verifier_stats.log
+# With no arguments it tries the default paths.  The executor's VI3
+# 9p-egress writes one file per VM-boot to a host-shared directory
+# (mount_tag "brfstats"), so the primary default is a glob over that
+# host directory; the guest in-VM mountpoint and the /tmp fallback
+# are also tried:
+#   <syz workdir>/workdir_v01/brf_verifier_stats/stats.*.log  (host)
+#   /mnt/brf_verif_stats/stats.*.log                          (in-VM)
+#   /tmp/brf_verifier_stats.log                               (fallback)
 # Multiple per-VM stats files may be passed at once; they are tallied
-# together.
+# together.  Default-path globs that match nothing are skipped.
 #
 # Companion: .claude/designs/mptcp_bpf_sched_phase3.md
 #            executor/common_brf_linux.h (the producer side)
 
 set -u
 
+# Default search paths.  Entries may contain shell globs; a glob that
+# matches nothing expands to nothing and is skipped.  The host-side
+# 9p-share path is resolved relative to this script's checkout so the
+# common syz-manager layout (.../syz_manager/workdir_v01/...) is found
+# without an explicit argument.
 DEFAULT_PATHS=(
-	"/mnt/brf_work_dir/brf_verifier_stats.log"
+	"/mnt/work_4gb/Dev/mpiric_kernel_dev_env/shared/mpiric/027_netdev_0x1a_proposal/work/brf_protocol_fuzz_setup/syz_manager/workdir_v01/brf_verifier_stats/stats.*.log"
+	"/mnt/brf_verif_stats/stats.*.log"
 	"/tmp/brf_verifier_stats.log"
 )
 
@@ -46,7 +57,11 @@ if [ "$#" -gt 0 ]; then
 	files=("$@")
 else
 	for p in "${DEFAULT_PATHS[@]}"; do
-		[ -f "$p" ] && files+=("$p")
+		# Expand globs; a non-matching glob yields the literal
+		# pattern, which the -f test below rejects.
+		for m in $p; do
+			[ -f "$m" ] && files+=("$m")
+		done
 	done
 fi
 
