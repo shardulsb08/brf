@@ -3,7 +3,7 @@
 Design doc for **Phase 3** of the MPTCP harness coverage-gap
 backlog (audit gap 1).  As of 2026-05-22: Stage 0/A/B are done and
 verified; Stage C-minimal and Stage D are implemented, committed
-and host-verified, with VM verification in progress; Stage C-full
+and host-verified, and VM-verified by the fuzz run; Stage C-full
 is not done.  See the per-stage Status section below.
 
 Auto-loads (per repo `CLAUDE.md`) when work touches the BRF program
@@ -40,25 +40,26 @@ VM-confirmed) / **IMPLEMENTED, VM-VERIFICATION IN PROGRESS**
 - **Stage B** — fixed-scheduler floor — **DONE, VERIFIED-WORKING**
   (2026-05-22; the smoke test passes — see
   `executor/bpf_progs/README.md`).
-- **Stage C-minimal** — generator core — **IMPLEMENTED; VM
-  VERIFICATION IN PROGRESS** (2026-05-22; see "Stage C-minimal —
-  implemented" below).  BRF's program generator now generates and
-  renders a fuzzed `mptcp_sched_ops` struct_ops scheduler.
-  Host-verified (go build/test/vet clean; a rendered sample
-  clang-compiles to a valid struct_ops `.o`).  Live behaviour
-  (kernel verifier accept, registration, execution) is **not yet
-  VM-confirmed** — a fuzz run is accumulating; verdict pending.
+- **Stage C-minimal** — generator core — **DONE, VERIFIED-WORKING**
+  (2026-05-22; see "Stage C-minimal — implemented" below).  BRF's
+  program generator generates and renders a fuzzed
+  `mptcp_sched_ops` struct_ops scheduler.  Host-verified (go
+  build/test/vet clean; a rendered sample clang-compiles to a valid
+  struct_ops `.o`) and **VM-confirmed**: the fuzz run
+  `run_20260522_100632` accumulated coverage across the
+  `bpf_mptcp_*` surface (see "VM run" below).
 - **Stage D** — wire generated schedulers into live fuzzing —
-  **IMPLEMENTED; VM VERIFICATION IN PROGRESS** (2026-05-22; see
-  "Stage D — implemented" below).  The executor loads + registers +
-  selects a generated scheduler and drives MPTCP traffic over it.
+  **DONE, VERIFIED-WORKING** (2026-05-22; see "Stage D —
+  implemented" below).  The executor loads + registers + selects a
+  generated scheduler and drives MPTCP traffic over it.
   Host-verified (go build clean; executor C reviewed; a -Werror
-  build issue found + fixed).  **Not yet VM-confirmed.**
+  build issue found + fixed) and **VM-confirmed** by the same run.
 - **Stage C-full** — **NOT DONE** (arbitrary kfunc-call generation,
   non-empty `init`/`release`).
 
-The genuine open risk is the verifier-accept rate on generated
-`get_send` bodies — unknown until the VM run reports back.
+The Phase 3 pipeline is end-to-end confirmed.  The one open item
+is the verifier-accept *rate* on generated `get_send` bodies — not
+yet quantified from coverage alone.
 
 ### VM run — first observations (2026-05-22)
 
@@ -75,14 +76,20 @@ First fuzz run on the Stage C/D build (`run_20260522_073845`):
   `^bpf_mptcp_.*` has been added to
   `mptcp_v01_first_kmemleak_debug.cfg`.  Any future Phase 3 run
   config must keep `^bpf_mptcp_.*` in the filter.
-- **struct_ops generation not yet confirmed.**  BRF's program
-  generation runs guest-side, so the syz-manager log shows no
-  per-program generation activity.  The fuzz run is accumulating
-  with the widened filter; confirmation (do generated struct_ops
-  schedulers load + pass the kernel verifier + run) will come from
-  `bpf_mptcp_*` coverage appearing, or a guest-side check of
-  `/mnt/brf_work_dir` for generated `prog_*.{c,o}` plus the
-  syz-fuzzer compile log.  **Verdict pending.**
+- **struct_ops generation CONFIRMED.**  With the widened filter,
+  the run `run_20260522_100632` accumulated coverage across the
+  whole `bpf_mptcp_*` surface — `bpf_mptcp_sched_reg` (a generated
+  scheduler registered, i.e. passed the kernel verifier),
+  `bpf_mptcp_sched_btf_struct_access` (the verifier checked a
+  generated scheduler's writes), `bpf_mptcp_subflow_ctx` and
+  `bpf_mptcp_sched_get_send` (a scheduler's `get_send` ran).  The
+  Phase 3 chain — generate → compile → load → verify → register →
+  run — is confirmed live (~2.5 h, 2026-05-22).  The
+  verifier-accept *rate* is not quantified from coverage alone.
+- **One non-kernel crash.**  The run logged one `panic: disabled
+  syscall` — a syz-fuzzer Go panic (`checkDisabledCalls`), not a
+  kernel bug and not a Phase 3 finding; a BRF fuzzer-robustness
+  nit (once in 2.5 h).
 
 ### Stage C-minimal — implemented (2026-05-22)
 
@@ -335,26 +342,26 @@ a live corpus program is most likely to still reference by path)
 survive longest.  Best-effort: any error logs and stops; generation
 never fails.  The generator is not frozen.
 
-**Verification status:** **host-verified 2026-05-22**.  Go side is
-build-clean (`go build ./prog/... && go build ./syz-manager`) and
-`go test ./prog/ -run StructOps` passes; the executor C
-(`common_brf_linux.h`) was reviewed and a `-Werror=stringop-truncation`
-build issue found + fixed (commit `22834b91a`).  Live verification —
-generated scheduler loads, registers under the unique name, is
-selected, and `get_send` runs under `drive_traffic` — is **VM
-verification in progress**: a fuzz run is accumulating, verdict
-pending.
+**Verification status:** **host-verified and VM-verified
+2026-05-22**.  Go side is build-clean (`go build ./prog/... &&
+go build ./syz-manager`) and `go test ./prog/ -run StructOps`
+passes; the executor C (`common_brf_linux.h`) was reviewed and a
+`-Werror=stringop-truncation` build issue found + fixed (commit
+`22834b91a`).  Live verification: the fuzz run
+`run_20260522_100632` accumulated coverage across the
+`bpf_mptcp_*` surface — generated schedulers load, the kernel
+verifier processes them, they register and `get_send` runs.  The
+verifier-accept *rate* is not yet quantified.
 
 ## Estimate
 
-**~3-5 weeks of focused work.**  As of 2026-05-22: Stage B is done
-and verified; Stage C-minimal and Stage D are implemented,
-committed, and host-verified, with VM verification in progress;
-Stage C-full is not done.  The submission (2026-06-01) presents
-Phase 3 as the flagship-in-progress; the **2026-07-13 talk** is the
-landing target.  Overrun risk now lives in Stage C-full and in
-whatever the VM-verification run surfaces about generated-body
-verifier-accept rate.
+**~3-5 weeks of focused work.**  As of 2026-05-22: Stages B,
+C-minimal and D are done and VM-verified — the Phase 3 pipeline
+runs end-to-end; Stage C-full is not done.  The submission
+(2026-06-01) can present Phase 3 as a working flagship; the
+**2026-07-13 talk** is the landing target.  Remaining overrun risk
+lives in Stage C-full and in the generated-body verifier-accept
+rate.
 
 ## Risks / open items
 

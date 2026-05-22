@@ -110,8 +110,9 @@ Expect the `PASS` block shown above.
   BRF's generator replaces the `get_send` body.
 - Stage C-minimal and Stage D (executor-driven loading, with BRF
   compiling generated struct_ops schedulers into
-  `/mnt/brf_work_dir`) are **implemented, committed and
-  host-verified** as of 2026-05-22, with VM verification in
-  progress -- see `../../.claude/designs/mptcp_bpf_sched_phase3.md`
-  for current status.  This directory's smoke test remains the
+  `/mnt/brf_work_dir`) are **done and VM-verified** as of
+  2026-05-22 -- the fuzz run confirmed generated struct_ops
+  schedulers load, pass the kernel verifier, register and run.
+  See `../../.claude/designs/mptcp_bpf_sched_phase3.md` for
+  per-stage status.  This directory's smoke test remains the
   Stage B fixed-scheduler floor and the Stage C scaffold.
