@@ -1,7 +1,7 @@
 # MPTCP runtime coverage for the MP_JOIN harness
 
 **Status:** patches 0001-0003 added 2026-05-15; patches 0004-0005
-added 2026-05-21; patch 0006 added 2026-05-22.  Patches were authored as real commits on the kernel
+added 2026-05-21; patches 0006-0007 added 2026-05-22.  Patches were authored as real commits on the kernel
 tree's `mptcp_brf_fuzz_base` branch, then exported with `git
 format-patch` -- they should apply cleanly against the same base
 (`mptcp/export`).  If the upstream base has moved, `git am --3way`
@@ -27,7 +27,7 @@ text below are informal iteration markers, not directory names.
 
 ## What this series adds
 
-Six patches:
+Seven patches:
 
 1. **`MPTCP_KCOV_HANDLE` setsockopt + per-msk scratch area +
    kcov_owner ownership marker**, CONFIG_KCOV-gated.  User sets a
@@ -95,6 +95,28 @@ Six patches:
    softirq's RCU grace period elapses before the free, and
    snapshots the area pointer once in the macro.  Added 2026-05-22.
 
+7. **kcov-field initialisation in `__mptcp_init_sock()`.**  A fuzz
+   run hit `WARNING: kernel/kcov.c:971` 24x via
+   `mptcp_incoming_options` -- the handle-validity `WARN_ON` in
+   `kcov_remote_start_prealloc` (`!kcov_check_handle()`).  The
+   register dump showed a garbage handle (`d3bfc2c05b95c3c2`):
+   uninitialised slab memory.  The kcov fields patch 1 added to
+   `struct mptcp_sock` are written only by
+   `setsockopt(MPTCP_KCOV_HANDLE)` and were never initialised at
+   socket creation.  `mptcp_prot` uses `SLAB_TYPESAFE_BY_RCU`, so
+   `sk_prot_alloc()` strips `__GFP_ZERO` and a recycled
+   `mptcp_sock` keeps stale bytes; an msk that never sets a handle
+   (a plain fuzzer socket, or a listener the harness leaves unset)
+   exposes garbage to `BRF_MPTCP_KCOV_START`.  patch 6 cleared
+   only the clone-inherited fields; this is the same family --
+   the remaining new-socket hole.  patch 7 zeroes the four fields
+   in `__mptcp_init_sock()`, the single init path for every msk
+   (it also subsumes patch 6's clone-path clearing, reduced here
+   to a comment).  This is the handle-validity WARN at
+   `kcov.c:971`, distinct from the `in_task()`/kcov-enabled WARN
+   at `kcov.c:983` that patch 5's `in_serving_softirq()` guard
+   addresses.  Added 2026-05-22.
+
 ## Prerequisites
 
 Apply **before** this series:
@@ -128,6 +150,7 @@ git am < $BRF/kernel_patches/mptcp_kcov/0003-mptcp-add-MPTCP_DEBUG_KEYS-getsocko
 git am < $BRF/kernel_patches/mptcp_kcov/0004-mptcp-extend-kcov-instrumentation-to-the-option-pars.patch
 git am < $BRF/kernel_patches/mptcp_kcov/0005-mptcp-restrict-BRF-kcov-instrumentation-to-softirq-c.patch
 git am < $BRF/kernel_patches/mptcp_kcov/0006-mptcp-fix-use-after-free-of-the-BRF-kcov-scratch-are.patch
+git am < $BRF/kernel_patches/mptcp_kcov/0007-mptcp-initialize-BRF-kcov-fields-in-__mptcp_init_soc.patch
 ```
 
 If a patch fails to apply (e.g. after the upstream base moves),
