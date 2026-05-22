@@ -8,10 +8,10 @@ implemented through **Stage 2b** -- Stage 1 (straight-line,
 contract-aware kfunc-call generation), Stage 2a (subflow iterator +
 non-empty init/release) and Stage 2b (generated free-form
 `if/else`) -- and **host-verified** (build / test / clang).
-Stage C-full is **not yet VM-confirmed**: BRF was rebuilt with
-Stage 1/2a/2b and the fuzzer restarted on it 2026-05-22
-(`run_20260522_151649`, in progress); the verdict and the
-verifier-accept rate are pending that run.  See the per-stage
+Stage C-full is **VM-confirmed** (2026-05-22): the fuzz run
+`run_20260522_151649` cleared the C-minimal/D ~20,690 cover
+ceiling and reached ~24,000 (~+16%), with the C-full kfuncs and
+the subflow iterator covered.  See the per-stage
 Status section below.
 
 Auto-loads (per repo `CLAUDE.md`) when work touches the BRF program
@@ -81,13 +81,14 @@ VM-confirmed) / **IMPLEMENTED, VM-VERIFICATION IN PROGRESS**
 With Stage 2b done, **Stage C-full is implemented through Stage 2b
 and host-verified** (`go build` / `go vet` clean, `go test ./prog/
 -run StructOps` passes, the regenerated sample clang-compiles).
-Phase 3 is **not** marked verified: the C-full features (Stage
-1/2a/2b) are not yet VM-confirmed.  BRF was rebuilt with C-full
-and the fuzzer restarted on it 2026-05-22 (`run_20260522_151649`,
-in progress) — see "C-full rebuild + run" below; the verdict (do
-the C-full kfunc calls / iterator / `if/else` reach new
-`bpf_mptcp_*` / `mptcp_sched_*` coverage) and the verifier-accept
-*rate* are pending that run.
+Stage C-full is **VM-confirmed** (2026-05-22): the fuzz run
+`run_20260522_151649` cleared the C-minimal/D ~20,690 cover
+ceiling — see "C-full rebuild + run" below.  Phase 3's whole
+implementation is now coverage-verified end to end.  Two honest
+caveats remain: the verifier-accept *rate* on generated bodies is
+not quantified from coverage alone, and a `kcov_remote_start_prealloc`
+WARNING in the BRF coverage instrumentation (not an MPTCP/BPF bug)
+is being fixed separately.
 
 ### VM run — first observations (2026-05-22)
 
@@ -127,13 +128,28 @@ new region took total cover to ~20,700.  That is the C-minimal/D
 harness's ceiling, not a C-full result.
 
 BRF was then rebuilt with Stage C-full (Stages 1/2a/2b) and the
-fuzzer restarted 2026-05-22 ~15:17 — run `run_20260522_151649`,
-**in progress**.  The C-full verdict — does it reach new kernel
-coverage beyond the ~20,700 ceiling, and do the C-full-specific
-functions (`bpf_iter_mptcp_subflow_*`, `bpf_mptcp_subflow_tcp_sock`,
-`bpf_mptcp_subflow_queues_empty`, `mptcp_subflow_active`,
-`mptcp_set_timeout`, `mptcp_wnd_end`) go cold → covered — needs
-the run to accumulate (hours).  Verdict pending.
+fuzzer restarted 2026-05-22 ~15:17 — run `run_20260522_151649`.
+
+**Verdict (2026-05-22, ~6.5 h in): C-full broke the plateau.**
+The run re-attained the ~20,690 ceiling and held it ~1 h
+(17:17–18:17), then at 18:37 jumped to 23,096 and kept climbing —
+**cover ~23,983, ~+16% over the C-minimal/D ceiling.**  The cover
+page confirms the C-full surface is live: the iterator kfuncs
+`bpf_iter_mptcp_subflow_{new,next,destroy}`,
+`bpf_mptcp_subflow_tcp_sock`, `bpf_mptcp_subflow_queues_empty`,
+`mptcp_subflow_active`, `mptcp_set_timeout`, `mptcp_wnd_end` are
+all covered.  Nuance: the filtered `net/mptcp` surface is ~flat
+(43%) — the gain is mostly in the BPF struct_ops/verifier path
+and the TCP/core code the kfuncs reach, i.e. deeper BPF/kfunc
+coverage rather than more MPTCP-protocol coverage.
+
+Crashes over the run (6): **none are findings** — a
+`kcov_remote_start_prealloc` WARNING (×24) in the BRF coverage
+instrumentation, reached via `mptcp_incoming_options`
+(self-inflicted, not an MPTCP/BPF bug — being fixed separately);
+the known `panic: disabled syscall` syz-fuzzer nit (×2); and a
+syzkaller-suppressed empty report (×4).  No genuine kernel bug
+surfaced.
 
 ### Stage C-minimal — implemented (2026-05-22)
 
