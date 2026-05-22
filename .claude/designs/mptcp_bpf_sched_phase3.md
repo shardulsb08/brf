@@ -32,7 +32,62 @@ rename — citation discipline applies.
 - **Stage A** — generator scoping + design — **DONE** (this doc).
 - **Stage B** — fixed-scheduler floor — **DONE** (2026-05-22; the
   smoke test passes — see `executor/bpf_progs/README.md`).
-- **Stage C/D** — pending.
+- **Stage C-minimal** — generator core — **IMPLEMENTED** (2026-05-22;
+  see "Stage C-minimal — implemented" below).  BRF's program
+  generator now generates and renders a fuzzed `mptcp_sched_ops`
+  struct_ops scheduler.  VM/verifier verification is the follow-up.
+- **Stage C-full / D** — pending.
+
+### Stage C-minimal — implemented (2026-05-22)
+
+Implemented in five pieces, all in `prog/`:
+
+1. **struct_ops prog-type + ctxAccess plumbing.** The commented-out
+   `BPF_PROG_TYPE_STRUCT_OPS` stub in `ProgTypeMap`
+   (`brf_types.go`) is replaced with a real entry targeted at
+   `mptcp_sched_ops` (`User`/`Kern`: `struct mptcp_sock`,
+   `SecDefs`: `{"struct_ops", nil, false}`, empty `FuncProtos` —
+   struct_ops uses kfuncs, not numbered helpers).  A
+   `CtxAccessMap[BPF_PROG_TYPE_STRUCT_OPS]` entry documents the
+   read/write surface: broad BTF-typed reads, writes only to
+   `snd_burst` / `avg_pacing_rate`.  `mptcp_sock` is deliberately
+   *not* added to `ctxStructsMap`, so `InitFromSrc`'s field-access
+   loop is skipped (no nil-panic; the struct_ops renderer does not
+   use that machinery).
+2. **kfunc modelling.** `prog/brf_structops.go` adds `BpfKfunc`
+   (a kfunc's `extern … __ksym;` decl) and `mptcpSchedKfuncs` — the
+   two kfuncs the fixed `get_send` skeleton needs
+   (`bpf_mptcp_subflow_ctx`, `mptcp_subflow_set_scheduled`).
+   Arbitrary kfunc-call generation is Stage C-full, out of scope.
+3. **`genStructOpsSource()`** — new renderer in
+   `prog/brf_structops.go`.  Emits `vmlinux.h` +
+   `bpf_helpers.h`/`bpf_tracing.h` includes, the kfunc externs, the
+   three `SEC("struct_ops")` `BPF_PROG` callbacks
+   (`init`/`release`/`get_send`), and the `SEC(".struct_ops.link")
+   struct mptcp_sched_ops` instance.  `get_send` = fixed kfunc
+   prologue + generated body + fixed kfunc epilogue.
+4. **context-write generation.** `genStructOpsBody` generates a
+   short randomised sequence of ctx reads, **ctx writes**
+   (`msk->snd_burst = <val>;` / `subflow->avg_pacing_rate = <val>;`
+   — the headline write primitive, confined to exactly the two
+   `bpf_mptcp_sched_btf_struct_access`-writable fields), and
+   arithmetic over the read locals; at least one write per body.
+5. **wiring.** `writeCSource` (`brf_prog.go`) routes a struct_ops
+   `BpfProg` to `genStructOpsSource`.  `GenBpfProg`
+   (`brf_legacy.go`) adds `STRUCT_OPS` as a fourth rotation choice
+   and dispatches to `genStructOpsBpfProg`, a separate path that
+   leaves the `{LSM,SYSCALL,NETFILTER}` helper-call generator
+   untouched.  `BpfProg` gains a `StructOps *StructOpsProg` field
+   (gob-serialisable); `isStructOps()` is the discriminator.
+   `MutBpfProg` re-rolls a struct_ops body rather than spinning on
+   the empty `Calls` list.
+
+Verification status: code self-reviewed for compile-correctness.
+`go build` / clang / `git` could not be executed in the
+implementation environment (sandbox denied build/exec tooling) — a
+representative rendered scheduler is committed at
+`executor/bpf_progs/generated_mptcp_sched_sample.bpf.c` for the
+follow-up `go build` + clang-compile + VM/verifier pass.
 
 ## What it is
 
@@ -131,21 +186,38 @@ output in `executor/bpf_progs/README.md`.  Original plan:
 
 ### Stage C — the generator core (~2-3 weeks, the bulk + the risk)
 
+**Stage C-minimal is implemented** — see "Stage C-minimal —
+implemented" under Status above for the as-built five-piece
+breakdown.  The original plan, for reference:
+
 - Uncomment / add the `BPF_PROG_TYPE_STRUCT_OPS` entry in
-  `ProgTypeMap`, **targeted at `mptcp_sched_ops`**:
-  - `SecDefs`: `{"struct_ops/", GenMptcpSchedOps, false}` — a new
-    tiny gen func picking `get_send` / `get_retrans`.
-  - `FuncProtos` / `Helpers`: the 9 MPTCP kfuncs + base helpers.
-  - `User`/`Kern`: the `struct mptcp_sock *` context.
-- Add a `CtxAccessMap` entry for `mptcp_sock` — the read/write
-  surface (`snd_burst`, `mptcp_subflow_context.avg_pacing_rate` —
-  the `bpf_mptcp_sched_btf_struct_access` primitive).
-- Add a struct_ops branch to `genCSource` — emit the
-  `SEC(".struct_ops") struct mptcp_sched_ops` instance alongside
-  the callback function (BRF's `genCSource` currently emits only
-  attached programs, not struct_ops map instances).
-- BRF's `NewBpfProg` then generates the callback *bodies*.
-- Risk lives here: verifier-pass iteration on generated bodies.
+  `ProgTypeMap`, **targeted at `mptcp_sched_ops`**.  *(As built: a
+  real entry; `SecDefs` `{"struct_ops", nil, false}` — the callback
+  names are fixed by the renderer so no `SecDefGenFunc`; kfuncs are
+  modelled separately as `BpfKfunc`, so `FuncProtos` is empty.)*
+- Add a `CtxAccessMap` entry — the read/write surface. *(As built:
+  `CtxAccessMap[BPF_PROG_TYPE_STRUCT_OPS]` records broad reads +
+  the two writable fields.)*
+- Render the `SEC(".struct_ops.link") struct mptcp_sched_ops`
+  instance. *(As built: a dedicated `genStructOpsSource` renderer
+  rather than a branch in `genCSource` — the struct_ops C shape is
+  different enough that a separate renderer is cleaner and leaves
+  `genCSource` untouched.)*
+- Generate the callback bodies. *(As built: `genStructOpsBody`
+  generates the `get_send` body — ctx reads/writes + arithmetic;
+  `init`/`release` are empty for Stage C-minimal.)*
+
+**Still pending (Stage C-full / D):**
+- Arbitrary MPTCP kfunc-call generation (the other 7 kfuncs,
+  iterator kfuncs, `bpf_for_each(mptcp_subflow, …)`).
+- Generated non-empty `init`/`release` (e.g. `BPF_MAP_TYPE_SK_STORAGE`
+  per-msk state, as in `mptcp_bpf_rr.c`).
+- Verifier-pass iteration on generated bodies — the genuine risk;
+  unknown until a VM run.  The Stage C-minimal body is deliberately
+  conservative (writes confined to the two
+  `bpf_mptcp_sched_btf_struct_access` fields, no kfunc-return
+  dereferences beyond the null-checked `subflow`) to maximise the
+  first-pass verifier-accept rate.
 
 ### Stage D — wire + fuzz (~days)
 

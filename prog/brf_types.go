@@ -1299,16 +1299,26 @@ var ProgTypeMap = map[BpfProgTypeEnum]*BpfProgType{
 			//"bpf_probe_read_kernel_proto", "bpf_probe_read_user_str_proto", "bpf_probe_read_kernel_str_proto", "bpf_snprintf_btf_proto",
 			//"bpf_snprintf_proto", "bpf_task_pt_regs_proto",
 	}},
-//	BPF_PROG_TYPE_STRUCT_OPS: &BpfProgType{
-//		Name: "bpf_struct_ops",
-//		User: "void *",
-//		Kern: "void *",
-//		Enum: BPF_PROG_TYPE_STRUCT_OPS,
-//		SecDefs: []SecDef{
-//			SecDef{"struct_ops+", nil, false}
-//		},
-//		FuncProtos: []string{//XXX: why missing this prog type
-//	}},
+	// BRF Phase 3, Stage C-minimal: struct_ops is revived *targeted at
+	// mptcp_sched_ops* only -- not as a generic struct_ops generator
+	// (the L+ trap the upstream authors abandoned).  The MPTCP
+	// scheduler callback context is `struct mptcp_sock *`.  The body
+	// is rendered by genStructOpsSource (prog/brf_structops.go), which
+	// uses MPTCP kfuncs (modelled there as BpfKfunc) rather than the
+	// numbered helper-id machinery -- hence FuncProtos/Helpers are
+	// empty for this prog type.  The SecDef carries the "struct_ops"
+	// section prefix; the callback name is fixed by genStructOpsSource,
+	// so no SecDefGenFunc is needed.
+	BPF_PROG_TYPE_STRUCT_OPS: &BpfProgType{
+		Name: "bpf_struct_ops",
+		User: "struct mptcp_sock",
+		Kern: "struct mptcp_sock",
+		Enum: BPF_PROG_TYPE_STRUCT_OPS,
+		SecDefs: []SecDef{
+			SecDef{"struct_ops", nil, false},
+		},
+		FuncProtos: []string{},
+	},
 //	BPF_PROG_TYPE_EXT: &BpfProgType{
 //		Name: "bpf_extension",
 //		User: "void *",
@@ -2098,6 +2108,29 @@ var CtxAccessMap = map[BpfProgTypeEnum]*BpfCtxAccess{
 		accesses: []BpfCtxAccessAttr{
 			// btf_ctx_access - BTF-based context access (hook-specific)
 			{rangeInCtx: []string{"default"}, canRead: true},
+		},
+	},
+	// BRF Phase 3, Stage C-minimal: the MPTCP struct_ops scheduler
+	// context.  The verifier uses bpf_tracing_btf_ctx_access for reads
+	// (broad, BTF-typed access to mptcp_sock and pointers reached from
+	// it) and bpf_mptcp_sched_btf_struct_access for writes -- which
+	// permits writes to EXACTLY two fields: struct mptcp_sock.snd_burst
+	// and struct mptcp_subflow_context.avg_pacing_rate (net/mptcp/bpf.c).
+	// A write anywhere else is verifier -EACCES.  This entry documents
+	// that surface; the generated body in genStructOpsSource confines
+	// its writes to those two fields (mptcpSchedWriteFields).  The
+	// `default` read entry keeps InitFromSrc nil-safe and records the
+	// broad-read model.
+	BPF_PROG_TYPE_STRUCT_OPS: &BpfCtxAccess{
+		regTypeMap: map[string][][]string{},
+		others:     map[string]*BpfCtxAccess{},
+		accesses: []BpfCtxAccessAttr{
+			// bpf_tracing_btf_ctx_access - broad BTF-typed reads.
+			{rangeInCtx: []string{"default"}, canRead: true},
+			// bpf_mptcp_sched_btf_struct_access - the only two
+			// writable fields.
+			{rangeInCtx: []string{"snd_burst", "snd_burst"}, canWrite: true, size: 4},
+			{rangeInCtx: []string{"avg_pacing_rate", "avg_pacing_rate"}, canWrite: true, size: 8},
 		},
 	},
 }

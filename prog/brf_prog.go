@@ -27,6 +27,12 @@ type BpfProg struct {
 	ScratchMapName  string
 	ScratchMapVars  []string
 	ScratchMapIndex int
+
+	// StructOps is non-nil for a BRF-generated MPTCP struct_ops
+	// scheduler (Phase 3, Stage C).  When set, the program is
+	// rendered by genStructOpsSource rather than the generic
+	// helper-call genCSource path.  See prog/brf_structops.go.
+	StructOps   *StructOpsProg
 }
 
 type BrfGenProgOpt struct {
@@ -53,6 +59,11 @@ func (p *BpfProg) writeCSource() error {
 
 	if (p.UseTestSrc) {
 		progSrc = testSrc
+	} else if p.isStructOps() {
+		// Struct_ops schedulers have a distinct C shape (callbacks
+		// + a SEC(".struct_ops.link") instance) and are rendered by
+		// their own generator.  See prog/brf_structops.go.
+		progSrc = p.genStructOpsSource()
 	} else {
 		progSrc = p.genCSource()
 	}

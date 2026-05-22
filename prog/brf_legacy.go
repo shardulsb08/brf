@@ -2443,9 +2443,23 @@ func (brf *BpfRuntimeFuzzer) GenBpfProg(r *randGen, opt BrfGenProgOpt) (*BpfProg
 	// recently-added types (LSM, SYSCALL, NETFILTER) so fuzzing
 	// effort is concentrated on the new paths. Revert to a uniform
 	// draw over 1..BPF_PROG_TYPE_TRACING once these stabilise.
-	pt := brf.progTypeMap[BpfProgTypeEnum(
-		[]int{int(BPF_PROG_TYPE_LSM), int(BPF_PROG_TYPE_SYSCALL), int(BPF_PROG_TYPE_NETFILTER)}[r.Intn(3)],
-	)]
+	//
+	// BRF Phase 3, Stage C-minimal: STRUCT_OPS joins the rotation as
+	// a fourth choice.  It takes a separate generation path -- a
+	// struct_ops scheduler has a distinct C shape (callbacks + a
+	// SEC(".struct_ops.link") instance) and uses MPTCP kfuncs rather
+	// than the numbered helper-id machinery -- so the existing
+	// {LSM,SYSCALL,NETFILTER} helper-call path below is left intact.
+	choices := []int{
+		int(BPF_PROG_TYPE_LSM), int(BPF_PROG_TYPE_SYSCALL),
+		int(BPF_PROG_TYPE_NETFILTER), int(BPF_PROG_TYPE_STRUCT_OPS),
+	}
+	pt := brf.progTypeMap[BpfProgTypeEnum(choices[r.Intn(len(choices))])]
+
+	if pt.Enum == BPF_PROG_TYPE_STRUCT_OPS {
+		return brf.genStructOpsBpfProg(r, pt, opt)
+	}
+
 	helper := pt.Helpers[r.Intn(len(pt.Helpers))]
 	p := NewBpfProg(pt, r, opt)
 
@@ -2456,7 +2470,29 @@ func (brf *BpfRuntimeFuzzer) GenBpfProg(r *randGen, opt BrfGenProgOpt) (*BpfProg
 	return p, ok
 }
 
+// genStructOpsBpfProg builds a BRF-generated MPTCP struct_ops scheduler
+// BpfProg (Phase 3, Stage C-minimal).  Separate from the helper-call
+// path in GenBpfProg: the program model is a StructOpsProg, rendered by
+// genStructOpsSource (prog/brf_structops.go).  NewBpfProg is still used
+// for the common skeleton (BasePath, prog-type binding, gob TypeEnum).
+func (brf *BpfRuntimeFuzzer) genStructOpsBpfProg(r *randGen, pt *BpfProgType, opt BrfGenProgOpt) (*BpfProg, bool) {
+	p := NewBpfProg(pt, r, opt)
+	p.TypeEnum = pt.Enum
+	p.StructOps = genStructOpsProg(r)
+	fmt.Printf("gen prog %v struct_ops sched %v\n", pt.Name, p.StructOps.SchedName)
+	return p, true
+}
+
 func (brf *BpfRuntimeFuzzer) MutBpfProg(r *randGen, p *BpfProg, opt BrfGenProgOpt) bool {
+	// Struct_ops schedulers (Phase 3) have no helper-call list to
+	// mutate; re-roll the body instead.  Returning a fresh body keeps
+	// any future mutation caller making progress rather than spinning
+	// on a `false` result.
+	if p.isStructOps() {
+		p.StructOps = genStructOpsProg(r)
+		return true
+	}
+
 	var calls []*BpfCall
 	for _, c := range p.Calls {
 		if len(c.Args) > 0 {
