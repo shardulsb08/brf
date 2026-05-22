@@ -43,6 +43,28 @@ rename — citation discipline applies.
 - **Stage C-full** — pending (arbitrary kfunc-call generation,
   non-empty `init`/`release`).
 
+### VM run — first observations (2026-05-22)
+
+First fuzz run on the Stage C/D build (`run_20260522_073845`):
+
+- **25 syscalls enabled** — the 4 BPF pseudo-syscalls are now
+  active on the BPF-enabled kernel (Stage 0).
+- **patch 0006 holds** — 0 crashes over the run; the recurring
+  `kcov_remote_start_prealloc` use-after-free has not recurred.
+- **cover_filter gap (fixed).**  The syz-manager `cover_filter`
+  was `^mptcp_.*` / `^__mptcp_.*` / `^subflow_.*` / `^__subflow_.*`
+  — none match `net/mptcp/bpf.c`'s `bpf_mptcp_*` functions, so the
+  Phase 3 surface was neither measured nor guiding the fuzzer.
+  Added `^bpf_mptcp_.*` to `mptcp_v01_first_kmemleak_debug.cfg`
+  (needs a syz-manager restart).  Any future Phase 3 run config
+  must keep `^bpf_mptcp_.*` in the filter.
+- **struct_ops generation not yet confirmed.**  BRF's program
+  generation runs guest-side, so the syz-manager log shows no
+  per-program generation activity.  Confirmation will come from
+  `bpf_mptcp_*` coverage appearing after the cover_filter restart,
+  or a guest-side check of `/mnt/brf_work_dir` for generated
+  `prog_*.{c,o}` plus the syz-fuzzer compile log.
+
 ### Stage C-minimal — implemented (2026-05-22)
 
 Implemented in five pieces, all in `prog/`:
