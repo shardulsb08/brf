@@ -36,7 +36,12 @@ rename — citation discipline applies.
   see "Stage C-minimal — implemented" below).  BRF's program
   generator now generates and renders a fuzzed `mptcp_sched_ops`
   struct_ops scheduler.  VM/verifier verification is the follow-up.
-- **Stage C-full / D** — pending.
+- **Stage D** — wire generated schedulers into live fuzzing —
+  **IMPLEMENTED** (2026-05-22; see "Stage D — implemented" below).
+  The executor loads + registers + selects a generated scheduler and
+  drives MPTCP traffic over it.  VM verification is the follow-up.
+- **Stage C-full** — pending (arbitrary kfunc-call generation,
+  non-empty `init`/`release`).
 
 ### Stage C-minimal — implemented (2026-05-22)
 
@@ -212,7 +217,7 @@ breakdown.  The original plan, for reference:
   generates the `get_send` body — ctx reads/writes + arithmetic;
   `init`/`release` are empty for Stage C-minimal.)*
 
-**Still pending (Stage C-full / D):**
+**Still pending (Stage C-full):**
 - Arbitrary MPTCP kfunc-call generation (the other 7 kfuncs,
   iterator kfuncs, `bpf_for_each(mptcp_subflow, …)`).
 - Generated non-empty `init`/`release` (e.g. `BPF_MAP_TYPE_SK_STORAGE`
@@ -224,15 +229,79 @@ breakdown.  The original plan, for reference:
   dereferences beyond the null-checked `subflow`) to maximise the
   first-pass verifier-accept rate.
 
-### Stage D — wire + fuzz (~days)
+### Stage D — wire + fuzz — implemented (2026-05-22)
 
-- `syz_mptcp_load_sched_bpf` pseudo-syscall (executor + syzlang +
-  registration), or wire generation into the existing
-  `syz_bpf_prog_*` path.
-- Work-dir pruning — keep `.c`/`.o`/`.gob` only for corpus
-  programs; the generator must not fill `/mnt/brf_work_dir`
-  unboundedly (it is already 73 GB of stale artifacts; clear it).
-- Drive traffic, measure find-rate.
+Stage D wires Stage C-minimal's *generated* struct_ops schedulers
+into live fuzzing: the executor loads + registers + selects each
+generated scheduler and drives MPTCP traffic so the kernel runs its
+`get_send`.  Implemented in four pieces (D1–D4); no new
+pseudo-syscall was needed — extending `syz_bpf_prog_attach` covered
+it.
+
+**D1 — executor struct_ops load / attach / select**
+(`executor/common_brf_linux.h`).  `syz_bpf_prog_open` /
+`syz_bpf_prog_load` are object-type-agnostic and reused as-is.
+`syz_bpf_prog_attach` gained a struct_ops branch:
+`brf_find_struct_ops_map` detects a `BPF_MAP_TYPE_STRUCT_OPS` map via
+`bpf_object__for_each_map`; if present, `brf_struct_ops_attach` calls
+`bpf_map__attach_struct_ops` (register) and keeps the returned
+`bpf_link` alive in `struct_ops_link_list[]` (parallel to
+`bpf_object_list[]`); then `brf_struct_ops_select` writes the
+scheduler name to `/proc/sys/net/mptcp/scheduler`.  The per-program
+callback-attach loop is skipped for struct_ops objects.  Logic ports
+`executor/bpf_progs/test_mptcp_bpf_sched.c`.
+
+**D2 — generator → syz-program wiring** (`prog/brf.go`).
+`GenPrologue` gained an `isStructOps()` branch → `genStructOpsPrologue`,
+which emits `syz_bpf_prog_open` → `_load` → `_attach` (struct_ops) →
+`syz_mptcp_pair_init` → `syz_mptcp_drive_traffic`.  open/load/attach
+reuse `genBpfProgOpenCall` / `LoadCall` / `AttachCall`; the two MPTCP
+calls are built by new `genMptcpPairInitCall` / `genMptcpDriveTrafficCall`
+helpers that generate every arg generically and thread the
+`mptcp_pair` resource from `pair_init`'s `Ret` into `drive_traffic`
+(the same pattern `genBpfProgTestRunCall` uses for the load fd).  The
+regular LSM/SYSCALL/NETFILTER prologue path is untouched.  There is
+no `BPF_PROG_TEST_RUN` for a struct_ops program — the callbacks run
+from the MPTCP stack under traffic.
+
+**D3 — scheduler-name uniqueness.**  `mptcp_register_scheduler` is
+kernel-global; concurrent procs (and successive struct_ops programs
+within one proc, each keeping its `bpf_link` alive) must not register
+the same name.  Mechanism: the executor patches the
+`mptcp_sched_ops.name[]` member of the struct_ops map's *initial
+value* — in `syz_bpf_prog_load`, **before** `bpf_object__load`
+(libbpf folds the initial value into the kernel struct_ops value at
+load time, so a post-load patch would be ignored).  The original
+name is located by searching the initial-value blob for the
+generator's `brf_<hash>` string (which equals the libbpf map name
+and occurs exactly once, at `name[]` — no BTF walking).  The patched
+name is `brf_<11 hex>` filling `MPTCP_SCHED_NAME_MAX` exactly:
+44 bits = `(getpid()&0xFFFFFF)<<20 | counter&0xFFFFF` — pid bits
+distinguish concurrent procs, a per-proc monotonic counter
+distinguishes programs within a proc.  The chosen name is stashed in
+`struct_ops_name_list[]` so `syz_bpf_prog_attach` selects exactly
+what was registered.  The generator (`brf_structops.go`) is
+unchanged — `SchedName` is still the search key.
+
+**D4 — work-dir pruning** (`prog/brf.go`).  `pruneWorkDir`, called
+at the top of `genSeedBpfProg`, keeps `/mnt/brf_work_dir` under a
+soft cap (`brfWorkDirCapBytes`, 4 GiB) by deleting the oldest
+`prog_*.{c,o,gob}` artifacts first.  Only the generator's own
+`prog_*` / `test_prog.*` files are swept — `vmlinux.h` and the
+hand-written `executor/bpf_progs/` scaffold are never touched.
+Oldest-first means the most recently generated artifacts (the ones
+a live corpus program is most likely to still reference by path)
+survive longest.  Best-effort: any error logs and stops; generation
+never fails.  The generator is not frozen.
+
+**Verification status:** Go-side host-verified is the parent's to
+run (`go build ./prog/... && go build ./syz-manager`,
+`go test ./prog/ -run StructOps`).  The executor C
+(`common_brf_linux.h`) is VM-build-only and self-reviewed.  Live
+verification — generated scheduler loads, registers under the
+unique name, is selected, and `get_send` runs under
+`drive_traffic` — is the VM follow-up, cleanest now that the
+load/register/select path is executor-wired.
 
 ## Estimate
 
@@ -245,15 +314,16 @@ target.
 
 ## Risks / open items
 
-- `mutBpfProg` (`brf.go:309`) is a stub — BRF only generates fresh
+- `mutBpfProg` (`brf.go`) is a stub — BRF only generates fresh
   programs, never mutates them.  This caps coverage-guided
-  exploration of the scheduler.  Fixing it is a Stage D
-  consideration, not a Stage C blocker.
-- `/mnt/brf_work_dir` disk growth once the generator runs — do not
-  freeze the generator (kills exploration); prune instead.
-- Verifier-pass rate on generated struct_ops bodies — unknown
-  until Stage C; the fixed Stage B scheduler de-risks the
-  load/registration path independently.
+  exploration of the scheduler.  A post-Stage-D consideration.
+- `/mnt/brf_work_dir` disk growth — **addressed in Stage D4**:
+  `pruneWorkDir` sweeps oldest `prog_*` artifacts under a 4 GiB soft
+  cap each generation.  The generator is not frozen.
+- Verifier-pass rate on generated struct_ops bodies — still unknown
+  until a VM run.  The fixed Stage B scheduler de-risks the
+  load/registration path; Stage D wires the generated path so a VM
+  run now exercises generated bodies end to end.
 
 ## Key files
 
