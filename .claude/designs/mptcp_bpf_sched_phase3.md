@@ -4,7 +4,10 @@ Design doc for **Phase 3** of the MPTCP harness coverage-gap
 backlog (audit gap 1).  As of 2026-05-22: Stage 0/A/B are done and
 verified; Stage C-minimal and Stage D are implemented, committed
 and host-verified, and VM-verified by the fuzz run; Stage C-full
-is not done.  See the per-stage Status section below.
+Stage 1 (straight-line, contract-aware kfunc-call generation) is
+implemented and host-verified; the remaining Stage C-full work
+(Stage 2 -- subflow iterator, non-empty init/release) is not done.
+See the per-stage Status section below.
 
 Auto-loads (per repo `CLAUDE.md`) when work touches the BRF program
 generator (`prog/brf*.go`) for the BPF struct_ops scheduler.
@@ -54,8 +57,14 @@ VM-confirmed) / **IMPLEMENTED, VM-VERIFICATION IN PROGRESS**
   generated scheduler and drives MPTCP traffic over it.
   Host-verified (go build clean; executor C reviewed; a -Werror
   build issue found + fixed) and **VM-confirmed** by the same run.
-- **Stage C-full** — **NOT DONE** (arbitrary kfunc-call generation,
-  non-empty `init`/`release`).
+- **Stage C-full Stage 1** — straight-line, contract-aware
+  kfunc-call generation — **DONE, host-verified** (see "Stage
+  C-full — Stage 1 — implemented" below).  Generated `get_send`
+  bodies now call six more common MPTCP kfuncs.
+- **Stage C-full Stage 2** — **NOT DONE** (subflow iterator
+  `bpf_iter_mptcp_subflow_*` / `bpf_for_each`, generated `if/else`
+  beyond the mandatory KF_RET_NULL guards, non-empty
+  `init`/`release`).
 
 The Phase 3 pipeline is end-to-end confirmed.  The one open item
 is the verifier-accept *rate* on generated `get_send` bodies — not
@@ -146,6 +155,102 @@ clang-compiles to a valid struct_ops `.o` (struct_ops +
 passing the kernel BPF verifier and registering on a live kernel
 -- the VM follow-up, cleanest once Stage D wires executor-side
 loading.
+
+### Stage C-full — Stage 1 — implemented (2026-05-22)
+
+Stage 1 of Stage C-full adds **straight-line, contract-aware
+kfunc-call generation** to the `get_send` body.  Before this, every
+generated scheduler called the same two kfuncs (the fixed
+prologue/epilogue skeleton) and the harness coverage plateaued on
+that fixed kfunc surface.  Stage 1 makes generated `get_send`
+bodies additionally call **six more common MPTCP kfuncs**, each of
+which reaches new kernel code.
+
+All changes are in `prog/brf_structops.go` + `prog/brf_structops_test.go`.
+
+**The kfunc set.**  The six kfuncs added to the model — every
+straight-line entry of `bpf_mptcp_common_kfunc_ids` in
+`net/mptcp/bpf.c` not already modelled:
+
+| kfunc | return | args | contract |
+|---|---|---|---|
+| `bpf_mptcp_subflow_tcp_sock` | `struct sock *` | `const struct mptcp_subflow_context *` | KF_RET_NULL pointer — NULL-guard required |
+| `bpf_sk_stream_memory_free` | `bool` | `const struct sock *` | KF_RET_NULL but scalar — no guard |
+| `bpf_mptcp_subflow_queues_empty` | `bool` | `struct sock *` | scalar |
+| `mptcp_subflow_active` | `bool` | `struct mptcp_subflow_context *` | scalar |
+| `mptcp_set_timeout` | `void` | `struct sock *` | call for effect |
+| `mptcp_wnd_end` | `__u64` | `const struct mptcp_sock *` | scalar |
+
+Signatures are transcribed verbatim from `net/mptcp/bpf.c` (the
+`__bpf_kfunc` definitions) and `net/mptcp/protocol.h`.
+**Deliberately excluded** (Stage 2 / not usable):
+`mptcp_pm_subflow_chk_stale` (KF_SLEEPABLE — not callable from the
+non-sleepable `get_send`) and the three `bpf_iter_mptcp_subflow_*`
+iterator kfuncs.
+
+**CF1 — kfunc model.**  `BpfKfunc` gains `RetType`, `ArgTypes`,
+`IsPtrRet` and `RetNull` (the latter mirrors the kernel
+`KF_RET_NULL` flag).  `BpfKfunc.needsNullGuard()` encodes the
+verifier-accurate rule: a NULL-check is required **only** for a
+`KF_RET_NULL` *pointer* return (`IsPtrRet && RetNull`).
+`KF_RET_NULL` on a scalar-returning kfunc (here
+`bpf_sk_stream_memory_free`, registered `KF_RET_NULL` but returning
+`bool`) only means the scalar may be 0 — no guard.
+
+**CF2 — contract-aware generation.**  `genStructOpsBody` threads a
+pool of **typed values**, seeded with the three values the fixed
+prologue establishes (`msk` : `struct mptcp_sock *`; `msk->first` :
+`struct sock *`; `subflow` : `struct mptcp_subflow_context *`) and
+grown by every typed local (ctx-read, arithmetic, kfunc result).
+A new `StructOpsStmtKfuncCall` statement kind is emitted only when
+**every argument type of the kfunc is satisfiable from the pool**
+(`pickKfuncArgs`; type matching strips `const`).  Per-return
+contract: a void kfunc is emitted for effect; a scalar result is
+bound to a local (and, if integer-like, made available to later
+arithmetic); a `KF_RET_NULL` pointer result is bound to a local
+and the local enters the pool **only after** the renderer emits the
+mandatory `if (!local) return -1;` guard — so no later statement
+can use an unguarded pointer.  The fixed prologue and the fixed
+epilogue (`mptcp_subflow_set_scheduled(subflow, true); return 0;`)
+are untouched, so `get_send` still schedules a subflow.
+
+**CF3 — renderer.**  `genStructOpsSource` renders `KfuncCall`
+statements (void call / result-bound call) and the immediate
+`if (!local)` / `return -1;` guard for a `NullGuard` statement.
+`StructOpsProg.usedKfuncIdxs()` filters the emitted `extern …
+__ksym;` decls to exactly the kfuncs the scheduler references (the
+two fixed-skeleton kfuncs plus every called kfunc).  The leftover
+`fmt.Printf` debug dump was removed.
+
+**Verifier-contract decisions.**
+- `bpf_sk_stream_memory_free` is `KF_RET_NULL` in the kernel but
+  returns `bool`; modelled `RetNull: true, IsPtrRet: false` so
+  `needsNullGuard()` is false — no guard, matching the verifier.
+- `bool` parameters (only `mptcp_subflow_set_scheduled`'s
+  `scheduled`, which the fixed epilogue supplies) are additionally
+  satisfiable by the literals `true` / `false`, so a generated
+  bool argument is never blocked.
+- Scope boundary: the only generated branching is the mandatory
+  `KF_RET_NULL` NULL-check; `get_send` is otherwise straight-line.
+  No subflow iterator, no non-empty `init`/`release` — Stage 2.
+
+Verification status: **host-verified 2026-05-22** —
+`go build ./prog/...` and `go vet ./prog/` clean.
+`prog/brf_structops_test.go` is extended:
+`TestStructOpsKfuncCalls` asserts kfunc calls are generated across
+256 seeds, that every `KF_RET_NULL` pointer result is
+NULL-checked immediately in both the model and the rendered C, and
+that arguments are only typed in-scope values;
+`TestStructOpsGobRoundTrip` is extended to confirm `KfuncCall`
+statements (with `KfuncArgs` + `NullGuard`) gob-round-trip.
+`go test ./prog/ -run StructOps` could not be **run** in the
+implementing sandbox (the `sys/test/gen` descriptions are not
+generated there — a pre-existing limitation that fails the
+pre-existing `TestNotEscaping` identically); the test file
+compiles clean (`go test -count=0`).  The regenerated sample
+`executor/bpf_progs/generated_mptcp_sched_sample.bpf.c` exercises
+all six new kfuncs incl. the `KF_RET_NULL` guard; the
+clang-compile is the parent's follow-up.
 
 ## What it is
 
@@ -265,17 +370,23 @@ breakdown.  The original plan, for reference:
   generates the `get_send` body — ctx reads/writes + arithmetic;
   `init`/`release` are empty for Stage C-minimal.)*
 
-**Still pending (Stage C-full):**
-- Arbitrary MPTCP kfunc-call generation (the other 7 kfuncs,
-  iterator kfuncs, `bpf_for_each(mptcp_subflow, …)`).
+**Stage C-full Stage 1 is implemented** — straight-line,
+contract-aware calls to the six common straight-line kfuncs; see
+"Stage C-full — Stage 1 — implemented" under Status above.
+
+**Still pending (Stage C-full Stage 2):**
+- The subflow iterator: the three `bpf_iter_mptcp_subflow_*`
+  iterator kfuncs / `bpf_for_each(mptcp_subflow, …)`.
+- Generated `if/else` beyond the mandatory `KF_RET_NULL` guards.
 - Generated non-empty `init`/`release` (e.g. `BPF_MAP_TYPE_SK_STORAGE`
   per-msk state, as in `mptcp_bpf_rr.c`).
 - Verifier-pass iteration on generated bodies — the genuine risk;
-  unknown until a VM run.  The Stage C-minimal body is deliberately
+  unknown until a VM run.  The bodies are deliberately
   conservative (writes confined to the two
-  `bpf_mptcp_sched_btf_struct_access` fields, no kfunc-return
-  dereferences beyond the null-checked `subflow`) to maximise the
-  first-pass verifier-accept rate.
+  `bpf_mptcp_sched_btf_struct_access` fields; every `KF_RET_NULL`
+  pointer immediately NULL-checked; only typed in-scope values
+  passed as kfunc arguments) to maximise the first-pass
+  verifier-accept rate.
 
 ### Stage D — wire + fuzz — implemented (2026-05-22)
 

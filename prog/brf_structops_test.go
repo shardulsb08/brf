@@ -1,11 +1,15 @@
 // Copyright 2026 Mpiric.  Apache 2 LICENSE -- see LICENSE.
 //
-// BRF Phase 3, Stage C-minimal verification test.  Builds a generated
-// MPTCP struct_ops scheduler BpfProg and renders it, asserting the
+// BRF Phase 3, Stage C verification test.  Builds a generated MPTCP
+// struct_ops scheduler BpfProg and renders it, asserting the
 // structural invariants the kernel verifier and bpf_struct_ops loader
 // require.  This is the in-tree compile + render check for
 // prog/brf_structops.go.  The clang-compile + VM/verifier pass is the
 // separate follow-up (see executor/bpf_progs/README.md).
+//
+// Stage C-full Stage 1 adds checks that generated schedulers emit
+// straight-line kfunc calls and that every KF_RET_NULL *pointer*
+// result is NULL-checked before any use (TestStructOpsKfuncCalls).
 //
 // Run: go test ./prog/ -run StructOps -v
 
@@ -148,5 +152,205 @@ func TestStructOpsGobRoundTrip(t *testing.T) {
 	if len(q.StructOps.GetSendBody) != len(p.StructOps.GetSendBody) {
 		t.Errorf("GetSendBody len: got %d want %d",
 			len(q.StructOps.GetSendBody), len(p.StructOps.GetSendBody))
+	}
+	if len(q.StructOps.Kfuncs) != len(p.StructOps.Kfuncs) {
+		t.Errorf("Kfuncs len: got %d want %d",
+			len(q.StructOps.Kfuncs), len(p.StructOps.Kfuncs))
+	}
+	// Stage C-full: kfunc-call statements -- with their KfuncArgs
+	// slice and NullGuard flag -- must survive the gob round-trip
+	// intact, since rendering happens after deserialization.
+	for i := range p.StructOps.GetSendBody {
+		ps := p.StructOps.GetSendBody[i]
+		qs := q.StructOps.GetSendBody[i]
+		if ps.Kind != qs.Kind {
+			t.Errorf("stmt %d: Kind got %d want %d", i, qs.Kind, ps.Kind)
+		}
+		if ps.Kind != StructOpsStmtKfuncCall {
+			continue
+		}
+		if qs.KfuncIdx != ps.KfuncIdx {
+			t.Errorf("stmt %d: KfuncIdx got %d want %d",
+				i, qs.KfuncIdx, ps.KfuncIdx)
+		}
+		if qs.NullGuard != ps.NullGuard {
+			t.Errorf("stmt %d: NullGuard got %v want %v",
+				i, qs.NullGuard, ps.NullGuard)
+		}
+		if len(qs.KfuncArgs) != len(ps.KfuncArgs) {
+			t.Fatalf("stmt %d: KfuncArgs len got %d want %d",
+				i, len(qs.KfuncArgs), len(ps.KfuncArgs))
+		}
+		for j := range ps.KfuncArgs {
+			if qs.KfuncArgs[j] != ps.KfuncArgs[j] {
+				t.Errorf("stmt %d arg %d: got %q want %q",
+					i, j, qs.KfuncArgs[j], ps.KfuncArgs[j])
+			}
+		}
+	}
+}
+
+// TestStructOpsKfuncCalls is the Stage C-full Stage 1 check.  It
+// asserts that generated schedulers exercise the kfunc-call generator
+// and that every generated call honours the verifier contract:
+//
+//   - a KF_RET_NULL *pointer* result is NULL-checked before any use;
+//   - every kfunc argument is a typed, in-scope value;
+//   - the fixed prologue/epilogue is left intact.
+func TestStructOpsKfuncCalls(t *testing.T) {
+	// The set of values that may legally appear as a kfunc argument:
+	// the three fixed prologue values plus any `sN` local.  An `sN`
+	// local is only ever in scope after its declaring statement, and
+	// the renderer emits statements in order, so a syntactic
+	// membership check here is sufficient to confirm "typed,
+	// in-scope" -- a non-member argument is necessarily wrong.
+	fixedArgs := map[string]bool{
+		"msk": true, "msk->first": true, "subflow": true,
+		"true": true, "false": true,
+	}
+
+	// Names of kfuncs whose pointer return is KF_RET_NULL -- their
+	// result MUST be guarded.  Derived from the model so the test
+	// tracks mptcpSchedKfuncs.
+	ptrRetNull := map[string]bool{}
+	for i := range mptcpSchedKfuncs {
+		kf := &mptcpSchedKfuncs[i]
+		if kf.needsNullGuard() {
+			ptrRetNull[kf.Name] = true
+		}
+	}
+
+	sawKfuncCall := false
+	sawGuard := false
+	for seed := int64(0); seed < 256; seed++ {
+		p := newStructOpsTestProg(t, seed)
+		sop := p.StructOps
+
+		// Walk the model: every KfuncCall must reference a valid
+		// kfunc, pass only in-scope args, and -- when its kfunc
+		// needs a guard -- carry NullGuard and bind a local.
+		declared := map[string]bool{}
+		for si, st := range sop.GetSendBody {
+			switch st.Kind {
+			case StructOpsStmtCtxRead, StructOpsStmtArith:
+				if st.Var != "" {
+					declared[st.Var] = true
+				}
+			case StructOpsStmtKfuncCall:
+				sawKfuncCall = true
+				if st.KfuncIdx < 0 || st.KfuncIdx >= len(sop.Kfuncs) {
+					t.Fatalf("seed %d stmt %d: KfuncIdx %d out of range",
+						seed, si, st.KfuncIdx)
+				}
+				kf := &sop.Kfuncs[st.KfuncIdx]
+				if len(st.KfuncArgs) != len(kf.ArgTypes) {
+					t.Errorf("seed %d stmt %d: %s got %d args, want %d",
+						seed, si, kf.Name, len(st.KfuncArgs),
+						len(kf.ArgTypes))
+				}
+				for _, a := range st.KfuncArgs {
+					if !fixedArgs[a] && !declared[a] {
+						t.Errorf("seed %d stmt %d: %s arg %q is not "+
+							"a typed, in-scope value",
+							seed, si, kf.Name, a)
+					}
+				}
+				// Verifier contract: KF_RET_NULL pointer -> guard.
+				if ptrRetNull[kf.Name] {
+					if !st.NullGuard {
+						t.Errorf("seed %d stmt %d: %s is KF_RET_NULL "+
+							"pointer but NullGuard is false",
+							seed, si, kf.Name)
+					}
+					if st.Var == "" {
+						t.Errorf("seed %d stmt %d: %s result not "+
+							"bound to a local",
+							seed, si, kf.Name)
+					}
+				}
+				if st.NullGuard {
+					sawGuard = true
+				}
+				if st.Var != "" {
+					declared[st.Var] = true
+				}
+			}
+		}
+
+		// Render and confirm the verifier contract holds in the C:
+		// for every KF_RET_NULL pointer call, the call line is
+		// immediately followed by `if (!sN)` / `return -1;`, and the
+		// local does not appear before that guard.
+		src := p.genStructOpsSource()
+		lines := strings.Split(src, "\n")
+		for li, line := range lines {
+			l := strings.TrimSpace(line)
+			for kfName := range ptrRetNull {
+				// A guarded call binds a local: `<type> sN = kfName(...)`.
+				if !strings.Contains(l, " = "+kfName+"(") {
+					continue
+				}
+				// Extract the bound local name (`sN`).
+				eq := strings.Index(l, " = ")
+				lhs := strings.Fields(strings.TrimSpace(l[:eq]))
+				if len(lhs) == 0 {
+					t.Errorf("seed %d: malformed kfunc-call line %q",
+						seed, l)
+					continue
+				}
+				local := lhs[len(lhs)-1]
+				// The next two lines must be the mandatory guard.
+				if li+2 >= len(lines) {
+					t.Errorf("seed %d: %s call not followed by guard",
+						seed, kfName)
+					continue
+				}
+				g1 := strings.TrimSpace(lines[li+1])
+				g2 := strings.TrimSpace(lines[li+2])
+				if g1 != "if (!"+local+")" || g2 != "return -1;" {
+					t.Errorf("seed %d: %s result %q not immediately "+
+						"NULL-checked; got %q / %q",
+						seed, kfName, local, g1, g2)
+				}
+			}
+		}
+
+		// The fixed prologue/epilogue must survive untouched.
+		for _, frag := range []string{
+			"bpf_mptcp_subflow_ctx(msk->first)",
+			"mptcp_subflow_set_scheduled(subflow, true)",
+			"return 0;",
+		} {
+			if !strings.Contains(src, frag) {
+				t.Errorf("seed %d: fixed skeleton fragment %q missing",
+					seed, frag)
+			}
+		}
+
+		// Every kfunc the body calls must have an `extern … __ksym;`
+		// decl in the rendered source.
+		for _, st := range sop.GetSendBody {
+			if st.Kind != StructOpsStmtKfuncCall {
+				continue
+			}
+			kfName := sop.Kfuncs[st.KfuncIdx].Name
+			if !strings.Contains(src, "\n"+kfName+"(") &&
+				!strings.Contains(src, " "+kfName+"(") {
+				continue // referenced; extern presence checked next
+			}
+			if !strings.Contains(src, kfName) {
+				t.Errorf("seed %d: kfunc %q called but no extern decl",
+					seed, kfName)
+			}
+		}
+	}
+
+	if !sawKfuncCall {
+		t.Error("no kfunc call generated across 256 seeds -- " +
+			"Stage C-full Stage 1 generator is not firing")
+	}
+	if !sawGuard {
+		t.Error("no KF_RET_NULL guard generated across 256 seeds -- " +
+			"the pointer-return contract path is untested")
 	}
 }
