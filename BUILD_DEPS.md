@@ -15,6 +15,18 @@ apt-get install -y libbpf-dev libelf-dev libdw-dev libzstd-dev zlib1g-dev
 # v02 NFQUEUE mutation work (smoke test side).  Executor side uses
 # raw netlink so does not need these.
 apt-get install -y libnetfilter-queue-dev libnfnetlink-dev
+
+# Phase 3 -- BPF struct_ops MPTCP scheduler.  clang compiles each
+# generated BPF program (any recent clang; trixie's `clang` is
+# clang-19 -- fine, BRF does not require clang-21).  bpftool generates
+# vmlinux.h.  libbpf-dev (>= 1.x, already above) is also used by the
+# executor's struct_ops loader.
+apt-get install -y clang bpftool
+
+# Generate vmlinux.h where compileBpfProg runs -- generated struct_ops
+# schedulers #include "vmlinux.h":
+mkdir -p /mnt/brf_work_dir
+bpftool btf dump file /sys/kernel/btf/vmlinux format c > /mnt/brf_work_dir/vmlinux.h
 ```
 
 Toolchain:
@@ -30,6 +42,7 @@ Toolchain:
 | `go build` hash step | `error: readlink("dashboard/app/static/common.js"): Too many levels of symbolic links` printed by every build. | Cosmetic only -- the build proceeds.  Stale symlink in BRF's dashboard webroot from the upstream Syzkaller fork.  Not worth fixing until/unless we touch dashboard. |
 | `apt-get` package name | Package is `libnetfilter-queue-dev` with a hyphen, not `libnetfilter_queue-dev` with an underscore. | -- |
 | Deprecated libnetfilter_queue ritual | `nfq_bind_pf(handle, AF_INET)` returns `EINVAL` on kernel >=7.x (and probably earlier).  The protocol-family bind it used to do is implicit in `nfq_create_queue()` now.  Old man-page examples still show it. | Don't call `nfq_unbind_pf` / `nfq_bind_pf` at all.  See `kernel_patches/mptcp_kcov/test_mp_join_hmac_bitflip.c` for the modern pattern. |
+| `apt-get install clang-21` on the dev_env VM (Debian trixie) | trixie's repos have no `clang-21`, and `apt.llvm.org` is unreachable from the VM (only the Debian mirrors resolve -- no general internet). | BRF does **not** need a specific clang version.  `compileBpfProg` (`prog/brf.go`, `brfClang()`) auto-detects the newest `clang-NN` in PATH, honouring `$BRF_CLANG`.  Install the distro `clang` (`apt-get install clang` -> clang-19 on trixie) -- recent enough for the BPF target + BTF + `-mcpu=v3`. |
 
 ## Kernel config requirements
 
@@ -45,6 +58,7 @@ here so future contributors who hand-roll a kernel know the surface.
 | `CONFIG_MPTCP=y` (from `mptcp.config`) | the protocol under test |
 | `CONFIG_PACKET=y`, `CONFIG_VETH=y` | reserved for future netns + AF_PACKET work, currently unused |
 | `CONFIG_NETFILTER_NETLINK_QUEUE=y`, `CONFIG_NETFILTER_XT_TARGET_NFQUEUE=y` | **v02 mutation** -- `nfq_create_queue` fails with `EINVAL` and `iptables -j NFQUEUE` fails to apply without these.  Required for `test_mp_join_hmac_bitflip` and the executor-side NFQUEUE in `syz_mptcp_join_subflow` mutation modes. |
+| `CONFIG_BPF_SYSCALL=y`, `CONFIG_BPF_JIT=y`, `CONFIG_DEBUG_INFO_BTF=y` (+ the BRF eBPF config set) | **Phase 3** -- the BPF struct_ops MPTCP scheduler.  Without `CONFIG_BPF_SYSCALL` the `bpf()` syscall is absent (syz-manager disables the BPF pseudo-syscalls); `CONFIG_DEBUG_INFO_BTF` is required for struct_ops, resolved against vmlinux BTF (needs `pahole` at kernel-build time).  Set in `brf_mptcp_harness.config`. |
 
 ## Runtime quirks (running syz-execprog / syz-executor in the dev_env VM)
 

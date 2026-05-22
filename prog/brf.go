@@ -514,13 +514,33 @@ func (brf *BpfRuntimeFuzzer) mutBpfProg(r *randGen, p *BpfProg, opt BrfGenProgOp
 	return true
 }
 
+// brfClang picks the C compiler for generated BPF programs.  BRF needs
+// a reasonably recent clang (BPF target, BTF emission, -mcpu=v3) but
+// NOT a specific version: the dev_env build VM (Debian trixie) ships
+// clang-19, the host has clang-21, the old Fedora-docker build had a
+// from-source clang-21.  Honour $BRF_CLANG, else the newest clang-NN
+// found in PATH, else plain `clang`.
+func brfClang() string {
+	if c := os.Getenv("BRF_CLANG"); c != "" {
+		return c
+	}
+	for _, c := range []string{
+		"clang-22", "clang-21", "clang-20", "clang-19",
+		"clang-18", "clang-17", "clang-16", "clang",
+	} {
+		if _, err := exec.LookPath(c); err == nil {
+			return c
+		}
+	}
+	return "clang"
+}
+
 func (brf *BpfRuntimeFuzzer) compileBpfProg(p *BpfProg) error {
 	var timeout time.Duration = 10000000000
-	// clang-21 is resolved via PATH: BRF's BPF generator needs a
-	// recent clang (-mcpu=v3, BTF emission).  The previous hardcoded
-	// Fedora-docker path (/home/user/llvm-project/...) does not exist
-	// on the dev_env host, which has clang-21 in /usr/local/bin.
-	cmd := exec.Command("clang-21", "-g", "-D__TARGET_ARCH_x86", "-mlittle-endian",
+	// BPF compiler: brfClang() picks $BRF_CLANG, else the newest
+	// clang-NN in PATH, else `clang` -- BRF needs a recent clang
+	// (BPF target, BTF, -mcpu=v3), not a specific version.
+	cmd := exec.Command(brfClang(), "-g", "-D__TARGET_ARCH_x86", "-mlittle-endian",
 		"-idirafter", "/usr/local/include",
 		"-idirafter", "/usr/local/llvm/include",
 		"-idirafter", "/usr/include/x86_64-linux-gnu",
