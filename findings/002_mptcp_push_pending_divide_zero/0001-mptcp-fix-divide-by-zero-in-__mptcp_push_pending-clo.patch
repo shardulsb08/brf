@@ -1,0 +1,55 @@
+From 2f0d0fed32e7aa035096e48ed7bb660ea330dea9 Mon Sep 17 00:00:00 2001
+From: Shardul Bankar <shardul.b@mpiricsoftware.com>
+Date: Sat, 23 May 2026 22:07:00 +0530
+Subject: [PATCH mptcp-net] mptcp: fix divide-by-zero in __mptcp_push_pending
+ close path
+
+A divide-by-zero in tcp_tso_segs() is reachable via __mptcp_close_ssk ->
+__mptcp_push_pending -> mptcp_push_release(ssk, &info) with info.mss_now
+== 0, triggered by MPTCP_PM_CMD_FLUSH_ADDRS.  __mptcp_close_ssk() leaves
+the ssk in a state where __tcp_can_send() is false (FIN_WAIT1/2, CLOSING,
+LAST_ACK) and then unconditionally calls __mptcp_push_pending(sk, 0).
+For such an ssk, mptcp_sendmsg_frag() returns -EAGAIN before reaching
+its tcp_send_mss(), so info.mss_now stays 0 when the trailing
+mptcp_push_release() feeds it into tcp_push() -> tcp_tso_autosize().
+
+Commit 1094c6fe7280 ("mptcp: fix possible divide by zero") covered the
+alloc-failure branch by moving tcp_send_mss() before allocation; it does
+not cover this -EAGAIN-before-tcp_send_mss() case.
+
+Initialise info->mss_now and ->size_goal at __subflow_push_pending()
+entry, before any early-return path.  Idempotent with the assignment
+inside mptcp_sendmsg_frag().
+
+Found by an MPTCP protocol-flow harness extending BRF
+(arXiv:2305.08782) via the MPTCP_PM_CMD_FLUSH_ADDRS kernel-PM admin
+path; the oops is reached on the first qualifying run.
+
+Fixes: 724cfd2ee8aa ("mptcp: allocate TX skbs in msk context")
+Assisted-by: Claude:claude-opus-4-7
+Signed-off-by: Shardul Bankar <shardul.b@mpiricsoftware.com>
+---
+ net/mptcp/protocol.c | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/net/mptcp/protocol.c b/net/mptcp/protocol.c
+index a72a6ad6ee8b1..7977f60f98474 100644
+--- a/net/mptcp/protocol.c
++++ b/net/mptcp/protocol.c
+@@ -1627,6 +1627,13 @@ static int __subflow_push_pending(struct sock *sk, struct sock *ssk,
+ 	struct mptcp_data_frag *dfrag;
+ 	int len, copied = 0, err = 0;
+ 
++	/* Initialise mss_now/size_goal: mptcp_sendmsg_frag() may return
++	 * before reaching its own tcp_send_mss() (e.g. !__tcp_can_send()),
++	 * leaving __mptcp_push_pending()'s trailing mptcp_push_release()
++	 * with info.mss_now == 0 and tripping tcp_tso_segs() on the divide.
++	 */
++	info->mss_now = tcp_send_mss(ssk, &info->size_goal, info->flags);
++
+ 	while ((dfrag = mptcp_send_head(sk))) {
+ 		info->sent = dfrag->already_sent;
+ 		info->limit = dfrag->data_len;
+-- 
+2.34.1
+
