@@ -360,7 +360,15 @@ from a single finding:
   syzkaller config (`procs: 6`), and corpus state.
 
 **One bug is suggestive, not proof.**  The talk's framing must reflect
-that.
+that.  (Update 2026-05-24: a *second* harness-found bug on a
+*different* MPTCP surface — kernel-PM `FLUSH_ADDRS` →
+`__mptcp_push_pending` divide-by-zero, see
+`findings/002_mptcp_push_pending_divide_zero/case_study.md` — has
+since been sent upstream.  Two bugs on two surfaces is meaningfully
+stronger than the one-fluke prior, but the absence of a controlled
+baseline against kernel-only Syzkaller still stands as the binding
+limit on "the methodology produces more bugs than the alternative."
+The pre-work caveat below is unchanged.)
 
 ---
 

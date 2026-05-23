@@ -4,10 +4,17 @@
 adopt this approach for a kernel transport-security subsystem of
 their own.  Kernel veterans reviewing the methodology under Q&A.
 
-**Companion evidence.** `findings/001_mptcp_pm_destroy_race/case_study.md`
-is the load-bearing bug case study; this document is the
-generalised methodology claim.  Read the case study for the
-ground-truth example.
+**Companion evidence.** Two case studies are the load-bearing
+bug evidence; this document is the generalised methodology
+claim.  Read the case studies for the ground-truth examples:
+
+- `findings/001_mptcp_pm_destroy_race/case_study.md` — userspace-PM
+  `ANNOUNCE`-vs-`destroy` race; kmemleak signal; patched, sent
+  to mptcp@ 2026-05-20.
+- `findings/002_mptcp_push_pending_divide_zero/case_study.md` —
+  kernel-PM `FLUSH_ADDRS` → `__mptcp_close_ssk` → divide-by-zero
+  in `tcp_tso_segs`; structural fix extending Paolo Abeni's
+  2021 `1094c6fe7280`; sent to mptcp@ 2026-05-24.
 
 **Authorship chain (preserve in every external artifact):**
 
@@ -42,10 +49,22 @@ Mpiric's role is **extender**, not author.
 The harness this methodology produced is 25 pseudo-syscalls (21
 MPTCP + 4 BPF), with wire-level option mutation, a generated BPF
 struct_ops MPTCP scheduler (Phase 3 / "the flagship") whose
-verifier-accept rate measures at ~93% on 1,422 loads, and one
-real, upstream-mergeable bug (the `mptcp_pm_destroy()`
-alloc-during-teardown race; sent to mptcp@ 2026-05-20).  None of
-this is a controlled comparison against any baseline; see Section 8.
+verifier-accept rate measures at ~93% on 1,422 loads, and **two
+real, upstream-mergeable bugs on two distinct surfaces of
+`net/mptcp/`**:
+
+- Finding 001: `mptcp_pm_destroy()` alloc-during-teardown race
+  on the userspace-PM genl handlers (sent to mptcp@ 2026-05-20).
+- Finding 002: `__mptcp_push_pending()` close-path divide-by-zero
+  in `tcp_tso_segs`, reached via the kernel-PM
+  `MPTCP_PM_CMD_FLUSH_ADDRS` admin command — a partial-fix
+  re-emergence of a bug class first patched (incompletely) by
+  Paolo Abeni in 2021 (sent to mptcp@ 2026-05-24).
+
+None of this is a controlled comparison against any baseline;
+see Section 6.  Two bugs on two surfaces is a stronger property
+than two bugs on one surface, but still small N — the framing
+below stays cautious about what two findings can prove.
 
 ---
 
@@ -419,6 +438,34 @@ required human triage to recognise.
   motivates the two-phase diagnostic / fix validation in the
   case study: an AI-generated probe condition looks correct on
   paper, and only the kernel's runtime behaviour disproves it.
+- **Finding 002 commit-message state imprecision:
+  "FIN_WAIT1/2 or CLOSE."**  The first draft of the
+  `__mptcp_push_pending()` divide-by-zero commit message named
+  the reachability set as "FIN_WAIT1/2 or CLOSE."  This was
+  wrong: `TCP_CLOSE` is not reachable for the divide because
+  `__tcp_push_pending_frames()` short-circuits before
+  `tcp_tso_autosize()`.  The conflation came from re-using the
+  outer push loop's `push_count--` *exit* predicate
+  (`TCPF_FIN_WAIT1 | TCPF_FIN_WAIT2 | TCPF_CLOSE`) as the
+  *crash-reachability* predicate — two different conditions, two
+  of four mask bits coincidentally shared.  Caught in human
+  review (Shardul) before the patch went to mptcp@; the
+  corrected message uses `!__tcp_can_send()` as the predicate
+  and names the four actually-reachable states.  This is the
+  same shape of failure as 001's probe condition: AI-drafted
+  state-machine reasoning that looks right on a single-pass
+  read, only the second careful read disproves it.
+- **Finding 002 fix comment too verbose.**  The first draft of
+  the comment block above the new `tcp_send_mss()` assignment
+  ran six lines, including a parenthetical about Paolo's 2021
+  fix and a redundant restatement of the call chain.  Trimmed
+  to four lines in review.  This is the same verbosity pattern
+  as 001's instrumentation: AI-generated explanatory text is
+  consistently *too long* for kernel-prose style and needs
+  human compression.  The pattern is repeated enough — across
+  two findings now — to be a methodology observation rather
+  than an incident: schedule a "compress the comment" step
+  before any send.
 - **The 8-sample 0/8 "regression" misread.**  At one point a
   short window showed the Phase 3 fuzzer producing no new
   coverage; this looked like a regression and triggered a chase
@@ -556,20 +603,40 @@ specific to MPTCP.
 
 ## 6. What it does **not** prove
 
-Single-substrate, single-harness, single-bug data.  Honest
-limits:
+Single-substrate, single-harness, two-bug data — across two
+distinct MPTCP surfaces.  The two-surface property is what
+genuinely strengthens; the rest of the limits are unchanged.
+Honest limits:
 
 - **It does not prove AI-augmented description authoring is
   faster than human authoring at the same level of rigor.**
-  There is no controlled comparison.  Time-to-first-bug was
-  driven at least as much by Shardul's existing MPTCP
-  expertise (HMAC fixes A/B upstream, set_rcvbuf merge,
-  RST_EMPTCP series in review) as by description productivity.
+  There is no controlled comparison.  Time-to-first-bug and
+  time-to-second-bug were both driven at least as much by
+  Shardul's existing MPTCP expertise (HMAC fixes A/B upstream,
+  set_rcvbuf merge, RST_EMPTCP series in review) as by
+  description productivity.  Finding 002 in particular sits
+  downstream of a careful per-entry-point audit of
+  `net/mptcp/` — the audit was the load-bearing pre-work, and
+  audit authoring is not subtractable from the
+  finding-discovery clock.
 - **It does not prove the methodology produces bugs on
-  schedule.**  One bug across ~6 weeks of harness build-out is
-  *suggestive*, not predictive.  The talk's framing is "the
-  *method* produces harnesses that produce bugs"; the bug
-  *rate* is unknown.
+  schedule.**  Two bugs across ~6 weeks of harness build-out
+  is *suggestive*, not predictive.  N=2 is small.  The
+  bug-finding *rate* is not extrapolatable from two data
+  points, and a third finding (or a barren stretch) is the
+  observation that would change the picture.  The talk's
+  framing is "the *method* produces harnesses that produce
+  bugs"; the bug *rate* and *spacing* remain unknown.
+- **What the second finding *does* strengthen.**  The
+  two-surface property — finding 001 on the userspace-PM
+  handlers, finding 002 on the kernel-PM admin handlers — is
+  stronger than two findings on the same surface.  The
+  harness's reachability is not concentrated in a single
+  chokepoint, and the audit-driven gap closure that added the
+  kernel-PM pseudo-syscalls produced a bug on its first
+  qualifying run.  "Audit identifies a gap; closing the gap
+  surfaces a bug" is a small piece of methodology validation
+  in itself.
 - **It does not prove portability beyond MPTCP.**  QUIC and
   tlshd extensions are planned but unbuilt; the state-carrier
   pattern's fit to those surfaces is a hypothesis, not a
@@ -580,12 +647,15 @@ limits:
 - **It does not include a controlled comparison against a
   kernel-only Syzkaller baseline.**  We have not run plain
   Syzkaller against the same kernel for the same time-budget
-  with the same crash-detection plumbing.  The case study
-  flags this as a backfill before publication; the
-  prescriptive part of the talk does not depend on it (the
-  methodology's value is "reaches code the baseline cannot",
-  which is demonstrable from coverage / reachability rather
-  than from bug-count).
+  with the same crash-detection plumbing.  Two findings on two
+  surfaces does not change this — both findings sit on code
+  paths that require state stateless Syzkaller cannot
+  construct, so the "harness reaches what the baseline cannot"
+  claim is demonstrable from reachability; but the
+  "harness *finds more bugs than* the baseline" claim still
+  requires the controlled run.  Both case studies flag this
+  as a backfill before publication.  The prescriptive part
+  of the talk does not depend on it.
 - **It does not prove the absence of AI-generated bugs in the
   harness.**  Several latent defects shipped to the corpus
   before VM testing caught them (Section 4.2).  The talk's
@@ -638,11 +708,16 @@ gated paths + continuous quality instrumentation**.  It is
 demonstrably effective at reaching protocol-flow code that
 stateless fuzzing cannot reach (25 pseudo-syscalls, +16%
 coverage on the BPF flagship, ~93% verifier-accept on
-generated struct_ops bodies, one upstream-mergeable bug).  It
-is honestly limited by the single-substrate single-bug data
-shape it currently has, by the absence of a controlled
-baseline, and — most importantly — by the documented AI
-failure modes the human verification step exists to catch.
+generated struct_ops bodies, **two upstream-mergeable bugs on
+two distinct surfaces of `net/mptcp/`** — userspace-PM
+handlers and kernel-PM admin handlers).  It is honestly
+limited by the single-substrate two-bug data shape it
+currently has, by the absence of a controlled baseline, and —
+most importantly — by the documented AI failure modes the
+human verification step exists to catch (state-machine
+imprecision and comment verbosity recurred across both
+findings, which is a methodology observation rather than a
+per-finding incident).
 
 The talk's defensible posture: *extend a published academic
 fuzzer with a methodology that demonstrably reaches new
